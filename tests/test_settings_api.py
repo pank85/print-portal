@@ -25,7 +25,7 @@ import main
 import printers
 
 VIEW_KEYS = {"id", "name", "url", "api_key_masked", "has_api_key", "selected",
-             "source", "editable", "created", "updated"}
+             "source", "editable", "profiles", "created", "updated"}
 TEST_KEYS = {"ok", "state", "webhooks", "error", "url", "ms"}
 STATUS = {"webhooks": {"state": "ready"}, "print_stats": {"state": "standby"}}
 

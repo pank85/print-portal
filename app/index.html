@@ -158,6 +158,7 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
 .field{ display:grid; gap:6px; }
 #profileSelectors{ display:grid; gap:var(--space-3); }
 #profileSelectors[hidden]{ display:none; }
+#profOptions{ display:grid; gap:var(--space-3); grid-template-columns:repeat(2,minmax(0,1fr)); }
 label{ font-size:var(--text-sm); font-weight:500; color:var(--color-muted-foreground); }
 input[type="text"],input[type="url"],input[type="password"],select{
   width:100%; min-height:var(--target-min); padding:10px var(--space-3);
@@ -263,6 +264,7 @@ select{ appearance:none; background-image:none; margin:0; }
 .printer-url{ color:var(--color-muted-foreground); font-size:var(--text-sm);
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .printer-key{ color:var(--color-muted-foreground); font-size:var(--text-sm); letter-spacing:.08em; }
+.printer-pair{ color:var(--color-muted-foreground); font-size:var(--text-sm); }
 .printer-actions{ display:flex; flex-wrap:wrap; gap:var(--space-2); }
 @media (max-width:599px){ .printer-actions .btn{ flex:1 1 calc(50% - var(--space-2)); } }
 .empty{
@@ -333,6 +335,8 @@ select{ appearance:none; background-image:none; margin:0; }
       <section class="card" aria-labelledby="profCardTitle">
         <h2 id="profCardTitle">Profile <span id="profSource" class="pill">—</span></h2>
         <div class="kv" id="profInfo"><span>—</span><span>—</span></div>
+        <p class="warning" id="profWarning" role="status" hidden></p>
+        <p class="hint" id="profCompat" role="status" hidden></p>
         <div id="profileSelectors">
           <div class="field">
             <label for="selMachine">Machine</label>
@@ -347,8 +351,23 @@ select{ appearance:none; background-image:none; margin:0; }
             <select id="selFilament"></select>
           </div>
         </div>
+        <div id="profOptions">
+          <div class="field">
+            <label for="optSupports">Supports</label>
+            <select id="optSupports">
+              <option value="no">No</option>
+              <option value="yes">Yes</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="optBrim">Brim</label>
+            <select id="optBrim">
+              <option value="no">No</option>
+              <option value="yes">Yes</option>
+            </select>
+          </div>
+        </div>
         <div class="acts">
-          <button type="button" class="btn btn-primary" id="btnSaveProfile">Enable</button>
           <label class="btn" for="profFile">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
@@ -369,12 +388,12 @@ select{ appearance:none; background-image:none; margin:0; }
         <p class="hint" id="outputNameHint">Saved as <span class="mono">&lt;name&gt;.gcode</span> — letters, digits, spaces, dot, dash, underscore. Empty uses the model name.</p>
       </div>
       <label for="file" class="sr-only">Model file to slice</label>
-      <input id="file" type="file" accept=".stl,.3mf,.obj" hidden>
+      <input id="file" type="file" accept=".stl,.3mf,.obj,.zip" hidden>
       <div id="drop" role="button" tabindex="0">
         <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
         <span class="drop-title">Drop an STL here or press to select</span>
-        <span class="hint">.stl / .3mf / .obj — sliced with the active profile</span>
+        <span class="hint">.stl / .3mf / .obj / .zip — sliced with the active profile</span>
       </div>
     </section>
 
@@ -402,21 +421,7 @@ select{ appearance:none; background-image:none; margin:0; }
     <p class="warning" id="printerWarning" role="status" hidden></p>
 
     <section class="card" aria-labelledby="optionsTitle">
-      <h2 id="optionsTitle">Basic options</h2>
-      <div class="field">
-        <label for="optSupports">Supports</label>
-        <select id="optSupports">
-          <option value="no">No</option>
-          <option value="yes">Yes</option>
-        </select>
-      </div>
-      <div class="field">
-        <label for="optBrim">Brim</label>
-        <select id="optBrim">
-          <option value="no">No</option>
-          <option value="yes">Yes</option>
-        </select>
-      </div>
+      <h2 id="optionsTitle">Interface</h2>
       <div class="field">
         <label><input type="checkbox" id="optHideProfiles"> Hide profile selectors</label>
       </div>
@@ -450,6 +455,15 @@ select{ appearance:none; background-image:none; margin:0; }
           <button type="button" class="btn" id="btnRevealKey" aria-pressed="false" aria-controls="pfKey">Show</button>
         </div>
         <p class="hint" id="pfKeyHint">Sent to the printer as <span class="mono">X-Api-Key</span> and stored encrypted.</p>
+      </div>
+      <div class="field">
+        <label for="pfMachine">Machine preset</label>
+        <select id="pfMachine"></select>
+      </div>
+      <div class="field">
+        <label for="pfProcess">Process preset</label>
+        <select id="pfProcess"></select>
+        <p class="hint">Selecting this printer applies its presets to the active profile.</p>
       </div>
       <div class="form-actions">
         <button type="submit" class="btn btn-primary" id="btnPrinterSave">Add printer</button>
@@ -593,11 +607,81 @@ async function refreshPrinter() {
 
 /* ---------------- profile ---------------- */
 let profileOptions = {supports:false, brim:true, hide_profiles:false};
-let saveSeq = 0;
+let saveSeq = 0;          // out-of-order guard for option saves
+let profileSeq = 0;       // and for profile (machine/process/filament) saves
+let activePaths = {};     // the rel paths GET /api/profile reports: the persisted truth
+const presetNames = {machine:new Map(), process:new Map(), filament:new Map()};
+const INHERIT_PRESET = "Inherit current profile";
+const PROCESS_NOT_LISTED = "Active process is not listed for this machine";
+const PROCESS_NOTHING_LISTED = "No process is listed for this machine — nothing was saved, pick one";
+const STALE_DERIVED = "Generated process preset is stale: save the options again to regenerate it";
 
 function applyProfileVisibility(hide) {
   const el = $("#profileSelectors");
   if (el) el.hidden = !!hide;
+}
+
+/* A preset row's display name; the rel is the fallback so a pairing the last list did not
+   contain still reads as something, instead of an empty option. */
+function presetName(kind, rel) {
+  if (!rel) return "";
+  const names = presetNames[kind];
+  return (names && names.get(rel)) || rel.split("/").pop() || rel;
+}
+
+/* The only place that turns a machine rel into `?machine=`: the dashboard process list and
+   the printer form's process list therefore ask for exactly the same filter (issue 7). */
+async function fetchPresets(machineRel) {
+  const qs = machineRel ? `?machine=${encodeURIComponent(machineRel)}` : "";
+  const r = await fetch(`/api/profiles${qs}`);
+  const list = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(list.detail || r.statusText);
+  for (const kind of ["machine", "process", "filament"]) {
+    for (const row of list[kind] || []) if (row && row.rel) presetNames[kind].set(row.rel, row.name);
+  }
+  return list;
+}
+
+/* Programmatic re-fill: assigning innerHTML never fires `change`, so refreshing the selects
+   after a save cannot feed back into saveProfile(). */
+function fillPresets(selId, rows, currentRel) {
+  $(selId).innerHTML = (rows || []).map(row =>
+    `<option value="${esc(row.rel || "")}"${row.rel && row.rel === currentRel ? " selected" : ""}>${esc(row.name)}</option>`).join("");
+}
+
+/* Lenient preset-name comparison, the same reading as profiles.filter_process_by_machine.
+   Only used to decide whether to show the compatibility note — the process list itself is
+   always the server-filtered one. */
+function presetKey(text) {
+  const name = String(text ?? "").toLowerCase().replace(/_/g, " ")
+    .split(/\s+/).filter(Boolean).join(" ").replace(/\s*\*+$/, "");
+  const at = name.lastIndexOf("@");
+  const base = at > 0 ? name.slice(0, at).trim() : "";
+  return {full: name, base: base || name};
+}
+
+function samePresetName(a, b) {
+  const left = presetKey(a), right = presetKey(b);
+  return left.full === right.full || left.base === right.base;
+}
+
+/* Whether the row the slicer will load is one this machine permits. A missing row or a
+   missing machine means "cannot tell", and the note stays quiet rather than guessing. */
+function processListedFor(list, processRel, machineRel) {
+  const row = (list.process || []).find(r => r.rel === processRel);
+  const machine = (list.machine || []).find(r => r.rel === machineRel);
+  if (!row || !machine) return true;
+  const allowed = row.compatible_printers || [];
+  return !allowed.length || allowed.some(name => samePresetName(name, machine.name));
+}
+
+/* The compatibility note under the selectors; `text` names what happened instead of
+   silently changing the pairing. */
+function setCompatNote(shown, text) {
+  const note = $("#profCompat");
+  if (!note) return;
+  note.textContent = text || PROCESS_NOT_LISTED;
+  note.hidden = !shown;
 }
 
 function applyProfileOptions(o) {
@@ -630,16 +714,21 @@ async function saveOption(key, value) {
   }
   applyProfileOptions(j.options || profileOptions);
   const status = $("#optionsStatus");
-  if (status) status.textContent = "";
+  if (status) status.textContent = key === "hide_profiles" ? "" : "Process preset updated";
   toast("Options saved");
+  /* supports/brim change what the card shows and what the derived preset holds, so the
+     card (and the stale warning) has to follow the saved value */
+  if (key !== "hide_profiles") await loadProfile();
 }
 
 async function loadProfile() {
   const act = await (await fetch("/api/profile")).json();
   applyProfileOptions(act.options || {});
   const s = act.presets || {};
+  activePaths = act.paths || {};
   $("#profSource").textContent = act.source;
   const m = s.machine || {}, pr = s.process || {}, f = s.filament || {};
+  const eff = act.effective || {}, derived = act.derived || {};
   $("#profInfo").innerHTML = kv([
     ["machine", act.machine_label || m.name || "—"],
     ["bed area", Array.isArray(m.printable_area) ? m.printable_area.join(" ") : (m.printable_area || "—")],
@@ -650,29 +739,69 @@ async function loadProfile() {
     ["speeds", `${pr.print_speed ?? "?"} / ${pr.outer_wall_speed ?? "?"} mm/s`],
     ["filament", f.name || "—"],
     ["temp / bed", `${f.nozzle_temperature ?? "?"} °C / ${f.hot_plate_temp ?? "?"} °C`],
+    /* the effective slicing state, so the operator sees what the slicer will use instead
+       of having to read it back off the raw preset */
+    ["supports", eff.error ? "—" : eff.supports ? "Yes" : "No"],
+    ["brim", eff.error ? "—" : eff.brim ? (eff.brim_width ? `Yes (${eff.brim_width} mm)` : "Yes") : "No"],
   ]);
 
-  const list = await (await fetch("/api/profiles")).json();
-  const fill = (selId, rows, current) => {
-    $(selId).innerHTML = (rows || []).map(r =>
-      `<option value="${esc(r.file)}"${r.name === current ? " selected" : ""}>${esc(r.name)}</option>`).join("");
-  };
-  fill("#selMachine", list.machine, m.name);
-  fill("#selProcess", list.process, pr.name);
-  fill("#selFilament", list.filament, f.name);
+  const warning = $("#profWarning");
+  warning.textContent = derived.stale ? (derived.error || STALE_DERIVED) : "";
+  warning.hidden = !derived.stale;
+
+  const list = await fetchPresets(activePaths.machine);
+  fillPresets("#selMachine", list.machine, activePaths.machine);
+  fillPresets("#selProcess", list.process, activePaths.process);
+  fillPresets("#selFilament", list.filament, activePaths.filament);
+  setCompatNote(!processListedFor(list, activePaths.process, activePaths.machine));
+}
+
+/* Narrow the process list to a machine and resolve the pairing it permits. The active
+   process is always in the response (the backend appends it back), so the list cannot be
+   trusted to hold only permitted rows: a selection the new machine does not list is
+   swapped for the first row it does, and when it lists nothing at all the selection stays
+   as it is and the caller must not persist it.
+   Returns {selected, name, anyPermitted, list} — `name` is the swapped-in row's display
+   name, and `list` is the raw machine-filtered response so a caller whose refresh fails
+   can still rebuild the control from data it already holds. */
+async function loadProcessOptions(machineRel, processRel) {
+  const list = await fetchPresets(machineRel);
+  const permitted = (list.process || []).filter(row => row.rel && processListedFor(list, row.rel, machineRel));
+  const kept = processRel && permitted.some(row => row.rel === processRel);
+  if (kept || !processRel || !permitted.length) {
+    fillPresets("#selProcess", list.process, processRel);
+    return {selected: processRel, name: "", anyPermitted: permitted.length > 0, list};
+  }
+  fillPresets("#selProcess", list.process, permitted[0].rel);
+  return {selected: permitted[0].rel, name: permitted[0].name, anyPermitted: true, list};
 }
 
 async function saveProfile() {
+  const seq = ++profileSeq;
   const body = {};
   for (const [kind, selId] of [["machine","#selMachine"],["process","#selProcess"],["filament","#selFilament"]]) {
     const v = $(selId).value;
-    if (v) body[kind] = `system/Custom/${kind}/${v}`;
+    if (v) body[kind] = v;
   }
-  const r = await fetch("/api/profile/select", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
-  const j = await r.json();
-  if (!r.ok) return toast("Not changed: " + (j.detail || r.statusText), 5000);
+  let r, j;
+  try {
+    r = await fetch("/api/profile/select", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+    j = await r.json().catch(() => ({}));
+  } catch (e) {
+    if (seq === profileSeq) {
+      toast("Not changed: " + e.message, 5000);
+      await loadProfile();
+    }
+    return;
+  }
+  if (seq !== profileSeq) return;      // a newer selection already owns the response
+  if (!r.ok) {
+    toast("Not changed: " + (j.detail || r.statusText), 5000);
+    await loadProfile();               // snap the selects back to the persisted profile
+    return;
+  }
   toast("Active profile updated");
-  loadProfile();
+  await loadProfile();                 // refresh #profInfo, the presets and the warnings
 }
 
 /* ---------------- upload ---------------- */
@@ -686,9 +815,25 @@ async function upload(file) {
   toast(`Uploading: ${file.name}`);
   try {
     const r = await fetch("/api/upload", {method:"POST", body:fd});
-    const j = await r.json();
+    const j = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(j.detail || r.statusText);
-    toast("Queued for slice");
+    if (j.archive) {
+      const total = Math.max(1, (j.archive.candidates || []).length);
+      toast(`Slicing ${j.archive.member} (1 of ${total} model files)`, 5000);
+    } else {
+      toast("Queued for slice");
+    }
+    if (j.threemf) {
+      /* the 3MF switch rewrote profile.json and possibly the selected printer, so both
+         cards are stale by now */
+      await loadPrinters();
+      await loadProfile();
+      if (j.threemf.printer || j.threemf.process) {
+        const printer = printers.find(p => p.id === j.threemf.printer);
+        const printerName = printer ? printer.name : (j.threemf.printer ? String(j.threemf.printer) : "—");
+        toast(`Profile switched to ${printerName} / ${presetName("process", j.threemf.process) || "—"}`, 6000);
+      }
+    }
     refresh();
   } catch (e) { toast("Error: " + e.message, 5000); }
 }
@@ -799,6 +944,9 @@ const KEY_HINT_DEFAULT = "Sent to the printer as X-Api-Key and stored encrypted.
 
 async function loadPrinters() {
   try {
+    /* unfiltered on purpose: the printer chips name any paired preset, including a pairing
+       the currently selected machine would filter out */
+    await fetchPresets().catch(() => ({}));
     const r = await fetch("/api/printers");
     const data = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(data.detail || r.statusText);
@@ -843,12 +991,19 @@ function renderPrinters(data) {
              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m6 6 1 14h10l1-14"/></svg>
         Delete
       </button>` : "";
+    const pairing = p.profiles || {};
+    const paired = ["machine", "process"]
+      .filter(slot => pairing[slot])
+      .map(slot => `${slot}: ${presetName(slot, pairing[slot])}`)
+      .join(" · ");
+    const pairedLine = paired ? `<p class="printer-pair">profile ${esc(paired)}</p>` : "";
     return `<li class="printer${p.selected ? " is-active" : ""}">
       <div class="printer-head">
         <span class="printer-name">${esc(p.name)}</span>${chips}
       </div>
       <p class="printer-url mono" title="${esc(p.url)}">${esc(p.url)}</p>
       <p class="printer-key mono" title="stored API key">${esc(p.api_key_masked || "—")}</p>
+      ${pairedLine}
       <div class="printer-actions">
         ${use}
         <button type="button" class="btn" data-act="test" data-ref="${esc(p.id)}">
@@ -862,10 +1017,35 @@ function renderPrinters(data) {
   }).join("");
 }
 
-function editPrinter(id) {
+/* The printer form's two preset selects: a blank first option inherits the global profile,
+   and the process list is narrowed by the machine in the same form (issue 7). */
+function fillPaired(selId, kind, rows, currentRel) {
+  const options = [`<option value="">${esc(INHERIT_PRESET)}</option>`];
+  for (const row of rows || []) {
+    if (row.rel) options.push(`<option value="${esc(row.rel)}">${esc(row.name)}</option>`);
+  }
+  if (currentRel && !(rows || []).some(row => row.rel === currentRel)) {
+    /* a stored pairing the current machine filter hides stays selectable, so editing the
+       printer cannot silently drop it */
+    options.push(`<option value="${esc(currentRel)}">${esc(presetName(kind, currentRel))}</option>`);
+  }
+  const el = $(selId);
+  el.innerHTML = options.join("");
+  el.value = currentRel || "";
+}
+
+async function populatePairing(machineRel, pairing) {
+  const list = await fetchPresets(machineRel);
+  fillPaired("#pfMachine", "machine", list.machine, (pairing || {}).machine);
+  fillPaired("#pfProcess", "process", list.process, (pairing || {}).process);
+}
+
+async function editPrinter(id) {
   const p = printers.find(x => x.id === id);
   if (!p || !p.editable) return;
   editingId = id;
+  const pairing = p.profiles || {};
+  await populatePairing(pairing.machine || "", pairing).catch(() => {});
   $("#pfName").value = p.name || "";
   $("#pfUrl").value = p.url || "";
   $("#pfKey").value = "";
@@ -891,6 +1071,7 @@ function resetPrinterForm() {
   $("#btnPrinterSave").textContent = "Add printer";
   $("#btnPrinterCancel").hidden = true;
   $("#formError").hidden = true;
+  populatePairing("", null).catch(() => {});   // no machine yet: the process list is unfiltered
 }
 
 async function submitPrinter(ev) {
@@ -898,7 +1079,12 @@ async function submitPrinter(ev) {
   const btn = $("#btnPrinterSave"), err = $("#formError");
   if (btn.disabled) return;
   err.hidden = true;
-  const body = { name: $("#pfName").value.trim(), url: $("#pfUrl").value.trim() };
+  const body = {
+    name: $("#pfName").value.trim(),
+    url: $("#pfUrl").value.trim(),
+    /* an empty select means "inherit the global profile", which the API spells null */
+    profiles: {machine: $("#pfMachine").value || null, process: $("#pfProcess").value || null},
+  };
   const key = $("#pfKey").value.trim();
   if (key) body.api_key = key;
   const editing = Boolean(editingId);
@@ -952,6 +1138,8 @@ async function selectPrinter(id) {
     toast("active printer: " + (p ? p.name : id), 4000);
     await loadPrinters();
     refreshPrinter();
+    /* selecting a printer applies its stored preset pairing to profile.json */
+    await loadProfile().catch(() => {});
   } catch (e) { toast("Not switched: " + e.message, 6000); }
 }
 
@@ -1011,13 +1199,57 @@ function boot() {
       const j = await r.json();
       if (!r.ok || !j.ok) throw new Error(j.detail || "no presets found");
       $("#profNotes").textContent = (j.notes || []).join("\n");
-      toast(`Imported ${j.imported.length} presets — pick one and press Enable`, 6000);
+      toast(`Imported ${j.imported.length} presets — select one to activate`, 6000);
       loadProfile();
     } catch (e) { toast("Failure: " + e.message, 6000); }
     ev.target.value = "";
   });
 
-  $("#btnSaveProfile").addEventListener("click", saveProfile);
+  /* selecting a preset applies it immediately — there is no Enable step any more */
+  $("#selProcess").addEventListener("change", () => saveProfile());
+  $("#selFilament").addEventListener("change", () => saveProfile());
+  /* the machine drives the process list, so refill it first and then save — but only a
+     pairing the new machine permits: a process it does not list is swapped for the first
+     one it does (and the note says so), and when it lists none nothing is written and the
+     control goes back to the machine profile.json holds, because a select left showing the
+     refused machine would be posted by the next process or filament change */
+  $("#selMachine").addEventListener("change", async ev => {
+    const machineRel = ev.target.value;
+    const processRel = $("#selProcess").value;
+    const options = await loadProcessOptions(machineRel, processRel).catch(() => null);
+    if (options && processRel && !options.anyPermitted) {
+      /* the control has to show the persisted machine again before the handler returns:
+         loadProfile() also puts that machine's process and filament lists back, so the
+         next change posts the pairing that is actually stored, not this machine's rows.
+         That refresh can fail on its own, and an empty swallow would leave the refused
+         machine's rows selected under the persisted machine — exactly the pairing the
+         next save would post — so the process control is rebuilt from the list this
+         handler already fetched. */
+      ev.target.value = activePaths.machine;
+      await loadProfile().catch(() => {
+        fillPresets("#selProcess", options.list.process, activePaths.process);
+      });
+      setCompatNote(true, PROCESS_NOTHING_LISTED);   // written after loadProfile()'s refresh
+      return;                       // no incompatible pairing reaches profile.json
+    }
+    await saveProfile();
+    /* written after the refresh loadProfile() does, so the explanation is not wiped */
+    if (options && options.selected && options.selected !== processRel) {
+      setCompatNote(true, `Active process was not listed for this machine — selected ${options.name}`);
+    }
+  });
+  /* the printer form's pairing follows the same rule: an unlisted process is replaced by
+     the first one this machine permits, or dropped back to "inherit" when it permits none */
+  $("#pfMachine").addEventListener("change", async ev => {
+    const machineRel = ev.target.value;
+    const current = $("#pfProcess").value;
+    try {
+      const list = await fetchPresets(machineRel);
+      const permitted = (list.process || []).filter(row => row.rel && processListedFor(list, row.rel, machineRel));
+      const keep = !current || permitted.some(row => row.rel === current);
+      fillPaired("#pfProcess", "process", list.process, keep ? current : (permitted.length ? permitted[0].rel : ""));
+    } catch (e) { toast("Presets not loaded: " + e.message, 5000); }
+  });
   $("#btnDeleteAll").addEventListener("click", deleteAllJobs);
   $("#btnRevealKey").addEventListener("click", toggleKeyReveal);
   $("#btnPrinterCancel").addEventListener("click", resetPrinterForm);
@@ -1046,6 +1278,7 @@ function boot() {
 
   route();
   loadProfile();
+  populatePairing("", null).catch(() => {});   // the form opens on "Inherit current profile"
   refresh();
   refreshPrinter();
   /* One poller for the page: nothing is fetched while Settings is open or the tab is

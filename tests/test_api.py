@@ -471,7 +471,8 @@ def test_index_page_has_no_external_dependencies(client):
 
 def test_settings_view_ids_are_present(client):
     text = client.get("/").text
-    for vid in ["viewSettings", "printerForm", "btnDeleteAll", "outputName", "printerList"]:
+    for vid in ["viewSettings", "printerForm", "btnDeleteAll", "outputName", "printerList",
+                "pfMachine", "pfProcess"]:
         assert f'id="{vid}"' in text
 
 
