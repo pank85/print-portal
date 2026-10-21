@@ -179,3 +179,130 @@ def test_version_matches_the_ci_app_version():
     match = re.search(r'^\s*APP_VERSION:\s*"([^"]+)"', ci.read_text(), re.MULTILINE)
     assert match, "APP_VERSION is not declared in .gitlab-ci.yml"
     assert match.group(1) == config.VERSION
+
+
+def test_seed_is_optional_for_ui_managed_printers():
+    cfg = config.load_config({"MOONRAKER_API_KEY": "k"}, printer_seed_required=False)
+    assert cfg.env_printer_api_key == "k"
+    assert cfg.printers_file == Path("/data/printers.json")
+    assert cfg.sliced_dir == Path("/data/sliced")
+    assert cfg.secret_key_file == Path("/data/secret.key")
+
+
+def test_printer_url_without_a_key_is_a_config_error():
+    with pytest.raises(config.ConfigError, match="PRINTER_URL is set but MOONRAKER_API_KEY is empty"):
+        config.load_config({"PRINTER_URL": "http://printer.local:7125"}, printer_seed_required=False)
+
+
+def test_key_without_an_explicit_url_uses_the_default():
+    cfg = config.load_config({"MOONRAKER_API_KEY": "k"}, printer_seed_required=False)
+    assert cfg.env_printer_url == "http://127.0.0.1:7125"
+    assert cfg.env_printer_api_key == "k"
+
+
+def test_new_paths_default_inside_the_data_dir(env):
+    env["MOONRAKER_API_KEY"] = "k"
+    cfg = config.load_config(env)
+    assert cfg.sliced_dir == Path("/data/sliced")
+    assert cfg.printers_file == Path("/data/printers.json")
+    assert cfg.secret_key_file == Path("/data/secret.key")
+
+
+def test_new_paths_can_be_overridden(env):
+    env.update({
+        "MOONRAKER_API_KEY": "k",
+        "SLICED_DIR": "/custom/sliced",
+        "PRINTERS_FILE": "/custom/p.json",
+        "SECRET_KEY_FILE": "/custom/s.key",
+    })
+    cfg = config.load_config(env)
+    assert cfg.sliced_dir == Path("/custom/sliced")
+    assert cfg.printers_file == Path("/custom/p.json")
+    assert cfg.secret_key_file == Path("/custom/s.key")
+
+
+def test_sliced_dir_expands_variables():
+    cfg = config.load_config(
+        {"MOONRAKER_API_KEY": "k", "DATA_DIR": "/srv/portal", "SLICED_DIR": "$DATA_DIR/sliced"},
+        printer_seed_required=False,
+    )
+    assert cfg.sliced_dir == Path("/srv/portal/sliced")
+
+
+def test_env_printer_name_override():
+    cfg = config.load_config(
+        {"MOONRAKER_API_KEY": "k", "ENV_PRINTER_NAME": "My Printer"},
+        printer_seed_required=False,
+    )
+    assert cfg.env_printer_name == "My Printer"
+
+
+def test_env_example_lists_only_known_variables():
+    known = {
+        "PRINTER_URL", "MOONRAKER_API_KEY", "MOONRAKER_ROOT", "PORT", "DATA_DIR",
+        "ORCA_BIN", "ORCA_DATADIR", "MAX_UPLOAD_MB", "KEEP_JOBS", "SLICE_TIMEOUT",
+        "BED_SIZE", "MACHINE_SLOT", "SLICED_DIR", "PRINTERS_FILE", "SECRET_KEY_FILE",
+        "ENV_PRINTER_NAME",
+    }
+    env_path = ROOT / ".env.example"
+    keys = []
+    example_values = {}
+    for line in env_path.read_text().splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if stripped.startswith("#"):
+            stripped = stripped.lstrip("#").strip()
+            if not stripped or "=" not in stripped:
+                continue
+        if "=" not in stripped:
+            continue
+        key, _, value = stripped.partition("=")
+        key = key.strip()
+        if not key:
+            continue
+        keys.append(key)
+        example_values[key] = value.strip()
+    assert set(keys) <= known, set(keys) - known
+    # build an env with all keys present and load successfully
+    env = {"MOONRAKER_API_KEY": "k"}
+    for key in keys:
+        env[key] = example_values[key] if example_values[key] else "k"
+    if "PRINTER_URL" not in env:
+        env["PRINTER_URL"] = "http://printer.local:7125"
+    config.load_config(env, printer_seed_required=False)
+    print("PARSED_KEYS:", keys)
+
+
+def test_compose_ships_the_sliced_mount_and_env():
+    text = (ROOT / "docker-compose.yml").read_text()
+    assert "SLICED_DIR" in text
+    assert "./sliced:/sliced" in text
+
+
+def test_config_cli_still_requires_the_api_key(monkeypatch):
+    proc = _run_config_module(monkeypatch)
+    assert proc.returncode == 2
+    assert "MOONRAKER_API_KEY is required" in proc.stderr
+
+
+@pytest.mark.parametrize("value", ["", "   "])
+def test_blank_printer_url_is_treated_as_unset(value):
+    cfg = config.load_config(
+        {"PRINTER_URL": value, "MOONRAKER_API_KEY": "k"},
+        printer_seed_required=False,
+    )
+    assert cfg.printer_url == "http://127.0.0.1:7125"
+    assert cfg.env_printer_url == "http://127.0.0.1:7125"
+
+
+def test_config_cli_allow_unconfigured_exits_0(monkeypatch):
+    proc = subprocess.run(
+        [sys.executable, "-m", "config", "--allow-unconfigured"],
+        cwd=APP_DIR,
+        env={k: v for k, v in os.environ.items()
+             if k not in ("MOONRAKER_API_KEY", "PRINTER_URL")},
+        capture_output=True, text=True, timeout=60,
+    )
+    assert proc.returncode == 0
+    assert "no PRINTER_URL/MOONRAKER_API_KEY set" in proc.stderr

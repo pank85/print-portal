@@ -63,13 +63,14 @@ quickstart above is all you need to start.
 
 ## Configuration
 
-All configuration is environment variables. The container reads them from `.env` via Compose (see
-`docker-compose.yml` and `.env.example`).
+Most configuration is environment variables (read from `.env` via Compose; see `docker-compose.yml` and
+`.env.example`). Printers can also be managed in the UI (Settings), in which case `PRINTER_URL` and
+`MOONRAKER_API_KEY` are left unset.
 
 | Var | Default | Meaning |
 |---|---|---|
 | `PRINTER_URL` | `http://127.0.0.1:7125` | Moonraker base URL, no trailing slash |
-| `MOONRAKER_API_KEY` | *(required)* | Moonraker API key; the app fails closed at startup if it is unset |
+| `MOONRAKER_API_KEY` | *(optional)* | Moonraker API key for the environment printer; required together with `PRINTER_URL`. The CLI `python -m config` fails closed without it, but the app boots so printers can be managed in Settings |
 | `MOONRAKER_ROOT` | `gcodes` | Moonraker file root for uploads |
 | `PORT` | `8088` | port the web UI listens on |
 | `DATA_DIR` | `/data` | jobs, uploaded presets, profile selection, Qt `HOME` |
@@ -109,15 +110,16 @@ a shared library is missing or a preset is broken — never the first user print
 ## Get a Moonraker API key
 
 See [docs/printer-setup.md](docs/printer-setup.md). In short: Moonraker's `[authorization]`
-section generates a key (or use the API key panel in your web UI), and you put it in
-`MOONRAKER_API_KEY`. The key is a secret — treat it like a password.
+section generates a key (or use the API key panel in your web UI). Put it in `MOONRAKER_API_KEY`
+for an environment printer, or paste it in Settings → Add printer for a UI-managed printer. The key
+is a secret — treat it like a password.
 
 ## API
 
 | Method | Path | What |
 |---|---|---|
 | GET | `/` | upload UI |
-| GET | `/api/health` | `{"status":"ok","app":"print-portal","version":...}` — never touches the printer |
+| GET | `/api/health` | `{"status":"ok","app":"print-portal","version":...}` — readiness; returns 503 until a printer is configured |
 | GET | `/api/printer` | live snapshot: state, file, progress, nozzle/bed temps, homed axes |
 | POST | `/api/upload` | multipart `file` (`.stl`, `.3mf`, `.obj`, ≤150 MB) → job id |
 | GET | `/api/jobs` | list jobs, newest first |
@@ -129,6 +131,13 @@ section generates a key (or use the API key panel in your web UI), and you put i
 | GET | `/api/profiles` | every preset available to the slicer |
 | POST | `/api/profile/upload` | import a `.orca_printer` bundle or preset json |
 | POST | `/api/profile/select` | switch the active machine/process/filament |
+| GET | `/api/printers` | list configured printers |
+| POST | `/api/printers` | add a printer |
+| PATCH | `/api/printers/{id}` | update a printer |
+| DELETE | `/api/printers/{id}` | remove a printer |
+| POST | `/api/printers/{id}/select` | select active printer |
+| POST | `/api/printers/{id}/test` | test printer connection |
+| DELETE | `/api/jobs` | remove all jobs |
 
 ## Importing profiles
 
@@ -183,7 +192,7 @@ These are the behaviours the code works around; keep them in mind when debugging
 | Symptom | Cause and fix |
 |---|---|
 | `printer unreachable` (503) | The container cannot reach `PRINTER_URL`. Check the URL, that the container has a route to the printer host, and that Moonraker is listening. See [docs/deployment.md](docs/deployment.md). |
-| `Moonraker rejected the API key` (502) | `MOONRAKER_API_KEY` is wrong or the key is not allowed for this client. Regenerate the key in Moonraker and update `.env`. |
+| `Moonraker rejected the API key` (502) | `MOONRAKER_API_KEY` is wrong or the key is not allowed for this client. Regenerate the key in Moonraker and update `.env` or Settings. |
 | `-17 incompatible profile` | The imported machine preset was not rebased onto the resolved slot, or the process preset is not compatible with it. Re-import the bundle through `/api/profile/upload`. |
 | `missing shared library` | The image was built for the wrong architecture, or the OrcaSlicer binary cannot find its bundled libraries. The image is amd64 only; rebuild with `--platform linux/amd64`. |
 | `mkdir: cannot create directory '/data/...': Permission denied` and the container exits | The bind-mounted `./data` directory is owned by root — Compose creates it that way when it does not exist yet on the host, while the image runs as uid 1000. Fix ownership on the host: `sudo chown -R 1000:1000 ./data`. |
@@ -197,6 +206,36 @@ These are the behaviours the code works around; keep them in mind when debugging
 - **One slice at a time** (single worker) on purpose: OrcaSlicer peaks at ~1 GB RAM.
 - **The print gate is not re-checked during a print.** State is read at click time only.
 
+## Printers
+
+Printers are managed in the UI (Settings view): name, URL, API key. They are stored encrypted in
+`data/printers.json` using `data/secret.key` (mode 0600). Back up both files together; losing the
+key file means re-entering API keys. A single uvicorn worker is assumed (no portal authentication).
+
+You can also configure one printer via environment variables (`PRINTER_URL` +
+`MOONRAKER_API_KEY`); this "environment printer" is seeded into the store at startup. If neither
+is set, the portal still boots and printer routes return 503 until a printer is added in Settings.
+
+`/api/health` returns 503 (and the Docker healthcheck goes unhealthy) until at least one printer is
+configured.
+
+## Environment variables (UI-managed printers)
+
+| Var | Default | Notes |
+|---|---|---|
+| `SLICED_DIR` | `$DATA_DIR/sliced` | mountable output directory |
+| `PRINTERS_FILE` | `$DATA_DIR/printers.json` | printer store |
+| `SECRET_KEY_FILE` | `$DATA_DIR/secret.key` | Fernet key |
+| `ENV_PRINTER_NAME` | `Default (environment)` | name used for the environment printer |
+
+`MOONRAKER_API_KEY` is optional when printers are managed in the UI; `PRINTER_URL` and
+`MOONRAKER_API_KEY` must be set together. The strict CLI `python -m config` still fails closed
+without a key. An unconfigured portal stays reachable and printer routes return 503.
+
+Sliced output from older jobs in `jobs/*/out` remains readable via fallback.
+
 ## License
+
+
 
 MIT — see [LICENSE](LICENSE).

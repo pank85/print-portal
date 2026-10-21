@@ -23,5 +23,5 @@ export HOME="${DATA_DIR}/home"
 # upload never fills the container's own filesystem.
 export TMPDIR="${DATA_DIR}/tmp"
 cd /app
-python -m config
+python -m config --allow-unconfigured
 exec python -m uvicorn main:app --host 0.0.0.0 --port "${PORT:-8088}"

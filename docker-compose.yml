@@ -11,6 +11,10 @@ services:
       - "${PORT:-8088}:${PORT:-8088}"
     volumes:
       - ./data:/data
+      # sliced output dir must be writable by uid 1000 (container user)
+      - ./sliced:/sliced
+    environment:
+      - SLICED_DIR=${SLICED_DIR:-/sliced}
     mem_limit: 2g
     healthcheck:
       test: ["CMD-SHELL", "python3 -c \"import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.environ.get('PORT','8088'), timeout=4).status == 200 else 1)\""]

@@ -1,11 +1,12 @@
-"""Environment-only configuration for print-portal.
+"""Environment configuration for print-portal.
 
 This module is the single source of truth for the env-var table, its defaults and
 its validation; every other module reads ``config.load_config()`` and nothing else
 touches ``os.environ``.
 
-It fails closed: without ``MOONRAKER_API_KEY`` nothing starts, and the API key is
-never printed or logged.
+The strict CLI (``python -m config``) fails closed without ``MOONRAKER_API_KEY``;
+the app itself boots without it so printers can be managed in the UI. The API key
+is never printed or logged.
 """
 from __future__ import annotations
 
@@ -29,9 +30,8 @@ DEFAULTS: dict[str, str] = {
     "KEEP_JOBS": "25",
     "SLICE_TIMEOUT": "900",
     "BED_SIZE": "220x220",
+    "ENV_PRINTER_NAME": "Default (environment)",
 }
-
-REQUIRED = ("MOONRAKER_API_KEY",)
 
 REQUIRED_HINTS: dict[str, str] = {
     "MOONRAKER_API_KEY": "set it to the key from Moonraker's [authorization] section (see README)",
@@ -50,7 +50,7 @@ class ConfigError(RuntimeError):
 @dataclass(frozen=True, slots=True)
 class Config:
     printer_url: str            # no trailing slash, scheme http:// or https://
-    moonraker_api_key: str
+    moonraker_api_key: str | None
     moonraker_root: str
     port: int
     data_dir: Path
@@ -64,6 +64,13 @@ class Config:
     slice_timeout: int
     bed_size: tuple[float, float]
     machine_slot: str | None    # raw MACHINE_SLOT, or None when unset/blank
+    # new (T2): UI-managed printers + mountable sliced output
+    sliced_dir: Path           # SLICED_DIR or data_dir / "sliced"
+    printers_file: Path        # PRINTERS_FILE or data_dir / "printers.json"
+    secret_key_file: Path      # SECRET_KEY_FILE or data_dir / "secret.key"
+    env_printer_name: str      # ENV_PRINTER_NAME or "Default (environment)"
+    env_printer_url: str       # PRINTER_URL (default http://127.0.0.1:7125, rstrip("/"))
+    env_printer_api_key: str | None  # None when the env seed is not configured
 
 
 def parse_bed_size(value: str) -> tuple[float, float]:
@@ -113,18 +120,31 @@ def _positive_int(name: str, value: str) -> int:
     return number
 
 
-def load_config(env: Mapping[str, str] | None = None) -> Config:
+def load_config(env: Mapping[str, str] | None = None, *, printer_seed_required: bool = True) -> Config:
     """Build a :class:`Config` from ``env`` (``os.environ`` when ``None``).
 
     Validation only — no directories are created and nothing is written.
     """
     source: Mapping[str, str] = os.environ if env is None else env
 
-    for name in REQUIRED:
-        if not (source.get(name) or "").strip():
-            raise ConfigError(f"{name} is required: {REQUIRED_HINTS[name]}")
+    api_key_raw = (source.get("MOONRAKER_API_KEY") or "").strip()
+    explicit_printer_url = bool((source.get("PRINTER_URL") or "").strip()) and "PRINTER_URL" in source
 
-    printer_url = _value(source, "PRINTER_URL")
+    if printer_seed_required:
+        if not api_key_raw:
+            raise ConfigError(f"MOONRAKER_API_KEY is required: {REQUIRED_HINTS['MOONRAKER_API_KEY']}")
+    else:
+        if explicit_printer_url and not api_key_raw:
+            raise ConfigError(
+                "PRINTER_URL is set but MOONRAKER_API_KEY is empty: "
+                "set both (environment printer) or neither (manage printers in Settings)"
+            )
+
+    printer_url_raw = source.get("PRINTER_URL")
+    if printer_url_raw is None or not str(printer_url_raw).strip():
+        printer_url = DEFAULTS["PRINTER_URL"]
+    else:
+        printer_url = str(printer_url_raw)
     if not printer_url.startswith(("http://", "https://")):
         raise ConfigError(f"PRINTER_URL must start with http:// or https:// (got {printer_url!r})")
     printer_url = printer_url.rstrip("/")
@@ -139,10 +159,25 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
     if port > MAX_PORT:
         raise ConfigError(f"PORT must be a positive integer <= {MAX_PORT} (got {_value(source, 'PORT')!r})")
 
+    sliced_raw = source.get("SLICED_DIR")
+    sliced_dir = Path(_expand_path(sliced_raw, source)) if (sliced_raw or "").strip() else data_dir / "sliced"
+
+    printers_raw = source.get("PRINTERS_FILE")
+    printers_file = Path(_expand_path(printers_raw, source)) if (printers_raw or "").strip() else data_dir / "printers.json"
+
+    secret_raw = source.get("SECRET_KEY_FILE")
+    secret_key_file = Path(_expand_path(secret_raw, source)) if (secret_raw or "").strip() else data_dir / "secret.key"
+
+    env_printer_name = (source.get("ENV_PRINTER_NAME") or "").strip()
+    if not env_printer_name:
+        env_printer_name = DEFAULTS["ENV_PRINTER_NAME"]
+
+    env_printer_api_key = api_key_raw if api_key_raw else None
+
     return Config(
         printer_url=printer_url,
-        # stored verbatim: it becomes the X-Api-Key header, never printed
-        moonraker_api_key=source["MOONRAKER_API_KEY"],
+        # trimmed of surrounding whitespace; becomes the X-Api-Key header, never printed
+        moonraker_api_key=env_printer_api_key,
         moonraker_root=_value(source, "MOONRAKER_ROOT"),
         port=port,
         data_dir=data_dir,
@@ -158,16 +193,30 @@ def load_config(env: Mapping[str, str] | None = None) -> Config:
         # a blank MACHINE_SLOT means "no override", so imports fall back to the
         # datadir default machine preset
         machine_slot=(source.get("MACHINE_SLOT") or None),
+        sliced_dir=sliced_dir,
+        printers_file=printers_file,
+        secret_key_file=secret_key_file,
+        env_printer_name=env_printer_name,
+        env_printer_url=printer_url,
+        env_printer_api_key=env_printer_api_key,
     )
 
 
-def main() -> None:
+def main(argv: list[str] | None = None) -> None:
     """``python -m config``: print a one-line summary, never the API key."""
+    args = sys.argv[1:] if argv is None else argv
+    allow_unconfigured = "--allow-unconfigured" in args
     try:
-        cfg = load_config()
+        cfg = load_config(printer_seed_required=not allow_unconfigured)
     except ConfigError as exc:
         print(f"print-portal: {exc}", file=sys.stderr)
         raise SystemExit(2) from None
+    if allow_unconfigured and cfg.env_printer_api_key is None:
+        print(
+            "print-portal: no PRINTER_URL/MOONRAKER_API_KEY set; "
+            "manage printers in Settings",
+            file=sys.stderr,
+        )
     width, height = cfg.bed_size
     print(
         f"print-portal: {cfg.printer_url} root={cfg.moonraker_root} "

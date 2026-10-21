@@ -54,13 +54,21 @@ If you skip this, the container may fail to write jobs or seed presets.
 
 ## Backups
 
-Everything worth keeping lives in `./data`:
+Everything worth keeping lives in `./data` (and `./sliced` when `SLICED_DIR` points outside it):
 
 - `jobs/` — uploaded models, sliced gcode and job metadata
 - `orca-datadir/` — the slicer datadir, including any presets you imported
 - `profile.json` — the active machine/process/filament selection
+- `secret.key` — Fernet key for the encrypted printer store (mode 0600)
+- `printers.json` — UI-managed printers, API keys stored as Fernet ciphertext
+- `sliced/` — sliced output when `SLICED_DIR` points inside the data dir
 
-Back up `./data` as a unit. Restoring it restores both your jobs and your imported presets.
+Back up `./data` as a unit (and `secret.key` together with `printers.json`). Restoring it restores
+your jobs, imported presets and configured printers. Losing `secret.key` means re-entering API keys.
+
+## Sliced output mount
+
+Mount `./sliced:/sliced` (or set `SLICED_DIR`). Fix permissions: `chown 1000:1000 sliced`.
 
 ## Upgrades and `SEED_VERSION`
 

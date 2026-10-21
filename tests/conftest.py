@@ -73,12 +73,35 @@ def jobs_dir(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
-def client(jobs_dir: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
+def printers_file(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """Per-test printers.json location; resets main.STORE."""
+    import main
+    import printers
+
+    p = tmp_path / "printers.json"
+    monkeypatch.setattr(main, "STORE", printers.PrinterStore.open(p, tmp_path / "secret.key"))
+    return p
+
+
+@pytest.fixture
+def sliced_dir(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    d = tmp_path / "sliced"
+    d.mkdir(parents=True, exist_ok=True)
+    import main
+    monkeypatch.setattr(main, "SLICED", d)
+    return d
+
+
+@pytest.fixture
+def client(jobs_dir: Path, printers_file: Path, sliced_dir: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     """API client with its own job storage and no lifespan (so no slicer worker)."""
     import main
+    import printers
 
     jobs_dir.mkdir(parents=True, exist_ok=True)
     monkeypatch.setattr(main, "JOBS", jobs_dir)
+    monkeypatch.setattr(main, "STORE", printers.PrinterStore.open(printers_file, printers_file.parent / "secret.key"))
+    monkeypatch.setattr(main, "SLICED", sliced_dir)
     return TestClient(main.app)
 
 
