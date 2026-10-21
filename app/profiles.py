@@ -18,10 +18,12 @@ from __future__ import annotations
 
 import io
 import json
+import os
 import re
 import shutil
+import tempfile
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 FOLDER_TYPE = {"printer": "machine", "machine": "machine",
                "process": "process", "filament": "filament"}
@@ -38,6 +40,16 @@ DEFAULT_PROFILE = {
     "process":  "system/Custom/process/generic-0.20-standard.json",
     "filament": "system/Custom/filament/generic-pla.json",
 }
+
+# The three persisted "basic options". Defaults mirror the shipped process preset: supports off
+# (`enable_support: "0"`) and a brim on (the inherited `brim_width: "5"`).
+OPTION_KEYS = ("supports", "brim", "hide_profiles")
+DEFAULT_OPTIONS = {"supports": False, "brim": True, "hide_profiles": False}
+
+# The derived process preset that carries the options into a slice. It lives inside the writable
+# datadir next to imported presets, and is hidden from the preset picker (`list_presets`).
+PORTAL_PROCESS_REL = "system/Custom/process/print-portal-options.json"
+PORTAL_PROCESS_FILE = PurePosixPath(PORTAL_PROCESS_REL).name
 
 MACHINE_IDENTITY = {"name", "inherits", "from", "type", "compatible_printers",
                     "printer_model", "printer_variant"}
@@ -65,6 +77,61 @@ class ProfileError(RuntimeError):
 # The upload endpoint refuses bundles above this size; a single zip member may not be
 # larger either, so an inflated member cannot be read into memory.
 BUNDLE_MAX_BYTES = 20 * 1024 * 1024
+
+
+def read_options(profile: object) -> dict[str, bool]:
+    """The stored options with defaults applied; never raises.
+
+    A value counts only when it is a real bool (JSON `true`/`false`); anything else — a legacy
+    document without `options`, a corrupt value, `0`/`1`, `"yes"` — falls back per key.
+    """
+    stored = profile.get("options") if isinstance(profile, dict) else None
+    stored = stored if isinstance(stored, dict) else {}
+    options: dict[str, bool] = {}
+    for key in OPTION_KEYS:
+        value = stored.get(key)
+        options[key] = value if type(value) is bool else DEFAULT_OPTIONS[key]
+    return options
+
+
+def validate_options(update: object) -> dict[str, bool]:
+    """The supplied (partial) option update, or a ProfileError explaining what is wrong."""
+    if not isinstance(update, dict):
+        raise ProfileError("options must be an object")
+    unknown = [key for key in update if key not in OPTION_KEYS]
+    if unknown:
+        raise ProfileError(f"unknown option: {unknown[0]}")
+    invalid = [key for key, value in update.items() if type(value) is not bool]
+    if invalid:
+        raise ProfileError(f"{invalid[0]} must be true or false")
+    if not update:
+        raise ProfileError("nothing to update")
+    return {key: update[key] for key in OPTION_KEYS if key in update}
+
+
+def write_json_atomic(path: Path, data: dict) -> None:
+    """Write ``data`` as JSON through a sibling temp file + os.replace.
+
+    Readers see either the old or the new file, never a half-written one; the temp file lives
+    in the same directory so the replace stays on one filesystem.
+    """
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=path.parent, prefix=path.name + ".", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(data, handle, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
 
 
 def safe_stem(name: str) -> str:
@@ -298,6 +365,58 @@ def summarise(path: Path, ptype: str, datadir: Path | None = None) -> dict:
     return out
 
 
+def _positive_width(value: object) -> str | None:
+    """A usable brim width, as the string it was stored as (presets store numbers as strings)."""
+    try:
+        return str(value) if float(value) > 0 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _effective_brim_width(datadir: Path, data: dict) -> str:
+    """The brim width to generate when the brim is on: own value, else the first inherited one.
+
+    The CLI loads `--load-settings` files without resolving `inherits`, so a preset that only
+    inherits `brim_width` must have it copied in explicitly. 5 mm is the shipped preset intent.
+    """
+    chain = _parent_chain(datadir, "process", data)
+    for level in chain:
+        width = _positive_width(level.get("brim_width"))
+        if width is not None:
+            return width
+    return "5"
+
+
+def write_derived_process(process: Path, datadir: Path, options: dict[str, bool]) -> Path:
+    """Write the per-slice process preset that carries the options; return its path.
+
+    The selected preset is only ever read: the CLI refuses a second process file on
+    `--load-settings`, so this copy replaces it, keeping every key the preset contributes.
+    """
+    try:
+        data = json.loads(Path(process).read_text())
+    except (OSError, ValueError) as exc:
+        raise ProfileError("process preset is not readable") from exc
+    if not isinstance(data, dict):
+        raise ProfileError("process preset is not readable")
+
+    derived = dict(data)
+    derived["type"] = "process"
+    derived["from"] = "system"
+    derived["name"] = f"{data.get('name') or Path(process).stem} (portal options)"
+    derived["enable_support"] = "1" if options.get("supports") else "0"
+    if options.get("brim"):
+        derived["brim_type"] = "outer_only"
+        derived["brim_width"] = _effective_brim_width(Path(datadir), data)
+    else:
+        derived["brim_type"] = "no_brim"
+        derived["brim_width"] = "0"
+
+    derived_path = Path(datadir) / PORTAL_PROCESS_REL
+    write_json_atomic(derived_path, derived)
+    return derived_path
+
+
 def list_presets(datadir: Path) -> dict[str, list[dict]]:
     out: dict[str, list[dict]] = {}
     pattern_for = {"machine": "system/Custom/machine/*.json",
@@ -306,7 +425,7 @@ def list_presets(datadir: Path) -> dict[str, list[dict]]:
     for ptype, pattern in pattern_for.items():
         rows = []
         for f in sorted(datadir.glob(pattern)):
-            if f.name.startswith("fdm_"):
+            if f.name.startswith("fdm_") or f.name == PORTAL_PROCESS_FILE:
                 continue
             try:
                 data = json.loads(f.read_text())
