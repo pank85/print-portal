@@ -156,6 +156,8 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
 
 /* ---------- form controls ---------- */
 .field{ display:grid; gap:6px; }
+#profileSelectors{ display:grid; gap:var(--space-3); }
+#profileSelectors[hidden]{ display:none; }
 label{ font-size:var(--text-sm); font-weight:500; color:var(--color-muted-foreground); }
 input[type="text"],input[type="url"],input[type="password"],select{
   width:100%; min-height:var(--target-min); padding:10px var(--space-3);
@@ -331,17 +333,19 @@ select{ appearance:none; background-image:none; margin:0; }
       <section class="card" aria-labelledby="profCardTitle">
         <h2 id="profCardTitle">Profile <span id="profSource" class="pill">—</span></h2>
         <div class="kv" id="profInfo"><span>—</span><span>—</span></div>
-        <div class="field">
-          <label for="selMachine">Machine</label>
-          <select id="selMachine"></select>
-        </div>
-        <div class="field">
-          <label for="selProcess">Process</label>
-          <select id="selProcess"></select>
-        </div>
-        <div class="field">
-          <label for="selFilament">Filament</label>
-          <select id="selFilament"></select>
+        <div id="profileSelectors">
+          <div class="field">
+            <label for="selMachine">Machine</label>
+            <select id="selMachine"></select>
+          </div>
+          <div class="field">
+            <label for="selProcess">Process</label>
+            <select id="selProcess"></select>
+          </div>
+          <div class="field">
+            <label for="selFilament">Filament</label>
+            <select id="selFilament"></select>
+          </div>
         </div>
         <div class="acts">
           <button type="button" class="btn btn-primary" id="btnSaveProfile">Enable</button>
@@ -396,6 +400,28 @@ select{ appearance:none; background-image:none; margin:0; }
       keep it on a trusted network.
     </p>
     <p class="warning" id="printerWarning" role="status" hidden></p>
+
+    <section class="card" aria-labelledby="optionsTitle">
+      <h2 id="optionsTitle">Basic options</h2>
+      <div class="field">
+        <label for="optSupports">Supports</label>
+        <select id="optSupports">
+          <option value="no">No</option>
+          <option value="yes">Yes</option>
+        </select>
+      </div>
+      <div class="field">
+        <label for="optBrim">Brim</label>
+        <select id="optBrim">
+          <option value="no">No</option>
+          <option value="yes">Yes</option>
+        </select>
+      </div>
+      <div class="field">
+        <label><input type="checkbox" id="optHideProfiles"> Hide profile selectors</label>
+      </div>
+      <p class="hint" id="optionsStatus" role="status" aria-live="polite"></p>
+    </section>
 
     <ul class="printer-list" id="printerList" role="list"></ul>
     <div class="empty" id="printerEmpty" hidden>
@@ -566,8 +592,51 @@ async function refreshPrinter() {
 }
 
 /* ---------------- profile ---------------- */
+let profileOptions = {supports:false, brim:true, hide_profiles:false};
+let saveSeq = 0;
+
+function applyProfileVisibility(hide) {
+  const el = $("#profileSelectors");
+  if (el) el.hidden = !!hide;
+}
+
+function applyProfileOptions(o) {
+  const opts = o || {};
+  const supports = !!opts.supports;
+  const brim = !!opts.brim;
+  const hide = !!opts.hide_profiles;
+  $("#optSupports").value = supports ? "yes" : "no";
+  $("#optBrim").value = brim ? "yes" : "no";
+  $("#optHideProfiles").checked = hide;
+  profileOptions = {supports, brim, hide_profiles: hide};
+  applyProfileVisibility(hide);
+}
+
+async function saveOption(key, value) {
+  const seq = ++saveSeq;
+  const r = await fetch("/api/profile/options", {
+    method: "POST",
+    headers: {"Content-Type": "application/json"},
+    body: JSON.stringify({[key]: value}),
+  });
+  const j = await r.json().catch(() => ({}));
+  if (seq !== saveSeq) return;
+  if (!r.ok) {
+    const status = $("#optionsStatus");
+    if (status) status.textContent = "Options not saved: " + (j.detail || r.statusText);
+    toast("Options not saved: " + (j.detail || r.statusText), 5000);
+    applyProfileOptions(profileOptions);
+    return;
+  }
+  applyProfileOptions(j.options || profileOptions);
+  const status = $("#optionsStatus");
+  if (status) status.textContent = "";
+  toast("Options saved");
+}
+
 async function loadProfile() {
   const act = await (await fetch("/api/profile")).json();
+  applyProfileOptions(act.options || {});
   const s = act.presets || {};
   $("#profSource").textContent = act.source;
   const m = s.machine || {}, pr = s.process || {}, f = s.filament || {};
@@ -970,6 +1039,10 @@ function boot() {
     else if (act === "edit") editPrinter(ref);
     else if (act === "delete") deletePrinter(ref, name || ref);
   });
+
+  $("#optSupports").addEventListener("change", ev => saveOption("supports", ev.target.value === "yes"));
+  $("#optBrim").addEventListener("change", ev => saveOption("brim", ev.target.value === "yes"));
+  $("#optHideProfiles").addEventListener("change", ev => saveOption("hide_profiles", !!ev.target.checked));
 
   route();
   loadProfile();

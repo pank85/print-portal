@@ -25,6 +25,7 @@ Endpoints
     GET    /api/profiles         selectable presets per type
     POST   /api/profile/upload   import an .orca_printer bundle or a single preset
     POST   /api/profile/select   choose the active presets
+    POST   /api/profile/options  set the basic slicing options (supports, brim, hide selectors)
 """
 from __future__ import annotations
 
@@ -160,6 +161,15 @@ def relative_to_datadir(path: Path) -> str:
         return str(path)
 
 
+def read_profile_document() -> dict:
+    """The stored profile document; a missing, unreadable or non-object file reads as {}."""
+    try:
+        stored = json.loads(CONFIG.profile_file.read_text())
+    except (OSError, ValueError):
+        return {}
+    return stored if isinstance(stored, dict) else {}
+
+
 def active_paths() -> dict[str, Path]:
     """Which presets the slicer loads: profile.json over the shipped defaults.
 
@@ -169,29 +179,23 @@ def active_paths() -> dict[str, Path]:
     datadir = CONFIG.orca_datadir
     slot = prof.machine_slot(datadir, CONFIG.machine_slot)
     chosen = {**prof.DEFAULT_PROFILE, "machine": relative_to_datadir(slot)}
-    if CONFIG.profile_file.exists():
-        try:
-            stored = json.loads(CONFIG.profile_file.read_text())
-        except json.JSONDecodeError:
-            stored = {}
-        chosen.update({k: v for k, v in stored.items() if k in chosen and v})
+    stored = read_profile_document()
+    chosen.update({k: v for k, v in stored.items() if k in chosen and v})
     return {k: datadir / v for k, v in chosen.items()}
 
 
 def profile_labels() -> dict:
     """The extra (non-preset) keys stored next to the selection, e.g. machine_label."""
-    if not CONFIG.profile_file.exists():
-        return {}
-    try:
-        stored = json.loads(CONFIG.profile_file.read_text())
-    except json.JSONDecodeError:
-        return {}
-    return {k: v for k, v in stored.items() if k not in prof.DEFAULT_PROFILE}
+    return {k: v for k, v in read_profile_document().items() if k not in prof.DEFAULT_PROFILE}
+
+
+def profile_options() -> dict[str, bool]:
+    """The basic slicing options, always fully populated (defaults applied)."""
+    return prof.read_options(read_profile_document())
 
 
 def write_profile_file(data: dict) -> None:
-    CONFIG.profile_file.parent.mkdir(parents=True, exist_ok=True)
-    CONFIG.profile_file.write_text(json.dumps(data, indent=2))
+    prof.write_json_atomic(CONFIG.profile_file, data)
 
 
 # ---------------------------------------------------------------- job storage
@@ -268,10 +272,16 @@ def run_slice(jid: str) -> None:
 
     write_job(jid, status="slicing", error=None, started=time.time())
     paths = active_paths()
+    try:
+        process = prof.write_derived_process(paths["process"], CONFIG.orca_datadir,
+                                             profile_options())
+    except Exception as exc:  # noqa: BLE001 - a job error, never a stale-options slice
+        write_job(jid, status="failed", error=f"profile: {type(exc).__name__}: {exc}")
+        return
     cmd = [
         str(CONFIG.orca_bin),
         "--datadir", str(CONFIG.orca_datadir),
-        "--load-settings", f"{paths['machine']};{paths['process']}",
+        "--load-settings", f"{paths['machine']};{process}",
         "--load-filaments", str(paths["filament"]),
         "--slice", "0",
         "--outputdir", str(out),
@@ -625,6 +635,7 @@ def api_profile():
         "machine_label": profile_labels().get("machine_label"),
         "paths": {k: relative_to_datadir(v) for k, v in paths.items()},
         "presets": {k: prof.summarise(v, k, datadir) for k, v in paths.items()},
+        "options": profile_options(),
     }
 
 
@@ -676,3 +687,21 @@ def api_profile_select(body: dict):
     merged.update(chosen)
     write_profile_file(merged)
     return {"ok": True, "active": merged}
+
+
+@app.post("/api/profile/options")
+def api_profile_options(body: dict):
+    """Merge a partial set of basic options into profile.json.
+
+    ``options`` is a top-level key outside DEFAULT_PROFILE, so profile_labels() carries it
+    through every write of the profile document (select, upload) untouched.
+    """
+    try:
+        update = prof.validate_options(body)
+    except prof.ProfileError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    document = read_profile_document()
+    merged = {**prof.read_options(document), **update}
+    document["options"] = merged
+    write_profile_file(document)
+    return {"ok": True, "options": merged}

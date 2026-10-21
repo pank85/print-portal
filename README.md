@@ -131,6 +131,7 @@ is a secret — treat it like a password.
 | GET | `/api/profiles` | every preset available to the slicer |
 | POST | `/api/profile/upload` | import a `.orca_printer` bundle or preset json |
 | POST | `/api/profile/select` | switch the active machine/process/filament |
+| POST | `/api/profile/options` | set basic slicing options (supports, brim, hide selectors) |
 | GET | `/api/printers` | list configured printers |
 | POST | `/api/printers` | add a printer |
 | PATCH | `/api/printers/{id}` | update a printer |
@@ -139,12 +140,20 @@ is a secret — treat it like a password.
 | POST | `/api/printers/{id}/test` | test printer connection |
 | DELETE | `/api/jobs` | remove all jobs |
 
+
 ## Importing profiles
 
 `POST /api/profile/upload` takes a `.orca_printer` bundle (a ZIP containing `printer/`, `process/`,
 `filament/` and `bundle_structure.json`) or a single preset `.json`, normalises it and writes it
 into the datadir. `POST /api/profile/select` chooses which machine/process/filament the slicer
 loads; the choice is stored in `profile.json`.
+
+### Basic options
+
+`options` lives in `profile.json` with `supports`, `brim`, `hide_profiles`; defaults `false`, `true`, `false`; legacy files without `options` get defaults. Supports is yes/no only; Brim yes/no drives `enable_support` and `brim_type`/`brim_width`. Each slice writes a derived `system/Custom/process/print-portal-options.json` inside `ORCA_DATADIR`; bundled presets are never modified and the derived file is hidden from the picker. The hide toggle hides the dashboard machine/process/filament pickers while slicing uses the saved selection.
+
+- `system/Custom/process/print-portal-options.json` inside `ORCA_DATADIR` is reserved and regenerated on every slice; don't edit it by hand.
+- Concurrent option saves are last-write-wins.
 
 A bundle carries none of the local wiring the CLI needs, so import has to fix it:
 

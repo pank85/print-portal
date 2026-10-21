@@ -7,6 +7,7 @@ built without its context manager, so the lifespan never starts the slicing work
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -145,9 +146,14 @@ def test_upload_accepts_the_maximum_length(storage, api_client, cube_stl):
 
 
 # ---------------------------------------------------------------- slicing
-def test_sliced_output_moves_into_the_sliced_dir(storage, api_client, cube_stl, monkeypatch):
+def test_sliced_output_moves_into_the_sliced_dir(storage, api_client, cube_stl, datadir,
+                                                 monkeypatch):
     jobs, sliced = storage
     jid = upload(api_client, cube_stl, output_name="Benchy v2").json()["id"]
+
+    # run_slice writes the derived preset into the datadir: keep it out of the session copy.
+    monkeypatch.setattr(main, "CONFIG",
+                        dataclasses.replace(main.CONFIG, orca_datadir=datadir))
 
     def fake_run(cmd, **kwargs):
         out = Path(kwargs["cwd"]) / "out"
