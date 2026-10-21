@@ -7,13 +7,20 @@ through Moonraker's HTTP API, so slicing never competes with klippy for CPU.
 Endpoints
     GET    /                     upload UI
     GET    /api/health           process readiness — never touches the printer
-    GET    /api/printer          live printer snapshot
-    POST   /api/upload           multipart file -> creates a job, queues the slice
+    GET    /api/printer          live printer snapshot of the selected printer
+    GET    /api/printers         configured printers (masked keys) + selection
+    POST   /api/printers         add a printer
+    PATCH  /api/printers/{id}    change name/url/api_key
+    DELETE /api/printers/{id}    remove a printer
+    POST   /api/printers/{id}/select  make it the active printer
+    POST   /api/printers/{id}/test    reachability probe (never raises)
+    POST   /api/upload           multipart file (+ optional output_name) -> queues the slice
     GET    /api/jobs             job list
     GET    /api/jobs/{id}        job status + stats
     GET    /api/jobs/{id}/gcode  download the sliced gcode
     POST   /api/jobs/{id}/print  upload the gcode to Moonraker and start it
-    DELETE /api/jobs/{id}        remove job directory
+    DELETE /api/jobs/{id}        remove job directory and its sliced output
+    DELETE /api/jobs             remove every finished job (skips active ones)
     GET    /api/profile          active presets + labels
     GET    /api/profiles         selectable presets per type
     POST   /api/profile/upload   import an .orca_printer bundle or a single preset
@@ -34,31 +41,114 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from fastapi import FastAPI, File, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse
 
 import config
 import moonraker
+import printers
 import profiles as prof
 from gcode import parse_gcode_stats
 
-CONFIG = config.load_config()
+# The env printer is optional here: printers normally live in printers.json. An unconfigured
+# instance still boots so the UI can be used, and printer traffic fails closed per request.
+CONFIG = config.load_config(printer_seed_required=False)
 APP_DIR = Path(__file__).resolve().parent
 ALLOWED = {".stl", ".3mf", ".obj"}
 PROFILE_BUNDLE_MAX = prof.BUNDLE_MAX_BYTES
 PROFILE_BUNDLE_SUFFIXES = (".orca_printer", ".json", ".zip")
 JOB_ID_RE = re.compile(r"[0-9a-f]{12}")
 ACTIVE_STATUSES = ("queued", "slicing")
+OUTPUT_NAME_MAX = 60
+OUTPUT_NAME_ALLOWED_RE = re.compile(r"[A-Za-z0-9 ._-]+")
+OUTPUT_NAME_SEPARATORS = "output_name must be a plain file name without path separators"
+WINDOWS_RESERVED = frozenset(
+    {"CON", "PRN", "AUX", "NUL",
+     *(f"COM{index}" for index in range(1, 10)),
+     *(f"LPT{index}" for index in range(1, 10))})
+NO_PRINTER = ("no printer configured: add one in Settings or set PRINTER_URL and "
+              "MOONRAKER_API_KEY")
 
 JOBS = CONFIG.jobs_dir
 TMP_DIR = CONFIG.data_dir / "tmp"
+SLICED = CONFIG.sliced_dir
 JOBS.mkdir(parents=True, exist_ok=True)
 CONFIG.home_dir.mkdir(parents=True, exist_ok=True)
 TMP_DIR.mkdir(parents=True, exist_ok=True)
+SLICED.mkdir(parents=True, exist_ok=True)
 
-client = moonraker.MoonrakerClient(CONFIG.printer_url, CONFIG.moonraker_api_key,
-                                   CONFIG.moonraker_root)
+STORE = printers.load_printers(CONFIG.printers_file, CONFIG.secret_key_file)
+SEED = (printers.SeededPrinter(id=printers.ENV_PRINTER_ID, name=CONFIG.env_printer_name,
+                               url=CONFIG.env_printer_url, api_key=CONFIG.env_printer_api_key)
+        if CONFIG.env_printer_api_key else None)
 job_queue: "queue.Queue[str]" = queue.Queue()
+
+
+# ---------------------------------------------------------------- printers
+# One resolution path for every printer-touching request: the store is reloaded and the
+# client is rebuilt per call, so switching printers in Settings takes effect immediately.
+def active_target() -> printers.PrintTarget | None:
+    """The printer this request should use, or None when nothing is configured."""
+    try:
+        return STORE.active(SEED)
+    except printers.PrinterStoreError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def current_target() -> printers.PrintTarget:
+    target = active_target()
+    if target is None:
+        raise HTTPException(503, NO_PRINTER)
+    return target
+
+
+def current_client() -> moonraker.MoonrakerClient:
+    """A fresh client for the selected printer — never cached across requests."""
+    target = current_target()
+    return moonraker.MoonrakerClient(target.url, target.api_key, CONFIG.moonraker_root)
+
+
+def printer_call(callback, *args, **kwargs):
+    """Run one store operation, mapping its errors onto the documented HTTP codes."""
+    try:
+        return callback(*args, **kwargs)
+    except printers.PrinterNotFound as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except printers.PrinterReadOnly as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except printers.PrinterError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except printers.PrinterStoreError as exc:
+        raise HTTPException(409, str(exc)) from exc
+
+
+def printer_view(printer_id: str) -> dict:
+    """One PrinterView, taken from the same list GET /api/printers returns."""
+    for view in STORE.views(SEED):
+        if view["id"] == printer_id:
+            return view
+    raise HTTPException(404, f"printer {printer_id!r} not found")
+
+
+def select_printer(printer_id: str) -> None:
+    """Persist the selection; the env id only exists while an env seed is configured.
+
+    Without the seed there is no ``env`` row to select, and persisting it would leave a
+    selection that resolves to no printer at all.
+    """
+    if printer_id == printers.ENV_PRINTER_ID and SEED is None:
+        raise printers.PrinterNotFound(f"printer {printer_id!r} not found")
+    STORE.select(printer_id)
+
+
+def printer_target(printer_id: str) -> printers.PrintTarget:
+    """Resolve one printer by id (env seed included) for the test-connection endpoint."""
+    if printer_id == printers.ENV_PRINTER_ID and SEED is not None:
+        return printers.PrintTarget(id=SEED.id, name=SEED.name, url=SEED.url,
+                                    api_key=SEED.api_key, source="env")
+    stored = printer_call(STORE.get, printer_id)
+    return printers.PrintTarget(id=stored.id, name=stored.name, url=stored.url,
+                                api_key=printer_call(STORE.api_key, stored), source="store")
 
 
 # ---------------------------------------------------------------- active presets
@@ -146,9 +236,31 @@ def write_job(jid: str, **fields) -> dict:
 
 
 # ---------------------------------------------------------------- slicer
+def job_output_name(job: dict) -> str:
+    """The gcode stem for a job: its output_name, else the upload stem for older jobs."""
+    return job.get("output_name") or Path(job.get("filename") or "").stem or "model"
+
+
+def gcode_path(jid: str, job: dict) -> Path | None:
+    """SLICED/<jid>/<basename> when present, else the legacy JOBS/<jid>/out/<basename>.
+
+    ``Path(name).name`` keeps a corrupted or hand-edited job.json from resolving outside
+    the two directories this app owns.
+    """
+    name = Path(job.get("gcode") or "").name
+    if not name:
+        return None
+    for candidate in (SLICED / jid / name, JOBS / jid / "out" / name):
+        if candidate.is_file():
+            return candidate
+    return None
+
+
+# ---------------------------------------------------------------- slicer
 def run_slice(jid: str) -> None:
+    job = read_job(jid)
     d = job_dir(jid)
-    src = d / "upload" / read_job(jid)["filename"]
+    src = d / "upload" / job["filename"]
     out = d / "out"
     if out.exists():
         shutil.rmtree(out)
@@ -191,8 +303,13 @@ def run_slice(jid: str) -> None:
             return
         gcode = gcodes[0]
         stats = parse_gcode_stats(gcode)
-        write_job(jid, status="sliced", elapsed=elapsed, gcode=gcode.name,
-                  gcode_bytes=gcode.stat().st_size, stats=stats,
+        # The sliced dir is the single home for gcode; shutil.move survives a separate
+        # SLICED_DIR mount, where os.replace would fail with EXDEV.
+        target = SLICED / jid / f"{job_output_name(job)}.gcode"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(gcode), str(target))
+        write_job(jid, status="sliced", elapsed=elapsed, gcode=target.name,
+                  gcode_dir="sliced", gcode_bytes=target.stat().st_size, stats=stats,
                   layer_height=(result.get("layer_height") or stats.get("layer_height")))
     except subprocess.TimeoutExpired:
         write_job(jid, status="failed", error=f"slice timed out after {CONFIG.slice_timeout}s")
@@ -268,7 +385,7 @@ def api_health():
     """Readiness only: config is loaded by import, and our own dirs must be writable."""
     problems = []
     for label, path in (("jobs", CONFIG.jobs_dir), ("home", CONFIG.home_dir),
-                        ("datadir", CONFIG.orca_datadir)):
+                        ("datadir", CONFIG.orca_datadir), ("sliced", SLICED)):
         if not path.is_dir():
             try:
                 path.mkdir(parents=True, exist_ok=True)
@@ -280,23 +397,118 @@ def api_health():
     body = {"status": "ok", "app": "print-portal", "version": config.VERSION}
     if problems:
         raise HTTPException(503, "; ".join(problems))
+    if active_target() is None:
+        raise HTTPException(503, NO_PRINTER)
     return body
 
 
 @app.get("/api/printer")
 def api_printer():
-    info = client.printer_state()
-    info["host"] = CONFIG.printer_url
+    target = current_target()
+    info = current_client().printer_state()
+    info["host"] = target.url
+    info["printer"] = {"id": target.id, "name": target.name, "source": target.source}
     return info
 
 
+# ---------------------------------------------------------------- printers API
+@app.get("/api/printers")
+def api_printers():
+    """Masked printer views plus the selection; ``warning`` reports a corrupt file."""
+    views = STORE.views(SEED)          # reloads the file, so STORE.corrupt is current too
+    return {"printers": views, "selected_id": STORE.selected_id(),
+            "env_seed": SEED is not None, "warning": STORE.corrupt}
+
+
+@app.post("/api/printers", status_code=201)
+def api_add_printer(body: dict):
+    printer = printer_call(STORE.add, body.get("name"), body.get("url"), body.get("api_key"))
+    return {"printer": printer_view(printer.id), "printers": STORE.views(SEED),
+            "selected_id": STORE.selected_id()}
+
+
+@app.patch("/api/printers/{pid}")
+def api_update_printer(pid: str, body: dict):
+    printer = printer_call(STORE.update, pid, name=body.get("name"), url=body.get("url"),
+                           api_key=body.get("api_key"))
+    return {"printer": printer_view(printer.id), "printers": STORE.views(SEED),
+            "selected_id": STORE.selected_id()}
+
+
+@app.delete("/api/printers/{pid}")
+def api_delete_printer(pid: str):
+    selected = printer_call(STORE.delete, pid)
+    return {"deleted": pid, "printers": STORE.views(SEED), "selected_id": selected}
+
+
+@app.post("/api/printers/{pid}/select")
+def api_select_printer(pid: str):
+    printer_call(select_printer, pid)
+    return {"selected_id": STORE.selected_id(), "printers": STORE.views(SEED)}
+
+
+@app.post("/api/printers/{pid}/test")
+def api_test_printer(pid: str):
+    """Probe one printer without touching the selection; an offline printer is a 200."""
+    target = printer_target(pid)
+    started = time.monotonic()
+    info = moonraker.MoonrakerClient(target.url, target.api_key,
+                                     CONFIG.moonraker_root).printer_state()
+    elapsed_ms = int((time.monotonic() - started) * 1000)
+    return {"ok": bool(info.get("ok")), "state": info.get("state") or "unknown",
+            "webhooks": info.get("webhooks"), "error": info.get("error"),
+            "url": target.url, "ms": elapsed_ms}
+
+
+# ---------------------------------------------------------------- upload
+def normalise_output_name(raw: object, fallback_stem: str) -> str:
+    """A plain gcode stem: no separators, no reserved device names, at most 60 characters.
+
+    An empty ``raw`` falls back to the uploaded file's stem, which is cleaned the same way;
+    a stem that cannot be saved falls back to ``model``.
+    """
+    name = str(raw or "").strip()
+    if name:
+        return _validated_output_name(name)
+    try:
+        return _validated_output_name(str(fallback_stem or "").strip())
+    except HTTPException:
+        return "model"
+
+
+def _validated_output_name(name: str) -> str:
+    """Raise HTTP 400 for anything that is not a plain, portable file stem."""
+    if (not name or name in (".", "..") or name.startswith(".")
+            or "/" in name or "\\" in name
+            or any(char < " " or char == "\x7f" for char in name)):
+        raise HTTPException(400, OUTPUT_NAME_SEPARATORS)
+    if name.split(".", 1)[0].strip().upper() in WINDOWS_RESERVED:
+        raise HTTPException(400, OUTPUT_NAME_SEPARATORS)
+    if name.lower().endswith(".gcode"):
+        name = name[:-len(".gcode")]
+    name = name.rstrip(" .")
+    if not name:
+        raise HTTPException(400, OUTPUT_NAME_SEPARATORS)
+    offending = sorted(set(re.sub(OUTPUT_NAME_ALLOWED_RE, "", name)))
+    if offending:
+        raise HTTPException(
+            400, "output_name may only contain letters, digits, spaces, dots, dashes and "
+                 f"underscores: remove {', '.join(repr(char) for char in offending)}")
+    if len(name) > OUTPUT_NAME_MAX:
+        raise HTTPException(400, f"output_name must be at most {OUTPUT_NAME_MAX} characters")
+    return name
+
+
 @app.post("/api/upload")
-async def api_upload(request: Request, file: UploadFile = File(...)):
+async def api_upload(request: Request, file: UploadFile = File(...),
+                     output_name: str | None = Form(None)):
     reject_oversize(request, CONFIG.max_upload_bytes,
                     f"file larger than {CONFIG.max_upload_bytes // (1024*1024)} MB")
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED:
         raise HTTPException(400, f"unsupported file type '{suffix}' (allowed: {', '.join(sorted(ALLOWED))})")
+    stem = Path(file.filename or f"model{suffix}").stem
+    name = normalise_output_name(output_name, stem)
     jid = uuid.uuid4().hex[:12]
     d = JOBS / jid
     (d / "upload").mkdir(parents=True)
@@ -309,7 +521,7 @@ async def api_upload(request: Request, file: UploadFile = File(...)):
                 shutil.rmtree(d, ignore_errors=True)
                 raise HTTPException(413, f"file larger than {CONFIG.max_upload_bytes // (1024*1024)} MB")
             fh.write(chunk)
-    write_job(jid, status="queued", filename=dest.name, upload_bytes=size,
+    write_job(jid, status="queued", filename=dest.name, output_name=name, upload_bytes=size,
               created=datetime.now(timezone.utc).isoformat(timespec="seconds"))
     job_queue.put(jid)
     return {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
@@ -336,10 +548,10 @@ def api_job(jid: str):
 @app.get("/api/jobs/{jid}/gcode")
 def api_gcode(jid: str):
     job = read_job(jid)
-    gcode = job_dir(jid) / "out" / (job.get("gcode") or "")
-    if not job.get("gcode") or not gcode.exists():
+    gcode = gcode_path(jid, job)
+    if gcode is None:
         raise HTTPException(409, "not sliced yet")
-    return FileResponse(gcode, filename=Path(job["filename"]).stem + ".gcode")
+    return FileResponse(gcode, filename=job_output_name(job) + ".gcode")
 
 
 @app.post("/api/jobs/{jid}/print")
@@ -347,7 +559,11 @@ def api_print(jid: str):
     job = read_job(jid)
     if job.get("status") != "sliced":
         raise HTTPException(409, f"job is '{job.get('status')}', not sliced")
+    gcode = gcode_path(jid, job)
+    if gcode is None:
+        raise HTTPException(409, "not sliced yet")
 
+    client = current_client()
     try:
         info = client.printer_status()
     except moonraker.MoonrakerError as exc:
@@ -357,8 +573,7 @@ def api_print(jid: str):
     if info["state"] not in ("standby", "complete"):
         raise HTTPException(409, f"printer busy: state={info['state']}")
 
-    gcode = job_dir(jid) / "out" / job["gcode"]
-    remote_name = f"portal_{jid}_{Path(job['filename']).stem}.gcode"[:90]
+    remote_name = f"portal_{jid}_{job_output_name(job)}.gcode"[:90]
     try:
         client.upload(gcode, remote_name)
         client.start_print(remote_name)
@@ -371,9 +586,32 @@ def api_print(jid: str):
     return {"started": True, "remote_file": remote_name}
 
 
+@app.delete("/api/jobs")
+def api_delete_all_jobs():
+    """Bulk cleanup of finished jobs. Every path comes from JOBS itself, never the request."""
+    deleted: list[str] = []
+    skipped: list[str] = []
+    for d in sorted(JOBS.iterdir()):
+        if not d.is_dir() or not JOB_ID_RE.fullmatch(d.name):
+            continue
+        try:
+            status = json.loads((d / "job.json").read_text()).get("status")
+        except (OSError, ValueError, AttributeError):
+            status = None
+        if status in ACTIVE_STATUSES:
+            skipped.append(d.name)
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        shutil.rmtree(SLICED / d.name, ignore_errors=True)
+        deleted.append(d.name)
+    return {"deleted": len(deleted), "skipped": len(skipped),
+            "deleted_ids": deleted, "skipped_ids": skipped}
+
+
 @app.delete("/api/jobs/{jid}")
 def api_delete(jid: str):
     shutil.rmtree(job_dir(jid), ignore_errors=True)
+    shutil.rmtree(SLICED / jid, ignore_errors=True)
     return {"deleted": jid}
 
 

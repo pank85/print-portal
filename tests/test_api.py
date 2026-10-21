@@ -3,7 +3,7 @@
 The client fixture is a plain ``TestClient(main.app)`` (no ``with``), so the lifespan never
 starts the slicing worker and an uploaded job stays ``queued``. Printer answers are faked
 either by monkeypatching ``urllib.request.urlopen`` (real client, real error mapping) or by
-swapping ``main.client`` for a stub (so the endpoint logic sees a chosen state).
+swapping ``main.current_client`` for a stub (so the endpoint logic sees a chosen state).
 """
 from __future__ import annotations
 
@@ -26,7 +26,7 @@ import moonraker
 
 
 class StubPrinter:
-    """Stand-in for main.client: answers from a canned status or raises a canned error."""
+    """Stand-in for main.current_client: answers from a canned status or raises a canned error."""
 
     def __init__(self, status: dict | None = None, error: Exception | None = None) -> None:
         self.status = status
@@ -308,7 +308,7 @@ def test_print_requires_a_sliced_job(client, jobs_dir, cube_stl):
 
 def test_print_maps_an_unreachable_printer_to_503(client, jobs_dir, monkeypatch):
     sliced_job(jobs_dir)
-    monkeypatch.setattr(main, "client", StubPrinter(
+    monkeypatch.setattr(main, "current_client", lambda: StubPrinter(
         error=moonraker.MoonrakerUnreachable(
             "printer unreachable at http://moonraker.invalid:7125")))
 
@@ -367,7 +367,7 @@ def test_print_maps_a_rejected_api_key_to_502(client, jobs_dir, monkeypatch):
 
 def test_print_refuses_while_klipper_is_not_ready(client, jobs_dir, monkeypatch):
     sliced_job(jobs_dir)
-    monkeypatch.setattr(main, "client", StubPrinter(
+    monkeypatch.setattr(main, "current_client", lambda: StubPrinter(
         status={"webhooks": "startup", "state": "standby"}))
 
     response = client.post("/api/jobs/decafbad1234/print")
@@ -378,7 +378,7 @@ def test_print_refuses_while_klipper_is_not_ready(client, jobs_dir, monkeypatch)
 
 def test_print_refuses_while_the_printer_is_busy(client, jobs_dir, monkeypatch):
     sliced_job(jobs_dir)
-    monkeypatch.setattr(main, "client", StubPrinter(
+    monkeypatch.setattr(main, "current_client", lambda: StubPrinter(
         status={"webhooks": "ready", "state": "printing"}))
 
     response = client.post("/api/jobs/decafbad1234/print")
@@ -390,7 +390,7 @@ def test_print_refuses_while_the_printer_is_busy(client, jobs_dir, monkeypatch):
 def test_print_uploads_then_starts_the_gcode(client, jobs_dir, monkeypatch):
     sliced_job(jobs_dir)
     stub = StubPrinter(status={"webhooks": "ready", "state": "standby"})
-    monkeypatch.setattr(main, "client", stub)
+    monkeypatch.setattr(main, "current_client", lambda: stub)
 
     response = client.post("/api/jobs/decafbad1234/print")
 
@@ -417,7 +417,7 @@ def test_print_failure_after_the_upload_is_recorded_on_the_job(client, jobs_dir,
             f"file did not land in the 'gcodes' root: {filename}")
 
     stub.start_print = missing                # type: ignore[method-assign]
-    monkeypatch.setattr(main, "client", stub)
+    monkeypatch.setattr(main, "current_client", lambda: stub)
 
     response = client.post("/api/jobs/decafbad1234/print")
 
@@ -430,3 +430,51 @@ def test_print_failure_after_the_upload_is_recorded_on_the_job(client, jobs_dir,
 
 def test_print_on_an_unknown_job_is_404(client):
     assert client.post("/api/jobs/deadbeef/print").status_code == 404
+
+
+# ---------------------------------------------------------------- ui tests (F4)
+def test_env_seed_bootstraps_the_first_printer(client):
+    r = client.get("/api/printers")
+    assert r.status_code == 200
+    body = r.json()
+    printers = body["printers"]
+    env_rows = [p for p in printers if p["id"] == "env"]
+    assert len(env_rows) == 1
+    p = env_rows[0]
+    assert p["source"] == "env"
+    assert p["api_key_masked"] is not None
+    assert "•" in p["api_key_masked"]
+    assert main.current_target().id == "env"
+
+
+def test_store_printer_takes_over_from_the_env_seed(client, monkeypatch):
+    r = client.post("/api/printers", json={"name": "store1", "url": "http://store.invalid", "api_key": "store-key"})
+    assert r.status_code == 201
+    pid = r.json()["printer"]["id"]
+    client.post(f"/api/printers/{pid}/select")
+    body = client.get("/api/printers").json()
+    assert body["selected_id"] == pid
+    ids = [p["id"] for p in body["printers"]]
+    assert "env" in ids
+    # current_target uses store printer
+    assert main.current_target().url == "http://store.invalid"
+
+
+def test_index_page_has_no_external_dependencies(client):
+    r = client.get("/")
+    assert r.status_code == 200
+    assert "text/html" in r.headers.get("content-type", "")
+    text = r.text
+    for bad in ['src="http', 'href="http', "cdn.", "@import", "fonts.googleapis"]:
+        assert bad not in text, bad
+
+
+def test_settings_view_ids_are_present(client):
+    text = client.get("/").text
+    for vid in ["viewSettings", "printerForm", "btnDeleteAll", "outputName", "printerList"]:
+        assert f'id="{vid}"' in text
+
+
+def test_index_page_never_references_main_client_state(client):
+    import main as m
+    assert not hasattr(m, "client")

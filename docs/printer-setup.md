@@ -35,6 +35,12 @@ Put the key in `.env` as `MOONRAKER_API_KEY`. It is a secret — do not commit `
 convenience for browser access to the printer's own UI; it is **not** a substitute for the portal's
 own access control, and it does not protect the portal's port. See [SECURITY.md](../SECURITY.md).
 
+## UI-managed variant
+
+Printers can also be managed entirely in the portal UI: open **Settings → Add printer** and paste
+the Moonraker URL and API key there. In that mode `PRINTER_URL` and `MOONRAKER_API_KEY` are left
+unset, and the portal boots unconfigured (printer routes return 503 until a printer is added).
+
 ## 3. CORS is not needed
 
 The portal makes server-side calls to Moonraker from inside the container. The browser never talks
