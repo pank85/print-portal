@@ -11,10 +11,13 @@ runs and the slicing worker thread never starts.
 """
 from __future__ import annotations
 
+import io
+import json
 import os
 import shutil
 import sys
 import tempfile
+import zipfile
 from pathlib import Path
 
 import pytest
@@ -108,3 +111,78 @@ def client(jobs_dir: Path, printers_file: Path, sliced_dir: Path, monkeypatch: p
 @pytest.fixture(scope="session")
 def cube_stl() -> bytes:
     return (FIXTURES / "cube.stl").read_bytes()
+
+
+@pytest.fixture
+def zip_bytes():
+    def _build(members: dict[str, bytes]) -> bytes:
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+        return buf.getvalue()
+    return _build
+
+
+@pytest.fixture
+def zip_bytes_with():
+    def _build(members, *, symlink_name=None, traversal_name=None):
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            for name, data in members.items():
+                z.writestr(name, data)
+            if symlink_name is not None:
+                zi = zipfile.ZipInfo(symlink_name)
+                zi.external_attr = (0o120777 << 16)
+                z.writestr(zi, b"")
+            if traversal_name is not None:
+                z.writestr(traversal_name, b"evil")
+        return buf.getvalue()
+    return _build
+
+
+@pytest.fixture
+def write_bytes_fixture():
+    def _write(tmp_path, name, blob) -> Path:
+        p = tmp_path / name
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_bytes(blob)
+        return p
+    return _write
+
+
+@pytest.fixture
+def three_mf_bytes():
+    def _build(*, printer="Generic Klipper 0.4 nozzle", printer_model="Generic Klipper Printer",
+               variant="0.4", process="0.20mm Standard @Generic Klipper",
+               filaments=("Generic PLA",), settings_member="project_settings.config",
+               extra=None, model_members=True) -> bytes:
+        settings_obj = {
+            "printer_settings_id": [printer],
+            "printer_model": [printer_model],
+            "printer_variant": [variant],
+            "print_settings_id": [process],
+            "filament_settings_id": [f for f in filaments],
+        }
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
+            z.writestr("[Content_Types].xml", "<?xml version='1.0'?><Types xmlns='http://schemas.openxmlformats.org/package/2006/content-types'></Types>")
+            z.writestr("_rels/.rels", "<?xml version='1.0'?><Relationships xmlns='http://schemas.openxmlformats.org/package/2006/relationships'></Relationships>")
+            z.writestr("3D/3dmodel.model", "<?xml version='1.0'?><model unit='millimeter' xmlns='http://schemas.microsoft.com/3dmanufacturing/core/2015/02'></model>")
+            if settings_member is not None:
+                name = settings_member if "/" in settings_member else "Metadata/" + settings_member
+                if settings_member.endswith("Slic3r_PE.config") or settings_member == "Slic3r_PE.config":
+                    lines = [f"printer_settings_id = {printer}", f"printer_model = {printer_model}",
+                             f"printer_variant = {variant}", f"print_settings_id = {process}",
+                             f"filament_settings_id = {filaments[0] if filaments else ''}"]
+                    data = ("\n".join(lines) + "\n").encode()
+                else:
+                    data = json.dumps(settings_obj).encode()
+                z.writestr(name, data)
+            if model_members:
+                z.writestr("Metadata/model_settings.config", "<?xml version='1.0'?><config></config>")
+            if extra:
+                for n, d in extra.items():
+                    z.writestr(n, d)
+        return buf.getvalue()
+    return _build

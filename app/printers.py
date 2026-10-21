@@ -30,7 +30,8 @@ from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet, InvalidToken
 
-PRINTERS_VERSION = 1
+PRINTERS_VERSION = 2
+PROFILE_SLOTS = ("machine", "process")
 NAME_MAX = 60
 URL_MAX = 300
 API_KEY_MAX = 256
@@ -44,6 +45,8 @@ DECRYPT_ERROR = ("stored API key cannot be decrypted with this key file; "
                  "re-enter the key in Settings")
 READ_ONLY_ERROR = ("the environment printer is read-only: change PRINTER_URL and "
                    "MOONRAKER_API_KEY in the deployment instead")
+PROFILES_SHAPE_ERROR = "profiles must be an object with machine/process paths"
+PROFILE_PATH_ERROR = "profile path must be relative to the datadir"
 
 
 class PrinterError(RuntimeError):
@@ -64,13 +67,18 @@ class PrinterStoreError(RuntimeError):
 
 @dataclass(frozen=True, slots=True)
 class Printer:
-    """One persisted printer. ``api_key_enc`` is a Fernet token, never the key itself."""
+    """One persisted printer. ``api_key_enc`` is a Fernet token, never the key itself.
+
+    ``profiles`` is the optional machine/process pairing as datadir-relative ``.json``
+    paths; ``None`` means the printer inherits the global selection in ``profile.json``.
+    """
     id: str
     name: str
     url: str
     api_key_enc: str
     created: str
     updated: str
+    profiles: dict[str, str] | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -209,6 +217,40 @@ def _has_control(text: str) -> bool:
     return any(char < " " or char == "\x7f" for char in text)
 
 
+def normalise_profiles(raw: object) -> dict[str, str] | None:
+    """Shape-only validation of a printer's profile pairing (this module has no datadir).
+
+    ``None``, ``{}`` and a dict whose slots are all ``None`` all mean "inherit the global
+    profile selection", so they normalise to ``None``. A slot value has to be a usable
+    datadir-relative ``.json`` path; whether that preset exists is checked by the API
+    layer, which knows ``CONFIG.orca_datadir``.
+    """
+    if raw is None:
+        return None
+    if not isinstance(raw, dict):
+        raise PrinterError(PROFILES_SHAPE_ERROR)
+    unknown = [key for key in raw if key not in PROFILE_SLOTS]
+    if unknown:
+        raise PrinterError(f"unknown profile slot: {unknown[0]!r}")
+    profiles: dict[str, str] = {}
+    for slot in PROFILE_SLOTS:
+        value = raw.get(slot)
+        if value is None:
+            continue
+        if not isinstance(value, str) or not value:
+            raise PrinterError(PROFILES_SHAPE_ERROR)
+        profiles[slot] = normalise_profile_path(value)
+    return profiles or None
+
+
+def normalise_profile_path(raw: str) -> str:
+    """A preset path relative to the datadir: POSIX separators, no ``..``, ends in ``.json``."""
+    if (raw.startswith("/") or "\\" in raw or not raw.endswith(".json")
+            or any(part in ("", ".", "..") for part in raw.split("/"))):
+        raise PrinterError(PROFILE_PATH_ERROR)
+    return raw
+
+
 # ---------------------------------------------------------------- persistence helpers
 def _timestamp() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -234,8 +276,12 @@ def _atomic_write(path: Path, data: dict) -> None:
         raise
 
 
-def _parse_printer(entry: object) -> Printer | None:
-    """Validate one stored printer; ``None`` means the document is unusable."""
+def _parse_printer(entry: object, version: int) -> Printer | None:
+    """Validate one stored printer; ``None`` means the document is unusable.
+
+    Only version 2 records carry a pairing: a version 1 record parses with
+    ``profiles=None``, and a stray ``profiles`` key there is dropped, not trusted.
+    """
     if not isinstance(entry, dict):
         return None
     fields: dict[str, str] = {}
@@ -246,11 +292,16 @@ def _parse_printer(entry: object) -> Printer | None:
         fields[field] = value
     if not PRINTER_ID_RE.fullmatch(fields["id"]):
         return None
-    return Printer(**fields)
+    profiles = normalise_profiles(entry.get("profiles")) if version >= 2 else None
+    return Printer(**fields, profiles=profiles)
 
 
 def _parse_document(data: object) -> tuple[list[Printer], str | None, str | None]:
-    """Return ``(printers, selected_id, error)`` for a decoded ``printers.json``."""
+    """Return ``(printers, selected_id, error)`` for a decoded ``printers.json``.
+
+    Versions 1 and 2 load; a version 1 document reads with ``profiles=None`` and is only
+    rewritten as version 2 by the next mutation, so reading never migrates the file.
+    """
     if not isinstance(data, dict):
         return [], None, "printers.json must contain a JSON object"
     version = data.get("version")
@@ -258,7 +309,7 @@ def _parse_document(data: object) -> tuple[list[Printer], str | None, str | None
         return [], None, f"printers.json has no integer version (found {version!r})"
     if version > PRINTERS_VERSION:
         return [], None, f"printers.json version {version} is newer than this build"
-    if version != PRINTERS_VERSION:
+    if version not in (1, PRINTERS_VERSION):
         return [], None, (f"printers.json version {version} is not supported "
                           f"(this build writes version {PRINTERS_VERSION})")
     selected = data.get("selected_id")
@@ -271,7 +322,10 @@ def _parse_document(data: object) -> tuple[list[Printer], str | None, str | None
         return [], None, "printers.json printers must be a list"
     printers = []
     for entry in entries:
-        printer = _parse_printer(entry)
+        try:
+            printer = _parse_printer(entry, version)
+        except PrinterError as exc:
+            return [], None, f"printers.json contains an invalid profile pairing: {exc}"
         if printer is None:
             return [], None, "printers.json contains a printer record with missing fields"
         printers.append(printer)
@@ -279,6 +333,9 @@ def _parse_document(data: object) -> tuple[list[Printer], str | None, str | None
 
 
 # ---------------------------------------------------------------- store
+_UNCHANGED = object()      # ``update(profiles=...)`` without a pairing argument
+
+
 def load_printers(path: Path, key_file: Path | None = None) -> PrinterStore:
     """Open the store at ``path``; ``key_file`` defaults to ``secret.key`` next to it."""
     return PrinterStore.open(path, key_file)
@@ -419,6 +476,7 @@ class PrinterStore:
                     "selected": printer.id == selected,
                     "source": "store",
                     "editable": True,
+                    "profiles": self._pairing(printer),
                     "created": printer.created,
                     "updated": printer.updated,
                 })
@@ -432,6 +490,7 @@ class PrinterStore:
                     "selected": selected == ENV_PRINTER_ID,
                     "source": "env",
                     "editable": False,
+                    "profiles": {slot: None for slot in PROFILE_SLOTS},
                     "created": None,
                     "updated": None,
                 })
@@ -476,6 +535,11 @@ class PrinterStore:
                            api_key=decrypt_secret(printer.api_key_enc, self._key),
                            source="store")
 
+    def _pairing(self, printer: Printer) -> dict[str, str | None]:
+        """The pairing shape the UI edits: every slot present, ``None`` = inherit."""
+        stored = printer.profiles or {}
+        return {slot: stored.get(slot) for slot in PROFILE_SLOTS}
+
     def _masked(self, printer: Printer) -> str:
         """Bullets only when the token does not match this key file, never a failure."""
         try:
@@ -484,18 +548,25 @@ class PrinterStore:
             return MASK
 
     # -- mutations
-    def add(self, name: object, url: object, api_key: object) -> Printer:
-        """Append a printer; the first one in an empty store becomes the selection."""
+    def add(self, name: object, url: object, api_key: object,
+            *, profiles: object = None) -> Printer:
+        """Append a printer; the first one in an empty store becomes the selection.
+
+        ``profiles`` is the optional machine/process pairing (datadir-relative paths);
+        ``None`` or an all-``None`` dict stores no pairing, i.e. the printer inherits the
+        global profile selection.
+        """
         name = normalise_name(name)
         url = normalise_url(url)
         api_key = normalise_api_key(api_key)
+        pairing = normalise_profiles(profiles)
         with self._lock:
             self._read()
             self._require_writable()
             stamp = _timestamp()
             printer = Printer(id=self._new_id(), name=name, url=url,
                               api_key_enc=encrypt_secret(api_key, self._key),
-                              created=stamp, updated=stamp)
+                              created=stamp, updated=stamp, profiles=pairing)
             first = not self._printers
             self._printers.append(printer)
             if first:
@@ -504,15 +575,24 @@ class PrinterStore:
             return printer
 
     def update(self, printer_id: str, *, name: object = None, url: object = None,
-               api_key: object = None) -> Printer:
-        """Change the supplied fields; an omitted API key keeps the stored token."""
+               api_key: object = None,
+               profiles: object = _UNCHANGED) -> Printer:
+        """Change the supplied fields; an omitted API key keeps the stored token.
+
+        ``profiles`` tells "leave the pairing alone" apart from "clear it": the
+        ``_UNCHANGED`` sentinel default keeps the stored pairing, ``None`` / ``{}`` / an
+        all-``None`` dict clears it to ``None`` (the printer then inherits the global
+        profile selection), and a supplied dict *is* the complete pairing — a slot left
+        out of it is cleared, so this is a replace, not a merge.
+        """
         with self._lock:
             self._read()
             self._require_writable()
             if printer_id == ENV_PRINTER_ID:
                 raise PrinterReadOnly(READ_ONLY_ERROR)
             index = self._index_of(printer_id)
-            if name is None and url is None and api_key is None:
+            if (name is None and url is None and api_key is None
+                    and profiles is _UNCHANGED):
                 raise PrinterError("nothing to update")
             current = self._printers[index]
             updated = Printer(
@@ -523,6 +603,8 @@ class PrinterStore:
                              if api_key is not None else current.api_key_enc),
                 created=current.created,
                 updated=_timestamp(),
+                profiles=(current.profiles if profiles is _UNCHANGED
+                          else normalise_profiles(profiles)),
             )
             self._printers[index] = updated
             self._write()

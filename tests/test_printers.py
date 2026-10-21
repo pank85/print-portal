@@ -17,6 +17,9 @@ import printers
 
 URL = "http://voron.lan:7125"
 KEY = "0123456789abcdef"
+MACHINE_REL = "system/Custom/machine/generic-klipper-0.4.json"
+PROCESS_REL = "system/Custom/process/generic-0.20-standard.json"
+PAIRING = {"machine": MACHINE_REL, "process": PROCESS_REL}
 SEED = printers.SeededPrinter(id=printers.ENV_PRINTER_ID, name="Environment",
                               url="http://env.lan:7125", api_key="env-secret-9999")
 
@@ -152,11 +155,13 @@ def test_add_printer_persists_a_versioned_file_with_encrypted_key(
     data = stored_json(store)
 
     assert KEY not in raw
-    assert data["version"] == printers.PRINTERS_VERSION == 1
+    assert data["version"] == printers.PRINTERS_VERSION == 2
     assert data["selected_id"] == printer.id
     assert len(data["printers"]) == 1
     entry = data["printers"][0]
-    assert set(entry) == {"id", "name", "url", "api_key_enc", "created", "updated"}
+    assert set(entry) == {"id", "name", "url", "api_key_enc", "created", "updated",
+                          "profiles"}
+    assert entry["profiles"] is None
     assert printers.PRINTER_ID_RE.fullmatch(entry["id"])
     assert entry["id"] == printer.id
     assert entry["name"] == "Voron 2.4"
@@ -327,7 +332,7 @@ def test_views_mask_keys_and_hide_the_token(store: printers.PrinterStore) -> Non
     assert len(views) == 2
     stored, env = views
     assert set(stored) == {"id", "name", "url", "api_key_masked", "has_api_key", "selected",
-                           "source", "editable", "created", "updated"}
+                           "source", "editable", "profiles", "created", "updated"}
     assert stored["id"] == printer.id
     assert stored["api_key_masked"] == printers.MASK + "cdef"
     assert stored["has_api_key"] is True
@@ -461,3 +466,141 @@ def test_newer_version_is_a_store_error(store: printers.PrinterStore) -> None:
         store.add("Voron", URL, KEY)
 
     assert stored_json(store)["version"] == printers.PRINTERS_VERSION + 1
+
+
+# ---------------------------------------------------------------- pairing
+def stored_entry(store: printers.PrinterStore, printer_id: str = "a1b2c3d4e5f6",
+                 name: str = "Voron 2.4") -> dict:
+    """One ``printers.json`` record exactly as a version 1 build wrote it (no pairing)."""
+    key = printers.load_or_create_key(store.path.with_name("secret.key"))
+    stamp = "2026-01-01T00:00:00+00:00"
+    return {"id": printer_id, "name": name, "url": URL,
+            "api_key_enc": printers.encrypt_secret(KEY, key),
+            "created": stamp, "updated": stamp}
+
+
+def test_printer_profiles_are_persisted_and_read_back(store: printers.PrinterStore) -> None:
+    printer = store.add("Voron 2.4", URL, KEY, profiles=PAIRING)
+
+    assert printer.profiles == PAIRING
+    assert stored_json(store)["printers"][0]["profiles"] == PAIRING
+
+    reloaded = printers.PrinterStore.open(store.path, store.path.with_name("secret.key"))
+
+    assert reloaded.get(printer.id).profiles == PAIRING
+    assert reloaded.views(SEED)[0]["profiles"] == PAIRING
+
+
+def test_printer_profiles_default_to_none_for_version_1_documents(
+        store: printers.PrinterStore) -> None:
+    entry = stored_entry(store)
+    store.path.write_text(json.dumps({"version": 1, "selected_id": entry["id"],
+                                      "printers": [entry]}), encoding="utf-8")
+
+    store.reload()
+
+    assert store.corrupt is None
+    assert store.get(entry["id"]).profiles is None
+    active = store.active()
+    assert active is not None and active.id == entry["id"] and active.api_key == KEY
+    assert stored_json(store)["version"] == 1        # reading never migrates the file
+
+
+def test_version_1_document_is_rewritten_as_version_2_on_next_write(
+        store: printers.PrinterStore) -> None:
+    first = stored_entry(store, "a1b2c3d4e5f6", "Voron 2.4")
+    second = stored_entry(store, "0f1e2d3c4b5a", "Trident")
+    store.path.write_text(json.dumps({"version": 1, "selected_id": second["id"],
+                                      "printers": [first, second]}), encoding="utf-8")
+    store.reload()
+
+    store.update(first["id"], name="Voron 2.4 XL")
+
+    data = stored_json(store)
+    assert data["version"] == printers.PRINTERS_VERSION == 2
+    assert [entry["id"] for entry in data["printers"]] == [first["id"], second["id"]]
+    assert data["selected_id"] == second["id"]
+    assert [entry["profiles"] for entry in data["printers"]] == [None, None]
+    assert store.selected_id() == second["id"]
+
+    store.add("Voron Zero", URL, KEY)
+
+    data = stored_json(store)
+    assert data["version"] == printers.PRINTERS_VERSION
+    assert [entry["id"] for entry in data["printers"]][:2] == [first["id"], second["id"]]
+    assert data["selected_id"] == second["id"]
+    assert data["printers"][-1]["profiles"] is None
+
+
+@pytest.mark.parametrize("profiles, message", [
+    ({"machine": "../x.json"}, "profile path must be relative to the datadir"),
+    ({"machine": "/abs/x.json"}, "profile path must be relative to the datadir"),
+    ({"machine": "notjson"}, "profile path must be relative to the datadir"),
+    ({"machine": 3}, "profiles must be an object with machine/process paths"),
+    ({"slicer": "x.json"}, "unknown profile slot: 'slicer'"),
+])
+def test_printer_profiles_reject_unsafe_or_unknown_paths(
+        store: printers.PrinterStore, profiles: object, message: str) -> None:
+    with pytest.raises(printers.PrinterError, match=message):
+        store.add("Voron 2.4", URL, KEY, profiles=profiles)
+    assert store.all() == []                         # a rejected pairing writes nothing
+
+    printer = add(store)
+
+    with pytest.raises(printers.PrinterError, match=message):
+        store.update(printer.id, profiles=profiles)
+    assert store.get(printer.id) == printer
+
+    document = {"version": printers.PRINTERS_VERSION, "selected_id": printer.id,
+                "printers": [dict(stored_entry(store, printer.id), profiles=profiles)]}
+    store.path.write_text(json.dumps(document), encoding="utf-8")
+    store.reload()
+
+    assert store.corrupt is not None
+    assert message in store.corrupt
+
+
+def test_update_can_set_and_clear_a_pairing(store: printers.PrinterStore) -> None:
+    printer = add(store)
+    assert printer.profiles is None
+
+    paired = store.update(printer.id, profiles=PAIRING)
+    assert paired.profiles == PAIRING
+    assert stored_json(store)["printers"][0]["profiles"] == PAIRING
+
+    kept = store.update(printer.id, name="Voron 2.4 XL")      # not passed: unchanged
+    assert kept.profiles == PAIRING
+
+    partial = store.update(printer.id, profiles={"machine": MACHINE_REL})
+    assert partial.profiles == {"machine": MACHINE_REL}       # the dict replaces the pairing
+
+    cleared = store.update(printer.id, profiles=None)
+    assert cleared.profiles is None
+    assert stored_json(store)["printers"][0]["profiles"] is None
+
+    store.update(printer.id, profiles=PAIRING)
+    all_none = store.update(printer.id, profiles={"machine": None, "process": None})
+    assert all_none.profiles is None
+
+    store.update(printer.id, profiles=PAIRING)
+    emptied = store.update(printer.id, profiles={})
+    assert emptied.profiles is None
+
+
+def test_view_exposes_the_pairing(store: printers.PrinterStore) -> None:
+    printer = add(store)
+
+    stored_view, env_view = store.views(SEED)
+
+    assert stored_view["profiles"] == {"machine": None, "process": None}
+    assert env_view["profiles"] == {"machine": None, "process": None}
+
+    store.update(printer.id, profiles=PAIRING)
+    stored_view, env_view = store.views(SEED)
+
+    assert stored_view["profiles"] == PAIRING
+    assert env_view["profiles"] == {"machine": None, "process": None}
+    assert set(stored_view) == set(env_view)         # one shape for both sources
+
+    with pytest.raises(printers.PrinterReadOnly):
+        store.update(printers.ENV_PRINTER_ID, profiles=PAIRING)

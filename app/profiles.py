@@ -61,10 +61,12 @@ BASE_FOR_TYPE = {"machine": "fdm_klipper_common",
 # fields worth showing in the UI, per preset type
 SUMMARISE = {
     "machine": ["printer_model", "nozzle_diameter", "printable_area", "printer_structure",
-                "retraction_length", "retraction_speed", "max_layer_height"],
+                "retraction_length", "retraction_speed", "max_layer_height",
+                "default_print_profile"],
     "process": ["layer_height", "initial_layer_print_height", "wall_loops", "top_shell_layers",
                 "sparse_infill_density", "sparse_infill_pattern", "print_speed",
-                "outer_wall_speed", "support_enable", "enable_support", "brim_width"],
+                "outer_wall_speed", "support_enable", "enable_support", "brim_width",
+                "compatible_printers"],
     "filament": ["filament_type", "nozzle_temperature", "nozzle_temperature_initial_layer",
                  "hot_plate_temp", "filament_density", "filament_cost", "filament_flow_ratio"],
 }
@@ -357,12 +359,47 @@ def summarise(path: Path, ptype: str, datadir: Path | None = None) -> dict:
         return {"name": path.stem, "error": "unreadable"}
     chain = _parent_chain(datadir, ptype, data) if datadir else [data]
     out = {"name": data.get("name", path.stem), "file": path.name, "type": ptype}
-    for key in SUMMARISE.get(ptype, []):
+    if datadir is not None:
+        # the value the printer pairing stores, so the UI never rebuilds a path from the basename
+        try:
+            out["rel"] = Path(path).relative_to(Path(datadir)).as_posix()
+        except ValueError:
+            pass
+    fields = SUMMARISE.get(ptype, [])
+    for key in fields:
         for level in chain:                      # own value first, then inherited
             if key in level and level[key] not in (None, "", []):
                 out[key] = level[key]
                 break
+    if "compatible_printers" in fields:
+        # published for every row, so the machine filter never has to guess between
+        # "universal" and "field missing", and a hand-edited preset that stores a bare
+        # string (or junk) cannot reach a caller unnormalised
+        out["compatible_printers"] = _name_list(out.get("compatible_printers"))
+    if "default_print_profile" in fields:
+        # one name or None, never the raw list: the 3MF matcher resolves this name against
+        # the process presets, so a malformed value must not reach it as a list of junk
+        out["default_print_profile"] = _first_name(out.get("default_print_profile"))
     return out
+
+
+def _first_name(value: object) -> str | None:
+    """One preset name out of a string or a name list; ``None`` for anything unusable."""
+    names = [value] if isinstance(value, str) else value
+    if not isinstance(names, (list, tuple)):
+        return None
+    for name in names:
+        if isinstance(name, str) and name.strip():
+            return name.strip()
+    return None
+
+
+def _name_list(value: object) -> list[str]:
+    """A preset's name list as plain strings; a malformed value reads as an empty list."""
+    names = [value] if isinstance(value, str) else value
+    if not isinstance(names, (list, tuple)):
+        return []
+    return [name for name in names if isinstance(name, str) and name.strip()]
 
 
 def _positive_width(value: object) -> str | None:
@@ -387,6 +424,27 @@ def _effective_brim_width(datadir: Path, data: dict) -> str:
     return "5"
 
 
+def _portal_option_fields(datadir: Path, data: dict, options: dict[str, bool]) -> dict[str, str]:
+    """The three preset fields the portal options control, as the strings presets store.
+
+    Shared by `write_derived_process` (which writes them) and `effective_process` (which
+    reports them), so what the profile card shows is what the slicer loads.
+    """
+    fields = {"enable_support": "1" if options.get("supports") else "0"}
+    if options.get("brim"):
+        fields["brim_type"] = "outer_only"
+        fields["brim_width"] = _effective_brim_width(Path(datadir), data)
+    else:
+        fields["brim_type"] = "no_brim"
+        fields["brim_width"] = "0"
+    return fields
+
+
+def _derived_name(process: Path, data: dict) -> str:
+    """The derived preset's name; it must stay distinct from the preset it was copied from."""
+    return f"{data.get('name') or Path(process).stem} (portal options)"
+
+
 def write_derived_process(process: Path, datadir: Path, options: dict[str, bool]) -> Path:
     """Write the per-slice process preset that carries the options; return its path.
 
@@ -403,18 +461,85 @@ def write_derived_process(process: Path, datadir: Path, options: dict[str, bool]
     derived = dict(data)
     derived["type"] = "process"
     derived["from"] = "system"
-    derived["name"] = f"{data.get('name') or Path(process).stem} (portal options)"
-    derived["enable_support"] = "1" if options.get("supports") else "0"
-    if options.get("brim"):
-        derived["brim_type"] = "outer_only"
-        derived["brim_width"] = _effective_brim_width(Path(datadir), data)
-    else:
-        derived["brim_type"] = "no_brim"
-        derived["brim_width"] = "0"
+    derived["name"] = _derived_name(process, data)
+    derived.update(_portal_option_fields(Path(datadir), data, options))
 
     derived_path = Path(datadir) / PORTAL_PROCESS_REL
     write_json_atomic(derived_path, derived)
     return derived_path
+
+
+def _effective_machine(datadir: Path, data: dict) -> str | None:
+    """The machine the process targets: its `compatible_printers`, else the datadir's slot."""
+    printers = data.get("compatible_printers")
+    if isinstance(printers, str):
+        printers = [printers]
+    if isinstance(printers, list):
+        first = next((name for name in printers
+                      if isinstance(name, str) and name), None)
+        if first:
+            return first
+    try:
+        slot = machine_slot(Path(datadir))
+        slot_data = json.loads((Path(datadir) / slot).read_text())
+    except (ProfileError, OSError, ValueError):
+        return None
+    if not isinstance(slot_data, dict):
+        return None
+    return slot_data.get("name") or Path(slot).stem
+
+
+def effective_process(process: Path, datadir: Path, options: dict[str, bool]) -> dict:
+    """What the options plus the selected process preset mean for the next slice.
+
+    Never raises: an unreadable preset reports the same text `write_derived_process` would
+    have raised, so the endpoint can show it instead of failing the profile card.
+    """
+    try:
+        data = json.loads(Path(process).read_text())
+    except (OSError, ValueError):
+        return {"error": "process preset is not readable"}
+    if not isinstance(data, dict):
+        return {"error": "process preset is not readable"}
+
+    fields = _portal_option_fields(Path(datadir), data, options)
+    brim = bool(options.get("brim"))
+    return {
+        "supports": bool(options.get("supports")),
+        "brim": brim,
+        "brim_width": fields["brim_width"] if brim else None,
+        "machine": _effective_machine(Path(datadir), data),
+        "process": _derived_name(process, data),
+        "process_rel": PORTAL_PROCESS_REL,
+    }
+
+
+def derived_state(process: Path, datadir: Path, options: dict[str, bool]) -> dict:
+    """Whether the derived preset on disk still matches the options; never raises.
+
+    `stale` covers the three ways the slice would load something other than the options: the
+    file is missing, unreadable, or carries different support/brim fields.
+    """
+    try:
+        data = json.loads(Path(process).read_text())
+    except (OSError, ValueError):
+        return {"path": PORTAL_PROCESS_REL, "stale": True,
+                "error": "process preset is not readable"}
+    if not isinstance(data, dict):
+        return {"path": PORTAL_PROCESS_REL, "stale": True,
+                "error": "process preset is not readable"}
+
+    expected = _portal_option_fields(Path(datadir), data, options)
+    try:
+        on_disk = json.loads((Path(datadir) / PORTAL_PROCESS_REL).read_text())
+    except (OSError, ValueError):
+        return {"path": PORTAL_PROCESS_REL, "stale": True,
+                "error": "derived process preset is not readable"}
+    if not isinstance(on_disk, dict):
+        return {"path": PORTAL_PROCESS_REL, "stale": True,
+                "error": "derived process preset is not readable"}
+    stale = any(on_disk.get(key) != value for key, value in expected.items())
+    return {"path": PORTAL_PROCESS_REL, "stale": stale, "error": None}
 
 
 def list_presets(datadir: Path) -> dict[str, list[dict]]:
@@ -440,6 +565,52 @@ def list_presets(datadir: Path) -> dict[str, list[dict]]:
             rows.append(summarise(f, ptype, datadir))
         out[ptype] = rows
     return out
+
+
+# ------------------------------------------------------- machine/process compatibility
+def _preset_name(text: object) -> tuple[str, str]:
+    """``(full, base)`` for lenient preset-name comparison; ``("", "")`` on a non-string.
+
+    Preset names are compared the way they read: casefolded, ``_`` as a space, whitespace
+    collapsed, a trailing ``*`` (an edited preset) dropped, and the ``@printer`` suffix
+    split off so that the same process for two printer models still matches by base name.
+    """
+    if not isinstance(text, str):
+        return "", ""
+    name = " ".join(text.casefold().replace("_", " ").split())
+    while name.endswith("*"):
+        name = name[:-1].strip()
+    head, sep, _suffix = name.rpartition("@")
+    base = head.strip() if sep else ""
+    return name, base or name
+
+
+def _same_preset_name(name: object, wanted: tuple[str, str]) -> bool:
+    full, base = _preset_name(name)
+    if not full:
+        return False
+    return full == wanted[0] or bool(base) and base == wanted[1]
+
+
+def filter_process_by_machine(rows: list[dict], machine: dict | None) -> list[dict]:
+    """The process presets that may be sliced with ``machine``.
+
+    A preset is compatible when its ``compatible_printers`` is empty — a universal preset
+    — or names this machine. ``machine=None`` (nothing selected, or no local preset the
+    file names) returns the rows untouched, and a malformed row or ``compatible_printers``
+    counts as universal, so a broken preset file never takes the picker down.
+    """
+    if not isinstance(machine, dict):
+        return rows
+    wanted = _preset_name(machine.get("name"))
+    if not wanted[0]:
+        return rows
+    kept = []
+    for row in rows:
+        allowed = _name_list(row.get("compatible_printers")) if isinstance(row, dict) else []
+        if not allowed or any(_same_preset_name(name, wanted) for name in allowed):
+            kept.append(row)
+    return kept
 
 
 def import_into(datadir: Path, blob: bytes, filename: str, slot: Path,
