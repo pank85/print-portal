@@ -1,4 +1,4 @@
-# GitLab CI: run the test suite, then build and push the amd64 image to master.
+# GitLab CI: test → build/push the amd64 image → deploy it on the homeserver.
 #
 # DOCKER_BUILDKIT=0 selects the classic builder, which streams every RUN step's
 # output, so the Dockerfile's build-time smoke-test line ("smoke: ok ...") stays
@@ -7,8 +7,11 @@
 # Push targets are opt-in: by default the image goes to this project's own
 # container registry. Set PRIMARY_IMAGE and/or MIRROR_IMAGE (Settings > CI/CD >
 # Variables) to publish somewhere else; see docs/deployment.md.
+#
+# Deploy is also opt-in and fails closed: with no DEPLOY_* variables the job is
+# skipped, so a public fork never tries to reach anyone's host.
 
-stages: [test, docker]
+stages: [test, docker, deploy]
 
 variables:
   DOCKER_HOST: tcp://docker:2375
@@ -84,3 +87,56 @@ docker:
       else
         echo "MIRROR_IMAGE is not set: mirror push skipped"
       fi
+
+      # Hand the exact pushed digest to the deploy job. A tag can move; the digest
+      # cannot, so the deploy asserts on this string rather than on ":latest".
+      DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$PRIMARY_IMAGE:latest")"
+      test -n "$DIGEST"
+      echo "pushed digest: $DIGEST"
+      printf 'PORTAL_IMAGE_DIGEST=%s\n' "$DIGEST" > release.env
+  artifacts:
+    reports:
+      dotenv: release.env
+    expire_in: 7 days
+
+# Deploys the image this pipeline just built and pushed, then proves the live
+# container is that image. The compose project lives outside the repo (the
+# homeserver's docker-compose@<name> convention), so the job only pulls and
+# restarts the unit — it never writes files on the host.
+deploy:production:
+  stage: deploy
+  image: alpine:3.21
+  needs:
+    - job: docker
+      artifacts: true
+  environment:
+    name: production
+  rules:
+    - if: $CI_COMMIT_BRANCH == "master" && $DEPLOY_HOST && $DEPLOY_SSH_PRIVATE_KEY_BASE64
+  resource_group: production
+  interruptible: false
+  before_script:
+    - apk add --no-cache openssh-client
+    - install -m 700 -d ~/.ssh
+    - printf '%s' "$DEPLOY_SSH_PRIVATE_KEY_BASE64" | base64 -d > ~/.ssh/id_ed25519
+    - chmod 600 ~/.ssh/id_ed25519
+    - printf '%s' "$DEPLOY_KNOWN_HOSTS_BASE64" | base64 -d > ~/.ssh/known_hosts
+    - test -n "$DEPLOY_HOST" && test -n "$DEPLOY_USER" && test -n "$DEPLOY_COMPOSE_PATH" && test -n "$PORTAL_IMAGE_DIGEST"
+  script:
+    - |
+      set -eu
+      SSH="ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts $DEPLOY_USER@$DEPLOY_HOST"
+
+      # Pull first: a failed pull leaves the running portal untouched.
+      $SSH "cd '$DEPLOY_COMPOSE_PATH' && sudo docker compose pull && sudo systemctl restart docker-compose@print-portal"
+
+      # The unit runs `docker compose up` in the foreground, so the restart is
+      # what recreates the container. Wait for health, then read the state.
+      $SSH 'i=0; while [ $i -lt 45 ]; do st=$(docker inspect -f "{{.State.Health.Status}}" print-portal 2>/dev/null || echo missing); [ "$st" = healthy ] && break; i=$((i+1)); sleep 2; done; echo "health=$st"; [ "$st" = healthy ]'
+
+      # Assert on the digest, not on the tag: ":latest" could have moved between
+      # the push and the pull, and "the job went green" proves nothing about
+      # what is serving traffic.
+      LIVE="$($SSH 'docker inspect -f "{{.Config.Image}} {{index .RepoDigests 0}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}" print-portal')"
+      echo "live: $LIVE"
+      echo "$LIVE" | grep -qF "$PORTAL_IMAGE_DIGEST"
