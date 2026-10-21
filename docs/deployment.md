@@ -107,3 +107,33 @@ Example: publish to a public registry and keep a private mirror, with
 `MIRROR_IMAGE=gitlab.example.com/group/print-portal` and
 `MIRROR_REGISTRY_PASSWORD=<deploy-token>` (masked). Leave the mirror empty to
 push to one registry only.
+
+## Deploying from CI
+
+The `deploy:production` job pushes the image this pipeline just built onto a
+host and restarts that host's compose service. It is **off by default**: its
+rule requires `DEPLOY_HOST` and `DEPLOY_SSH_PRIVATE_KEY_BASE64`, so a fork or a
+repository without those variables never runs it — and never reaches anyone's
+host.
+
+| Variable | Meaning |
+| --- | --- |
+| `DEPLOY_HOST` | Host to deploy to, reachable over SSH from the runner. |
+| `DEPLOY_USER` | SSH user. |
+| `DEPLOY_SSH_PRIVATE_KEY_BASE64` | Private key, base64-encoded (`base64 -w0 key`). |
+| `DEPLOY_KNOWN_HOSTS_BASE64` | The host's `known_hosts` line, base64-encoded. |
+| `DEPLOY_COMPOSE_PATH` | Directory holding the compose project on that host. |
+
+Two assumptions about that host, both required:
+
+1. The compose project is owned by a `docker-compose@<name>` systemd unit, so
+   the deploy can restart one unit instead of poking at containers.
+2. Its compose file references the registry image (`image:`), never a
+   `build:` block — `docker compose pull` is the only step that fetches a new
+   image, and a local `build:` silently makes it a no-op.
+
+The job then checks what is actually serving, not just that the commands
+exited 0: it reads the pulled image's `RepoDigests` and the running container's
+`Config.Image`/`Image`, and requires both to match the digest this pipeline
+pushed. A `:latest` that moved, or a container the restart did not recreate,
+fails the deploy.
