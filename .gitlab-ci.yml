@@ -136,7 +136,16 @@ deploy:production:
 
       # Assert on the digest, not on the tag: ":latest" could have moved between
       # the push and the pull, and "the job went green" proves nothing about
-      # what is serving traffic.
-      LIVE="$($SSH 'docker inspect -f "{{.Config.Image}} {{index .RepoDigests 0}} {{.State.Status}} {{if .State.Health}}{{.State.Health.Status}}{{end}}" print-portal')"
-      echo "live: $LIVE"
-      echo "$LIVE" | grep -qF "$PORTAL_IMAGE_DIGEST"
+      # what is serving traffic. Two checks, because a container's .Image is a
+      # config ID while a digest names a manifest: (1) the tag the host pulled
+      # IS this build, (2) the running container is that exact image.
+      REPO="${PORTAL_IMAGE_DIGEST%@*}"
+      PULLED="$($SSH "docker image inspect -f '{{index .RepoDigests 0}} {{.Id}}' '$REPO:latest'")"
+      echo "pulled: $PULLED"
+      echo "$PULLED" | grep -qF "$PORTAL_IMAGE_DIGEST"
+      IMG_ID="$(echo "$PULLED" | awk '{print $2}')"
+
+      RUNNING="$($SSH "docker inspect -f '{{.Config.Image}} {{.Image}} {{.State.Status}}' print-portal")"
+      echo "running: $RUNNING"
+      echo "$RUNNING" | awk '{print $1}' | grep -qx "$REPO:latest"
+      echo "$RUNNING" | awk '{print $2}' | grep -qx "$IMG_ID"
