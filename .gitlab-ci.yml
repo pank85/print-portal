@@ -1,26 +1,39 @@
-# GitLab CI: test → build/push the amd64 image → deploy it on the homeserver.
+# GitLab CI: test → build/push the amd64 image to both registries → deploy it on
+# the homeserver. Uses the same dind fixes and registry hosts as the sibling
+# grocery project's pipeline (GroceryMoneySaver/GroceryMoneySaver-Api/.gitlab-ci.yml),
+# but the deploy intentionally differs: grocery recreates via compose, while here
+# the systemd unit owns the container.
+#
+# The docker job publishes the digest of what it pushed as a dotenv artifact
+# (release.env); the deploy job asserts the host serves exactly that digest, so
+# a `:latest` that moved fails the pipeline instead of passing it.
 #
 # DOCKER_BUILDKIT=0 selects the classic builder, which streams every RUN step's
 # output, so the Dockerfile's build-time smoke-test line ("smoke: ok ...") stays
 # visible in the job log. (--progress=plain is BuildKit-only and would fail here.)
 #
-# Push targets are opt-in: by default the image goes to this project's own
-# container registry. Set PRIMARY_IMAGE and/or MIRROR_IMAGE (Settings > CI/CD >
-# Variables) to publish somewhere else; see docs/deployment.md.
-#
-# Deploy is also opt-in and fails closed: with no DEPLOY_* variables the job is
-# skipped, so a public fork never tries to reach anyone's host.
+# The runner shares ONE docker network across concurrent jobs (config.toml
+# network_mode = gitlab_network), so a fixed `docker` service alias can resolve to
+# a FOREIGN dind. Every dind service here therefore gets a per-job alias,
+# docker-$CI_JOB_ID, plus a preflight that fails when the alias resolves to more
+# than one endpoint.
 
 stages: [test, docker, deploy]
 
 variables:
-  DOCKER_HOST: tcp://docker:2375
   DOCKER_TLS_CERTDIR: ""
   DOCKER_BUILDKIT: "0"
   DOCKER_DRIVER: overlay2
+  # Hardcoded defaults, so the pipeline needs no CI/CD variables at all. A project
+  # or group variable of the same name (Settings > CI/CD > Variables) overrides
+  # any of them.
+  CI_REGISTRY: "dockerhub.pkatopodis.me"
+  CI_REGISTRY_IMAGE: "dockerhub.pkatopodis.me/pank85/print-portal"
+  GITLAB_REGISTRY_IMAGE: "gitlab-ce:5050/pank85/print-portal"
   APP_VERSION: "2.0.0"                 # must equal app/config.py VERSION (test_config enforces)
   FULL_VERSION: "${APP_VERSION}-${CI_COMMIT_SHORT_SHA}"
   # Optional overrides. Empty means "use the default" (see the docker job).
+  # MIRROR_IMAGE=none disables the mirror push.
   PRIMARY_IMAGE: ""
   MIRROR_IMAGE: ""
 
@@ -34,75 +47,122 @@ test:
 docker:
   stage: docker
   image: docker:27-cli
-  services: [docker:27-dind]
+  services:
+    - name: docker:27-dind
+      # Shared runner: pin this job to its own dind (see the header).
+      alias: docker-$CI_JOB_ID
+      entrypoint: ["dockerd"]
+      command: ["--host=tcp://0.0.0.0:2375", "--insecure-registry=gitlab-ce:5050"]
+  variables:
+    DOCKER_HOST: tcp://docker-$CI_JOB_ID:2375
   only: [master]
   needs: [test]
+  before_script:
+    # Preflight BEFORE trusting the daemon: if the per-job alias resolves to more
+    # than one endpoint a foreign dind shares it, and both `docker info` and the
+    # pushes can silently target that foreign daemon. Fail fast and loudly.
+    - |
+      count=$(getent ahosts "docker-$CI_JOB_ID" | awk '{print $1}' | sort -u | grep -c .)
+      if [ "$count" -ne 1 ]; then
+        echo "PREFLIGHT FAIL: 'docker-$CI_JOB_ID' resolves to ${count} addresses;"
+        echo "a foreign dind shares this job's alias on the runner network."
+        getent ahosts "docker-$CI_JOB_ID"
+        exit 1
+      fi
+      echo "preflight OK: docker-$CI_JOB_ID resolves to exactly one daemon"
+    # Bounded readiness probe. An unbounded `until docker info; do sleep 1; done`
+    # hangs until the runner's job timeout with no clue why, so cap it and dump
+    # the daemon's own diagnostics on failure.
+    - |
+      i=0
+      until docker info >/dev/null 2>&1; do
+        i=$((i+1))
+        if [ "$i" -ge 60 ]; then
+          echo "DIND FAIL: no docker daemon at $DOCKER_HOST after 60 attempts (~60s)."
+          docker info
+          getent ahosts "docker-$CI_JOB_ID" || true
+          exit 1
+        fi
+        sleep 1
+      done
+      echo "dind ready (retries: $i)"
+    # Primary registry login. Both registries live on the runner box and answer to
+    # the same account, so the mirror reuses this credential pair — but it logs in
+    # inside the script, only when the mirror is enabled.
+    # Optional per-registry credential overrides: PRIMARY_REGISTRY_USER/PASSWORD and
+    # MIRROR_REGISTRY_USER/PASSWORD (default to CI_REGISTRY_USER/PASSWORD).
+    - echo "${PRIMARY_REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}" | docker login -u "${PRIMARY_REGISTRY_USER:-$CI_REGISTRY_USER}" --password-stdin "$CI_REGISTRY"
   script:
     - |
       set -eu
 
-      # Default target: the registry of this project, so a fresh fork works with
-      # the credentials GitLab already provides.
-      PRIMARY_IMAGE="${PRIMARY_IMAGE:-$CI_REGISTRY_IMAGE}"
-      MIRROR_IMAGE="${MIRROR_IMAGE:-}"
-      echo "primary image: $PRIMARY_IMAGE"
-      echo "mirror image:  ${MIRROR_IMAGE:-(none, mirror push disabled)}"
+      TARGET="${PRIMARY_IMAGE:-$CI_REGISTRY_IMAGE}"
+      MIRROR="${MIRROR_IMAGE:-$GITLAB_REGISTRY_IMAGE}"
+      if [ "$MIRROR" = "none" ]; then
+        MIRROR=""
+      fi
+      echo "target image: $TARGET"
+      echo "mirror image: ${MIRROR:-(none, mirror push disabled)}"
 
-      # docker login <host> needs the registry host, which is the first path
-      # component of an image reference. Credentials come from the matching
-      # *_REGISTRY_USER / *_REGISTRY_PASSWORD pairs, falling back to the job's
-      # GitLab registry credentials. Missing credentials skip the login instead
-      # of failing the pipeline.
-      login() {
-        host="${1%%/*}"
-        [ "$host" = "$1" ] && host=""
-        user="${2:-}"
-        token="${3:-}"
-        if [ -z "$host" ] || [ -z "$user" ] || [ -z "$token" ]; then
-          echo "skipping docker login for '${host:-<no registry host>}': no credentials configured"
-          return 0
-        fi
-        echo "$token" | docker login -u "$user" --password-stdin "$host"
-      }
-
-      login "$PRIMARY_IMAGE" \
-        "${PRIMARY_REGISTRY_USER:-${CI_REGISTRY_USER:-}}" \
-        "${PRIMARY_REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-}}"
+      # Explicit positional list. A `TAGS="a b c"` string would word-split on
+      # whitespace, so a value containing a space would silently push a wrong tag.
+      set -- "$CI_COMMIT_SHORT_SHA" "$FULL_VERSION" "latest"
 
       docker build --platform linux/amd64 \
-        -t "$PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA" \
-        -t "$PRIMARY_IMAGE:$FULL_VERSION" \
-        -t "$PRIMARY_IMAGE:latest" .
+        -t "$TARGET:$CI_COMMIT_SHORT_SHA" \
+        -t "$TARGET:$FULL_VERSION" \
+        -t "$TARGET:latest" .
+      for tag in "$@"; do
+        docker push "$TARGET:$tag"
+      done
 
-      docker push --all-tags "$PRIMARY_IMAGE"
-
-      if [ -n "$MIRROR_IMAGE" ]; then
-        login "$MIRROR_IMAGE" \
-          "${MIRROR_REGISTRY_USER:-${CI_REGISTRY_USER:-}}" \
-          "${MIRROR_REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-}}"
-        docker tag "$PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA" "$MIRROR_IMAGE:$CI_COMMIT_SHORT_SHA"
-        docker tag "$PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA" "$MIRROR_IMAGE:$FULL_VERSION"
-        docker tag "$PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA" "$MIRROR_IMAGE:latest"
-        docker push --all-tags "$MIRROR_IMAGE"
+      if [ -n "$MIRROR" ]; then
+        # The mirror's registry host is the first path component of its
+        # reference; logging in only when the mirror is enabled keeps a disabled
+        # mirror from needing credentials at all.
+        echo "${MIRROR_REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}" | docker login -u "${MIRROR_REGISTRY_USER:-$CI_REGISTRY_USER}" --password-stdin "${MIRROR%%/*}"
+        for tag in "$@"; do
+          docker tag "$TARGET:$tag" "$MIRROR:$tag"
+          docker push "$MIRROR:$tag"
+        done
       else
-        echo "MIRROR_IMAGE is not set: mirror push skipped"
+        echo "mirror push skipped (MIRROR_IMAGE=none)"
       fi
 
       # Hand the exact pushed digest to the deploy job. A tag can move; the digest
       # cannot, so the deploy asserts on this string rather than on ":latest".
-      DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$PRIMARY_IMAGE:latest")"
-      test -n "$DIGEST"
+      # Select the digest for THIS target repo explicitly: when the mirror is
+      # also pushed, RepoDigests holds entries for both registries and index 0 is
+      # not guaranteed to be $TARGET. Taking the wrong one would make the deploy
+      # assert against the mirror's repo name and fail a good build.
+      DIGEST="$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$TARGET:latest" | grep -F "$TARGET@" | head -n1)"
+      if [ -z "$DIGEST" ]; then echo "no pushed RepoDigest for $TARGET" >&2; exit 1; fi
       echo "pushed digest: $DIGEST"
       printf 'PORTAL_IMAGE_DIGEST=%s\n' "$DIGEST" > release.env
   artifacts:
     reports:
       dotenv: release.env
-    expire_in: 7 days
 
-# Deploys the image this pipeline just built and pushed, then proves the live
-# container is that image. The compose project lives outside the repo (the
-# homeserver's docker-compose@<name> convention), so the job only pulls and
-# restarts the unit — it never writes files on the host.
+# DEPLOY TARGET (read before changing anything here)
+#
+# 172.16.0.50 is NOT a separate production host: it is the LAN address of the CI
+# runner's own machine. This job therefore SSHes to the same box CI runs on and
+# drives the compose project at ~/homeserver/docker-compose/print-portal, which
+# pins image dockerhub.pkatopodis.me/pank85/print-portal:latest, container name
+# print-portal, public port 8088.
+#
+# That project is owned by the systemd unit docker-compose@print-portal, which
+# runs `docker compose up` in the FOREGROUND with Restart=always. Never mutate the
+# project directly (`docker compose up -d --force-recreate`): that kills the
+# foreground compose process, systemd then runs `compose down` and removes the
+# container just created (Restart=always brings it back ~10 s later, so the cost
+# is a double recreate plus a short outage, not a dead portal). The provable
+# sequence is `docker compose pull` followed
+# by `systemctl restart docker-compose@print-portal`, which is what this job does.
+#
+# A master pipeline deploys as soon as test and docker are green — no manual
+# gate, hence a missing deploy key fails the job loudly in before_script instead
+# of silently skipping it.
 deploy:production:
   stage: deploy
   image: alpine:3.21
@@ -112,40 +172,84 @@ deploy:production:
   environment:
     name: production
   rules:
-    - if: $CI_COMMIT_BRANCH == "master" && $DEPLOY_HOST && $DEPLOY_SSH_PRIVATE_KEY_BASE64
+    - if: $CI_COMMIT_BRANCH == "master"
+      allow_failure: false
   resource_group: production
   interruptible: false
+  variables:
+    DEPLOY_HOST: "172.16.0.50"
+    DEPLOY_USER: "pank"
+    DEPLOY_COMPOSE_PATH: "/home/pank/homeserver/docker-compose/print-portal"
   before_script:
     - apk add --no-cache openssh-client
     - install -m 700 -d ~/.ssh
-    - printf '%s' "$DEPLOY_SSH_PRIVATE_KEY_BASE64" | base64 -d > ~/.ssh/id_ed25519
-    - chmod 600 ~/.ssh/id_ed25519
-    - printf '%s' "$DEPLOY_KNOWN_HOSTS_BASE64" | base64 -d > ~/.ssh/known_hosts
-    - test -n "$DEPLOY_HOST" && test -n "$DEPLOY_USER" && test -n "$DEPLOY_COMPOSE_PATH" && test -n "$PORTAL_IMAGE_DIGEST"
+    # Loud failure, not a silent skip: this job is automatic on master, so a
+    # missing key must stop the pipeline with a readable message.
+    - |
+      if [ -z "${DEPLOY_SSH_PRIVATE_KEY_BASE64:-}" ] && [ -z "${SSH_PRIVATE_KEY:-}" ]; then
+        echo "DEPLOY FAIL: no SSH deploy key for $DEPLOY_HOST."
+        echo "Set DEPLOY_SSH_PRIVATE_KEY_BASE64 ('base64 -w0 key') or SSH_PRIVATE_KEY (raw key)"
+        echo "under Settings > CI/CD > Variables."
+        exit 1
+      fi
+    # Either credential style: base64 (DEPLOY_SSH_PRIVATE_KEY_BASE64) or the raw
+    # PEM/multiline key in SSH_PRIVATE_KEY, which is what the grocery project uses.
+    - |
+      if [ -n "${DEPLOY_SSH_PRIVATE_KEY_BASE64:-}" ]; then
+        printf '%s' "$DEPLOY_SSH_PRIVATE_KEY_BASE64" | base64 -d > ~/.ssh/id_ed25519
+      else
+        printf '%s\n' "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+      fi
+      chmod 600 ~/.ssh/id_ed25519
+    - |
+      if [ -n "${DEPLOY_KNOWN_HOSTS_BASE64:-}" ]; then
+        printf '%s' "$DEPLOY_KNOWN_HOSTS_BASE64" | base64 -d > ~/.ssh/known_hosts
+      else
+        if ! ssh-keyscan -H "$DEPLOY_HOST" > ~/.ssh/known_hosts; then
+          echo "host $DEPLOY_HOST is unreachable; set DEPLOY_KNOWN_HOSTS_BASE64 instead" >&2
+          exit 1
+        fi
+      fi
+      test -s ~/.ssh/known_hosts
+    # PORTAL_IMAGE_DIGEST arrives as the docker job's dotenv artifact. Without it
+    # the post-deploy assertion cannot say what is serving, so refuse to deploy.
+    - |
+      if [ -z "$DEPLOY_HOST" ]; then echo "missing DEPLOY_HOST" >&2; exit 1; fi
+      if [ -z "$DEPLOY_USER" ]; then echo "missing DEPLOY_USER" >&2; exit 1; fi
+      if [ -z "$DEPLOY_COMPOSE_PATH" ]; then echo "missing DEPLOY_COMPOSE_PATH" >&2; exit 1; fi
+      if [ -z "${PORTAL_IMAGE_DIGEST:-}" ]; then echo "missing PORTAL_IMAGE_DIGEST" >&2; exit 1; fi
   script:
     - |
       set -eu
-      SSH="ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts $DEPLOY_USER@$DEPLOY_HOST"
+      SSH="ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes -o StrictHostKeyChecking=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts"
+      REMOTE="$DEPLOY_USER@$DEPLOY_HOST"
 
-      # Pull first: a failed pull leaves the running portal untouched.
-      $SSH "cd '$DEPLOY_COMPOSE_PATH' && sudo docker compose pull && sudo systemctl restart docker-compose@print-portal"
+      # Pull, then hand the recreate to systemd (see the DEPLOY TARGET comment):
+      # a failed pull leaves the running portal serving, and restarting the unit
+      # is the only way to replace the container without fighting `compose up`.
+      # The unit's %i comes from the directory name (print-portal), so derive it
+      # from the compose path rather than hardcoding it.
+      UNIT="docker-compose@$(basename "$DEPLOY_COMPOSE_PATH")"
+      $SSH "$REMOTE" "cd '$DEPLOY_COMPOSE_PATH' && sudo docker compose pull && sudo systemctl restart \"$UNIT\""
 
-      # The unit runs `docker compose up` in the foreground, so the restart is
-      # what recreates the container. Wait for health, then read the state.
-      $SSH 'i=0; while [ $i -lt 45 ]; do st=$(docker inspect -f "{{.State.Health.Status}}" print-portal 2>/dev/null || echo missing); [ "$st" = healthy ] && break; i=$((i+1)); sleep 2; done; echo "health=$st"; [ "$st" = healthy ]'
+      # Bounded health poll: 90 attempts x 2 s (180 s). The image healthcheck has
+      # a 30 s interval and a 25 s start period, so a shorter budget could fail a
+      # container that is merely still warming up.
+      $SSH "$REMOTE" 'i=0; st=missing; while [ "$i" -lt 90 ]; do st="$(sudo docker inspect -f "{{.State.Health.Status}}" print-portal 2>/dev/null || echo missing)"; [ "$st" = healthy ] && break; i=$((i+1)); sleep 2; done; echo "health=$st after $((i+1)) attempt(s)"; [ "$st" = healthy ]'
 
       # Assert on the digest, not on the tag: ":latest" could have moved between
-      # the push and the pull, and "the job went green" proves nothing about
-      # what is serving traffic. Two checks, because a container's .Image is a
-      # config ID while a digest names a manifest: (1) the tag the host pulled
-      # IS this build, (2) the running container is that exact image.
+      # the push and the pull, and "the job went green" proves nothing about what
+      # is serving traffic. Two checks, because a container's .Image is a config ID
+      # while a digest names a manifest: (1) the tag the host pulled IS this build,
+      # (2) the running container is that exact image and is running.
       REPO="${PORTAL_IMAGE_DIGEST%@*}"
-      PULLED="$($SSH "docker image inspect -f '{{index .RepoDigests 0}} {{.Id}}' '$REPO:latest'")"
+      PULLED="$($SSH "$REMOTE" "sudo docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' '$REPO:latest' | grep -F '$REPO@' | head -n1") $( $SSH "$REMOTE" "sudo docker image inspect -f '{{.Id}}' '$REPO:latest'" )"
       echo "pulled: $PULLED"
       echo "$PULLED" | grep -qF "$PORTAL_IMAGE_DIGEST"
       IMG_ID="$(echo "$PULLED" | awk '{print $2}')"
 
-      RUNNING="$($SSH "docker inspect -f '{{.Config.Image}} {{.Image}} {{.State.Status}}' print-portal")"
+      RUNNING="$($SSH "$REMOTE" "sudo docker inspect -f '{{.Config.Image}} {{.Image}} {{.State.Status}}' print-portal")"
       echo "running: $RUNNING"
       echo "$RUNNING" | awk '{print $1}' | grep -qx "$REPO:latest"
       echo "$RUNNING" | awk '{print $2}' | grep -qx "$IMG_ID"
+      echo "$RUNNING" | awk '{print $3}' | grep -qx running
