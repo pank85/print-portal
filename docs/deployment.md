@@ -126,12 +126,11 @@ host.
 
 Two assumptions about that host, both required:
 
-1. The compose file references the registry image (`image:`), never a `build:`
-   block — `docker compose pull` is the only step that fetches a new image, and
-   a local `build:` silently makes it a no-op.
-2. The container sets `restart: unless-stopped` (or `always`), and the Docker
-   daemon is enabled at boot. That is what brings it back after a reboot; no
-   systemd unit is needed, and the deploy job never relies on one.
+1. The compose project is owned by a `docker-compose@<name>` systemd unit, so
+   the deploy can restart one unit instead of poking at containers.
+2. Its compose file references the registry image (`image:`), never a
+   `build:` block — `docker compose pull` is the only step that fetches a new
+   image, and a local `build:` silently makes it a no-op.
 
 The job then checks what is actually serving, not just that the commands
 exited 0: it reads the pulled image's `RepoDigests` and the running container's

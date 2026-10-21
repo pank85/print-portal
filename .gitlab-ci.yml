@@ -128,7 +128,10 @@ deploy:production:
       SSH="ssh -i $HOME/.ssh/id_ed25519 -o BatchMode=yes -o UserKnownHostsFile=$HOME/.ssh/known_hosts $DEPLOY_USER@$DEPLOY_HOST"
 
       # Pull first: a failed pull leaves the running portal untouched.
-      $SSH "cd '$DEPLOY_COMPOSE_PATH' && sudo docker compose pull && sudo docker compose up -d --no-deps --force-recreate --wait --wait-timeout 150"
+      $SSH "cd '$DEPLOY_COMPOSE_PATH' && sudo docker compose pull && sudo systemctl restart docker-compose@print-portal"
+
+      # The unit runs `docker compose up` in the foreground, so the restart is
+      # what recreates the container. Wait for health, then read the state.
       $SSH 'i=0; while [ $i -lt 45 ]; do st=$(docker inspect -f "{{.State.Health.Status}}" print-portal 2>/dev/null || echo missing); [ "$st" = healthy ] && break; i=$((i+1)); sleep 2; done; echo "health=$st"; [ "$st" = healthy ]'
 
       # Assert on the digest, not on the tag: ":latest" could have moved between
