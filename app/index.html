@@ -1,0 +1,262 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Print Portal</title>
+<style>
+  :root { --bg:#12151a; --card:#1a1f27; --line:#2a3240; --fg:#e6edf3; --dim:#8b98a8;
+          --ok:#3fb950; --warn:#d29922; --err:#f85149; --acc:#388bfd; }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.5 -apple-system,Segoe UI,Roboto,sans-serif; }
+  header { padding:14px 18px; border-bottom:1px solid var(--line); display:flex; gap:12px;
+           align-items:center; justify-content:space-between; flex-wrap:wrap; }
+  h1 { font-size:17px; margin:0; font-weight:600; }
+  h2 { font-size:12px; margin:0 0 10px; color:var(--dim); font-weight:600; text-transform:uppercase; letter-spacing:.6px; }
+  main { max-width:900px; margin:0 auto; padding:16px; }
+  .cards { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  @media (max-width:720px){ .cards { grid-template-columns:1fr; } }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; }
+  .pill { font-size:12px; padding:3px 9px; border-radius:999px; border:1px solid var(--line); color:var(--dim); }
+  .pill.ok { color:var(--ok); border-color:#1c4429; } .pill.err { color:var(--err); border-color:#4a1d1d; }
+  .pill.warn { color:var(--warn); border-color:#4a3a15; }
+  .kv { display:grid; grid-template-columns:auto 1fr; gap:3px 12px; font-size:13px; }
+  .kv span:nth-child(odd){ color:var(--dim); }
+  .kv span:nth-child(even){ color:var(--fg); text-align:right; word-break:break-word; }
+  .bar { height:6px; background:#0d1117; border-radius:99px; overflow:hidden; margin:10px 0 6px; }
+  .bar > i { display:block; height:100%; background:var(--acc); width:0; transition:width .4s; }
+  #drop { border:2px dashed var(--line); border-radius:14px; padding:26px 18px; text-align:center;
+          color:var(--dim); transition:.15s; cursor:pointer; margin-top:14px; }
+  #drop.hot { border-color:var(--acc); color:var(--fg); background:#161c25; }
+  #drop b { color:var(--fg); }
+  .job { background:var(--card); border:1px solid var(--line); border-radius:12px; padding:14px; margin-top:10px; }
+  .row { display:flex; gap:10px; align-items:baseline; justify-content:space-between; flex-wrap:wrap; }
+  .name { font-weight:600; word-break:break-all; }
+  .meta { color:var(--dim); font-size:13px; }
+  .stats { display:flex; gap:16px; flex-wrap:wrap; margin-top:8px; font-size:13px; color:var(--dim); }
+  .stats b { color:var(--fg); }
+  .acts { display:flex; gap:8px; margin-top:12px; flex-wrap:wrap; }
+  button, a.btn, select { font:inherit; font-size:13px; padding:7px 12px; border-radius:8px; border:1px solid var(--line);
+           background:#212833; color:var(--fg); cursor:pointer; text-decoration:none; }
+  button:hover, a.btn:hover { border-color:#3d4a5c; }
+  button.primary { background:#1f6feb22; border-color:#1f6feb66; color:#9ecbff; }
+  button.danger { color:#ffb4ae; border-color:#4a1d1d; }
+  button:disabled { opacity:.45; cursor:not-allowed; }
+  select { width:100%; margin:3px 0 8px; }
+  label.lbl { font-size:12px; color:var(--dim); }
+  .status { font-size:12px; padding:2px 8px; border-radius:999px; border:1px solid var(--line); }
+  .s-sliced { color:var(--ok); border-color:#1c4429; } .s-failed { color:var(--err); border-color:#4a1d1d; }
+  .s-slicing,.s-queued { color:var(--warn); border-color:#4a3a15; }
+  .err { color:var(--err); font-size:13px; margin-top:8px; white-space:pre-wrap; word-break:break-word; }
+  .notes { font-size:12px; color:var(--warn); margin-top:8px; white-space:pre-wrap; }
+  #toast { position:fixed; left:50%; transform:translateX(-50%); bottom:22px; background:#212833;
+           border:1px solid var(--line); padding:10px 16px; border-radius:10px; font-size:14px;
+           opacity:0; pointer-events:none; transition:.2s; max-width:90vw; }
+  #toast.show { opacity:1; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Print Portal <span class="meta">Print portal</span></h1>
+  <div><span id="printerPill" class="pill">printer…</span></div>
+</header>
+
+<main>
+  <div class="cards">
+    <section class="card">
+      <h2>Printer</h2>
+      <div class="kv" id="printerInfo"><span>—</span><span>—</span></div>
+      <div class="bar"><i id="progBar"></i></div>
+      <div class="meta" id="printerFile"></div>
+    </section>
+
+    <section class="card">
+      <h2>Profile <span id="profSource" class="pill" style="float:right"></span></h2>
+      <div class="kv" id="profInfo"><span>—</span><span>—</span></div>
+      <div style="margin-top:12px">
+        <label class="lbl">Machine</label><select id="selMachine"></select>
+        <label class="lbl">Process</label><select id="selProcess"></select>
+        <label class="lbl">Filament</label><select id="selFilament"></select>
+        <div class="acts">
+          <button class="primary" onclick="saveProfile()">Enable</button>
+          <button onclick="document.getElementById('profFile').click()">Upload .orca_printer</button>
+          <input id="profFile" type="file" accept=".orca_printer,.json,.zip" hidden>
+        </div>
+        <div class="notes" id="profNotes"></div>
+      </div>
+    </section>
+  </div>
+
+  <div id="drop">
+    <div style="font-size:24px;margin-bottom:6px">⬆</div>
+    <b>Drop an STL here</b> or click to select<br>
+    <span class="meta">.stl / .3mf / .obj — sliced with the active profile</span>
+    <input id="file" type="file" accept=".stl,.3mf,.obj" hidden>
+  </div>
+  <div id="jobs"></div>
+</main>
+<div id="toast"></div>
+
+<script>
+const $ = s => document.querySelector(s);
+const esc = s => String(s ?? "").replace(/[&<>"]/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+const toast = (m, ms=2800) => { const t=$("#toast"); t.textContent=m; t.classList.add("show");
+  setTimeout(()=>t.classList.remove("show"), ms); };
+const fmtBytes = b => { if(!b) return "—"; const u=["B","KB","MB"]; let i=0; while(b>1024&&i<2){b/=1024;i++;} return b.toFixed(b<10?1:0)+" "+u[i]; };
+const fmtDate = iso => { if(!iso) return "—"; try { return new Date(iso).toLocaleString({day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}); } catch { return iso; } };
+const kv = pairs => pairs.map(([k,v]) => `<span>${esc(k)}</span><span>${esc(v ?? "—")}</span>`).join("");
+
+/* ---------------- printer ---------------- */
+async function refreshPrinter() {
+  const pill = $("#printerPill"), info = $("#printerInfo"), bar = $("#progBar"), fileEl = $("#printerFile");
+  try {
+    const p = await (await fetch("/api/printer")).json();
+    if (!p.ok) {
+      pill.className = "pill err"; pill.textContent = "printer offline";
+      info.innerHTML = kv([["host", p.host], ["error", (p.error || "no route").slice(0,90)]]);
+      bar.style.width = "0"; fileEl.textContent = "";
+      return;
+    }
+    const printing = p.state === "printing";
+    pill.className = "pill " + (printing ? "warn" : p.state === "error" ? "err" : "ok");
+    pill.textContent = "printer: " + p.state;
+    info.innerHTML = kv([
+      ["nozzle", `${p.extruder?.temp ?? "?"} / ${p.extruder?.target ?? "?"} °C`],
+      ["bed", `${p.bed?.temp ?? "?"} / ${p.bed?.target ?? "?"} °C`],
+      ["elapsed", p.duration_min ? p.duration_min + " min" : "—"],
+      ["progress", (p.progress ?? 0) + " %"],
+      ["homed", p.homed || "none"],
+    ]);
+    bar.style.width = Math.min(100, p.progress || 0) + "%";
+    fileEl.textContent = p.file ? p.file : (p.message || "");
+  } catch (e) { pill.className = "pill err"; pill.textContent = "printer ?"; }
+}
+
+/* ---------------- profile ---------------- */
+async function loadProfile() {
+  const act = await (await fetch("/api/profile")).json();
+  const s = act.presets || {};
+  $("#profSource").textContent = act.source;
+  const m = s.machine || {}, pr = s.process || {}, f = s.filament || {};
+  $("#profInfo").innerHTML = kv([
+    ["machine", act.machine_label || m.name || "—"],
+    ["bed area", Array.isArray(m.printable_area) ? m.printable_area.join(" ") : (m.printable_area || "—")],
+    ["nozzle", m.nozzle_diameter ?? "—"],
+    ["process", pr.name || "—"],
+    ["layer / walls", `${pr.layer_height ?? "—"} mm / ${pr.wall_loops ?? "—"}`],
+    ["infill", `${pr.sparse_infill_density ?? "—"} ${pr.sparse_infill_pattern ?? ""}`],
+    ["speeds", `${pr.print_speed ?? "?"} / ${pr.outer_wall_speed ?? "?"} mm/s`],
+    ["filament", f.name || "—"],
+    ["temp / bed", `${f.nozzle_temperature ?? "?"} °C / ${f.hot_plate_temp ?? "?"} °C`],
+  ]);
+
+  const list = await (await fetch("/api/profiles")).json();
+  const fill = (selId, rows, current) => {
+    $(selId).innerHTML = (rows || []).map(r =>
+      `<option value="${esc(r.file)}"${r.name === current ? " selected" : ""}>${esc(r.name)}</option>`).join("");
+  };
+  fill("#selMachine", list.machine, m.name);
+  fill("#selProcess", list.process, pr.name);
+  fill("#selFilament", list.filament, f.name);
+}
+
+async function saveProfile() {
+  const body = {};
+  for (const [kind, selId] of [["machine","#selMachine"],["process","#selProcess"],["filament","#selFilament"]]) {
+    const v = $(selId).value;
+    if (v) body[kind] = `system/Custom/${kind}/${v}`;
+  }
+  const r = await fetch("/api/profile/select", {method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)});
+  const j = await r.json();
+  if (!r.ok) return toast("Not changed: " + (j.detail || r.statusText), 5000);
+  toast("Active profile updated");
+  loadProfile();
+}
+
+$("#profFile").onchange = async () => {
+  const f = $("#profFile").files[0]; if (!f) return;
+  const fd = new FormData(); fd.append("file", f);
+  toast("Uploading profile…");
+  try {
+    const r = await fetch("/api/profile/upload", {method:"POST", body:fd});
+    const j = await r.json();
+    if (!r.ok || !j.ok) throw new Error(j.detail || "no presets found");
+    $("#profNotes").textContent = (j.notes || []).join("\n");
+    toast(`Imported ${j.imported.length} presets — pick one and press Enable`, 6000);
+    loadProfile();
+  } catch (e) { toast("Failure: " + e.message, 6000); }
+  $("#profFile").value = "";
+};
+
+/* ---------------- upload ---------------- */
+const drop = $("#drop"), input = $("#file");
+drop.onclick = () => input.click();
+["dragenter","dragover"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add("hot"); }));
+["dragleave","drop"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove("hot"); }));
+drop.addEventListener("drop", ev => { if (ev.dataTransfer.files[0]) upload(ev.dataTransfer.files[0]); });
+input.onchange = () => { if (input.files[0]) upload(input.files[0]); };
+
+async function upload(file) {
+  const fd = new FormData(); fd.append("file", file);
+  toast(`Uploading: ${file.name}`);
+  try {
+    const r = await fetch("/api/upload", {method:"POST", body:fd});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    toast("Queued for slice"); refresh();
+  } catch (e) { toast("Error: " + e.message, 5000); }
+}
+
+async function printJob(id) {
+  if (!confirm("Start the print?")) return;
+  toast("Sending to printer…");
+  try {
+    const r = await fetch(`/api/jobs/${id}/print`, {method:"POST"});
+    const j = await r.json();
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    toast("Started: " + j.remote_file, 4000);
+  } catch (e) { toast("Did not start: " + e.message, 6000); }
+  refresh();
+}
+
+async function del(id) {
+  if (!confirm("Delete job and its files?")) return;
+  await fetch(`/api/jobs/${id}`, {method:"DELETE"}); refresh();
+}
+
+/* ---------------- jobs ---------------- */
+async function refresh() {
+  try {
+    const jobs = await (await fetch("/api/jobs")).json();
+    const box = $("#jobs");
+    if (!jobs.length) { box.innerHTML = `<p class="meta" style="margin-top:16px">No jobs yet.</p>`; return; }
+    box.innerHTML = jobs.map(j => {
+      const s = j.stats || {};
+      const stats = j.status === "sliced" ? `
+        <div class="stats">
+          <span>time <b>${esc(s.time || "?")}</b></span>
+          <span>filament <b>${s.grams ? s.grams.toFixed(1)+" g" : "?"}</b></span>
+          <span>layers <b>${s.layers || "?"}</b></span>
+          <span>height <b>${esc(s.layer_height || "?")} mm</b></span>
+          <span>slice <b>${esc(j.elapsed || "?")}s</b></span>
+        </div>` : "";
+      return `<div class="job">
+        <div class="row"><span class="name">${esc(j.filename)}</span>
+          <span class="status s-${esc(j.status)}">${esc(j.status)}</span></div>
+        <div class="meta">${fmtBytes(j.upload_bytes)} · ${fmtDate(j.created)}${j.remote_file ? " · on printer: "+esc(j.remote_file) : ""}</div>
+        ${stats}
+        ${j.error ? `<div class="err">${esc(j.error)}</div>` : ""}
+        <div class="acts">
+          ${j.status === "sliced" ? `<button class="primary" onclick="printJob('${j.id}')">Print</button>
+            <a class="btn" href="/api/jobs/${j.id}/gcode">Gcode</a>` : ""}
+          <button class="danger" onclick="del('${j.id}')">Delete</button>
+        </div></div>`;
+    }).join("");
+  } catch (e) { console.error(e); }
+}
+
+loadProfile(); refresh(); refreshPrinter();
+setInterval(() => { refresh(); refreshPrinter(); }, 4000);
+</script>
+</body>
+</html>

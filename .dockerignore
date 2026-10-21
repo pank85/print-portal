@@ -1,0 +1,12 @@
+.git
+.orchestration
+jobs
+venv
+.venv
+.venv-test
+data
+orca-datadir
+__pycache__
+*.pyc
+.env
+*.bak

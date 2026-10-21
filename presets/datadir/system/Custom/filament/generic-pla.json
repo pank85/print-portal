@@ -1,0 +1,1 @@
+{"type": "filament", "name": "Generic PLA", "inherits": "fdm_filament_pla", "from": "system", "instantiation": "true", "filament_type": ["PLA"], "filament_density": ["1.24"], "filament_cost": ["20"], "nozzle_temperature": ["220"], "hot_plate_temp": ["60"]}

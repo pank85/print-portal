@@ -1,0 +1,20 @@
+services:
+  print-portal:
+    build: .
+    image: print-portal:latest
+    container_name: print-portal
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${PORT:-8088}:${PORT:-8088}"
+    volumes:
+      - ./data:/data
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.environ.get('PORT','8088'), timeout=4).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s

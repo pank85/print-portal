@@ -1,0 +1,86 @@
+# GitLab CI: run the test suite, then build and push the amd64 image to master.
+#
+# DOCKER_BUILDKIT=0 selects the classic builder, which streams every RUN step's
+# output, so the Dockerfile's build-time smoke-test line ("smoke: ok ...") stays
+# visible in the job log. (--progress=plain is BuildKit-only and would fail here.)
+#
+# Push targets are opt-in: by default the image goes to this project's own
+# container registry. Set PRIMARY_IMAGE and/or MIRROR_IMAGE (Settings > CI/CD >
+# Variables) to publish somewhere else; see docs/deployment.md.
+
+stages: [test, docker]
+
+variables:
+  DOCKER_HOST: tcp://docker:2375
+  DOCKER_TLS_CERTDIR: ""
+  DOCKER_BUILDKIT: "0"
+  DOCKER_DRIVER: overlay2
+  APP_VERSION: "2.0.0"                 # must equal app/config.py VERSION (test_config enforces)
+  FULL_VERSION: "${APP_VERSION}-${CI_COMMIT_SHORT_SHA}"
+  # Optional overrides. Empty means "use the default" (see the docker job).
+  PRIMARY_IMAGE: ""
+  MIRROR_IMAGE: ""
+
+test:
+  stage: test
+  image: python:3.12-slim
+  script:
+    - python -m pip install --no-cache-dir -r requirements.txt -r requirements-dev.txt
+    - python -m pytest -q
+
+docker:
+  stage: docker
+  image: docker:27-cli
+  services: [docker:27-dind]
+  only: [master]
+  needs: [test]
+  script:
+    - |
+      set -eu
+
+      # Default target: the registry of this project, so a fresh fork works with
+      # the credentials GitLab already provides.
+      PRIMARY_IMAGE="${PRIMARY_IMAGE:-$CI_REGISTRY_IMAGE}"
+      MIRROR_IMAGE="${MIRROR_IMAGE:-}"
+      echo "primary image: $PRIMARY_IMAGE"
+      echo "mirror image:  ${MIRROR_IMAGE:-(none, mirror push disabled)}"
+
+      # docker login <host> needs the registry host, which is the first path
+      # component of an image reference. Credentials come from the matching
+      # *_REGISTRY_USER / *_REGISTRY_PASSWORD pairs, falling back to the job's
+      # GitLab registry credentials. Missing credentials skip the login instead
+      # of failing the pipeline.
+      login() {
+        host="${1%%/*}"
+        [ "$host" = "$1" ] && host=""
+        user="${2:-}"
+        token="${3:-}"
+        if [ -z "$host" ] || [ -z "$user" ] || [ -z "$token" ]; then
+          echo "skipping docker login for '${host:-<no registry host>}': no credentials configured"
+          return 0
+        fi
+        echo "$token" | docker login -u "$user" --password-stdin "$host"
+      }
+
+      login "$PRIMARY_IMAGE" \
+        "${PRIMARY_REGISTRY_USER:-${CI_REGISTRY_USER:-}}" \
+        "${PRIMARY_REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-}}"
+
+      docker build --platform linux/amd64 \
+        -t "$PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA" \
+        -t "$PRIMARY_IMAGE:$FULL_VERSION" \
+        -t "$PRIMARY_IMAGE:latest" .
+
+      docker push --all-tags "$PRIMARY_IMAGE"
+
+      if [ -n "$MIRROR_IMAGE" ]; then
+        login "$MIRROR_IMAGE" \
+          "${MIRROR_REGISTRY_USER:-${CI_REGISTRY_USER:-}}" \
+          "${MIRROR_REGISTRY_PASSWORD:-${CI_REGISTRY_PASSWORD:-}}"
+        docker tag "$PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA" "$MIRROR_IMAGE:$CI_COMMIT_SHORT_SHA"
+        docker tag "$PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA" "$MIRROR_IMAGE:$FULL_VERSION"
+        docker tag "$PRIMARY_IMAGE:$CI_COMMIT_SHORT_SHA" "$MIRROR_IMAGE:latest"
+        docker push --all-tags "$MIRROR_IMAGE"
+      else
+        echo "MIRROR_IMAGE is not set: mirror push skipped"
+      fi
