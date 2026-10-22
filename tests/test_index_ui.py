@@ -126,20 +126,51 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
     assert '<h2 id="optionsTitle">Interface</h2>' in page
 
 
-def test_hide_profiles_still_hides_only_the_selectors(page):
-    """`hide_profiles` gates the three selects — never the options or the upload control.
+def test_hide_profiles_hides_machine_and_process_but_keeps_filament(page):
+    """`hide_profiles` gates the Machine and Process pickers — never Filament, the options or
+    the upload control.
 
-    The group moved inside the Printer card, so the guard is pinned to the one id it always
-    named: hiding `#profOptions` or the upload button would take Supports/Brim away on a
-    setting that never meant to.
+    Rewritten from `test_hide_profiles_still_hides_only_the_selectors`, which asserted that the
+    option gated all three selects. It did so by hiding the whole `#profileSelectors` wrapper,
+    and a user who turned the switch on lost the Filament picker with them. The switch is now
+    per field, so the guard is pinned to the two ids it names — and Filament is not one of them,
+    in either state.
     """
     body = function_body(page, "applyProfileVisibility")
-    assert '$("#profileSelectors")' in body
-    assert body.count(".hidden") == 1
-    for untouched in ("#profOptions", "#profFile", "#profNotes", "#optSupports", "#optBrim"):
-        assert untouched not in body, untouched
-    # the id-level display:grid still needs its [hidden] guard, and only that one
-    assert "#profileSelectors[hidden]{ display:none; }" in page
+    # judge the code, not the prose: the comment above it names the wrapper it replaced
+    code = re.sub(r"/\*.*?\*/", "", body, flags=re.S)
+    # one assignment driven by the `hide` argument, so both states come from the same line
+    assert code.count("el.hidden = !!hide") == 1
+    assert "!!hide" in code
+    assert '"#fieldMachine", "#fieldProcess"' in code
+    assert "#fieldFilament" not in code, "the filament picker must never be hidden"
+    for untouched in ("#profileSelectors", "#profOptions", "#profFile", "#profNotes",
+                      "#optSupports", "#optBrim"):
+        assert untouched not in code, untouched
+
+    # nothing is latched into the DOM: every load and every toggle re-applies the saved value,
+    # so turning the option back off brings both fields back
+    assert "applyProfileVisibility(hide)" in function_body(page, "applyProfileOptions")
+
+    # the three pickers are three `.field` siblings, each owning its own label/select pair —
+    # that is what lets one be hidden while the filament label stays attached to its select
+    for field_id, select_id in (("fieldMachine", "selMachine"),
+                                ("fieldProcess", "selProcess"),
+                                ("fieldFilament", "selFilament")):
+        assert page.count(f'id="{field_id}"') == 1, field_id
+        block = slice_between(page, f'id="{field_id}"', "</div>")
+        assert f'for="{select_id}"' in block and f'id="{select_id}"' in block, field_id
+
+    # a `.field` is display:grid, so a per-field `hidden` needs its own rule to win — the rule
+    # the wrapper used to carry went away with the wrapper-wide hide
+    assert ".field[hidden]{ display:none; }" in page
+    assert "#profileSelectors[hidden]" not in page
+
+    # the group keeps its accessible name, and the options stay outside the wrapper
+    assert 'role="group" aria-labelledby="profileGroupTitle"' in page
+    assert '<h3 id="profileGroupTitle">Profile</h3>' in page
+    seg = page[page.index('id="profileSelectors"'):page.index('id="profOptions"')]
+    assert seg.count("<div") == seg.count("</div>")
 
 
 def test_enable_button_and_its_wording_are_gone(page):
