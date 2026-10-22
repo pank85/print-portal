@@ -12,7 +12,8 @@ from pathlib import Path
 import profiles as prof
 
 SELECTED_PROCESS = prof.DEFAULT_PROFILE["process"]
-DEFAULTS = {"supports": False, "brim": True, "hide_profiles": False}
+DEFAULTS = {"supports": False, "brim": True, "hide_profiles": False,
+            "auto_orient": True, "shrink_to_fit": False}
 
 
 def write_process(datadir: Path, name: str, data: dict) -> Path:

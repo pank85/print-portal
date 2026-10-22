@@ -50,9 +50,10 @@ def test_profile_reports_effective_supports_and_brim(client, datadir):
 
     body = client.get("/api/profile").json()
 
-    assert set(body) == {"source", "machine_label", "paths", "presets", "options",
-                         "effective", "derived"}
+    assert set(body) == {"imported", "source", "machine_label", "paths", "presets",
+                         "options", "effective", "derived"}
     assert body["effective"] == {"supports": True, "brim": True, "brim_width": "5",
+                                 "auto_orient": True, "shrink_to_fit": False,
                                  "machine": MACHINE_NAME,
                                  "process": f"{body['presets']['process']['name']} (portal options)",
                                  "process_rel": prof.PORTAL_PROCESS_REL}
@@ -93,7 +94,8 @@ def test_option_save_response_shape_is_unchanged(client, isolated_profile):
     assert set(body) == {"ok", "options"}
     assert body["ok"] is True
     assert set(body["options"]) == set(prof.OPTION_KEYS)
-    assert body["options"] == {"supports": False, "brim": False, "hide_profiles": False}
+    assert body["options"] == {"supports": False, "brim": False, "hide_profiles": False,
+                              "auto_orient": True, "shrink_to_fit": False}
     assert json.loads(isolated_profile.read_text())["options"] == body["options"]
 
 

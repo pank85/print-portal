@@ -27,6 +27,7 @@ ROOT = Path(__file__).resolve().parents[1]
 APP_DIR = ROOT / "app"
 SEED_DATADIR = ROOT / "presets" / "datadir"
 FIXTURES = Path(__file__).resolve().parent / "fixtures"
+PRESET_DATADIR = FIXTURES / "preset-datadir"
 
 # production runs uvicorn with WORKDIR=/app and flat imports (`import config`), so the tests
 # put both the repo root and app/ on sys.path
@@ -34,8 +35,10 @@ for _entry in (ROOT, APP_DIR):
     if str(_entry) not in sys.path:
         sys.path.insert(0, str(_entry))
 
+# the real seed ships only system/Custom.json, so the session datadir starts from the
+# trimmed fixture copy of the presets the old seed used to ship
 SESSION_DATA_DIR = Path(tempfile.mkdtemp(prefix="print-portal-tests-"))
-shutil.copytree(SEED_DATADIR, SESSION_DATA_DIR / "orca-datadir")
+shutil.copytree(PRESET_DATADIR, SESSION_DATA_DIR / "orca-datadir")
 
 os.environ.update({
     "PRINTER_URL": "http://moonraker.invalid:7125",
@@ -58,10 +61,25 @@ def data_dir() -> Path:
 
 @pytest.fixture
 def datadir(tmp_path: Path) -> Path:
-    """A private copy of the shipped preset seed, safe for import_into() to write into."""
+    """A private copy of the presets the old seed used to ship, trimmed to what the tests
+    read, safe for import_into() to write into."""
+    dest = tmp_path / "orca-datadir"
+    shutil.copytree(PRESET_DATADIR, dest)
+    return dest
+
+
+@pytest.fixture
+def empty_datadir(tmp_path: Path) -> Path:
+    """A private copy of the real, near-empty seed (no presets), as a fresh install has it."""
     dest = tmp_path / "orca-datadir"
     shutil.copytree(SEED_DATADIR, dest)
     return dest
+
+
+@pytest.fixture
+def bundle_bytes() -> bytes:
+    """The committed .orca_printer fixture bundle, as the upload endpoint would receive it."""
+    return (FIXTURES / "portal-import.orca_printer").read_bytes()
 
 
 @pytest.fixture

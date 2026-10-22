@@ -44,10 +44,10 @@ and network reachability; it does not need OrcaSlicer, Python or any shared moun
 
 - **Moonraker** reachable from the container, with an API key (see
   [docs/printer-setup.md](docs/printer-setup.md)).
-- **An OrcaSlicer preset** — a machine preset, a process preset and a filament preset. The image
-  ships a neutral generic set; you can also import your own `.orca_printer` bundle or single
-  preset `.json` through `POST /api/profile/upload`. Where presets live on each platform, and how to
-  export a `.orca_printer` from the desktop app: [docs/orcaslicer-presets.md](docs/orcaslicer-presets.md).
+- **An OrcaSlicer preset bundle** — an `.orca_printer` export carrying your machine preset and the
+  process and filament presets you want. The image ships **no presets**, so import one bundle once
+  through `POST /api/profile/upload`. Where presets live on each platform, and how to export a
+  `.orca_printer` from the desktop app: [docs/orcaslicer-presets.md](docs/orcaslicer-presets.md).
 - **Docker** with the Compose plugin, Docker Compose **≥ 2.24** — `docker-compose.yml` uses the
   optional `env_file: {path: .env, required: false}` form, which older Compose releases reject.
 
@@ -66,6 +66,28 @@ Then open <http://localhost:8088>, upload an STL, and press **Print**.
 
 `.env.example` and `docker-compose.yml` in this repository are the real configuration files; the
 quickstart above is all you need to start.
+
+## First run
+
+A fresh install ships **no printer, process or filament preset**. The portal cannot slice anything
+until you import one bundle — that is deliberate: a preset that does not match your printer fails at
+the printer, after the upload looked successful.
+
+In OrcaSlicer, with your printer selected: **File → Export → Export Preset Bundle…**, tick
+**Printer** (and the process and filament presets you want), then select the printer on the next
+screen. Save the `.orca_printer` file.
+
+In the portal, open the profile card and upload that file (or `POST /api/profile/upload`). The
+import writes your machine under **its own name**, registers it, and selects it together with the
+first process and filament in the bundle — the three pickers then list exactly what you imported.
+Importing a second bundle adds a second machine; both stay selectable.
+
+The bundle carries **presets only**. The printer *connection* — Moonraker URL and API key — is
+separate: `PRINTER_URL` / `MOONRAKER_API_KEY`, or the Printers card. Neither depends on the other.
+
+Until a bundle is imported, `GET /api/profiles` answers with three empty lists and `GET /api/profile`
+answers `200` with `"imported": false` — reads never fail. Anything that would slice answers `409`
+with `detail.error: "no_printer_profile"`.
 
 ## Configuration
 
@@ -86,10 +108,15 @@ Most configuration is environment variables (read from `.env` via Compose; see `
 | `KEEP_JOBS` | `25` | job directories retained before the oldest are pruned |
 | `SLICE_TIMEOUT` | `900` | seconds before a slice is killed |
 | `BED_SIZE` | `220x220` | bed size used to clamp imported machine presets |
-| `MACHINE_SLOT` | *(auto)* | optional override of the machine preset that imports rebase onto |
-| `SEED_VERSION` | `2.4.2-1` | build-time marker; bump it to re-run preset seeding on upgrade |
+| `MACHINE_SLOT` | *(auto)* | optional override of the machine preset the slicer loads |
+| `SEED_VERSION` | `2.4.2-2` | build-time marker for the seed copy; bump it to re-run seeding on upgrade |
 
 `HOME` for the slicer subprocess is `$DATA_DIR/home` and must be writable.
+
+An existing deployment keeps the presets it already has: the seed is copied into the datadir with
+`cp -R -n`, which never overwrites, so an empty seed can never resurrect a preset either. Delete
+`$DATA_DIR/orca-datadir/system/Custom/` once if you want the fresh-install state — the portal never
+deletes your data in a migration.
 
 ## Build the image yourself
 
@@ -129,7 +156,7 @@ is a secret — treat it like a password.
 | GET | `/api/printer` | live snapshot: state, file, progress, nozzle/bed temps, homed axes |
 | POST | `/api/upload` | multipart `file` (`.stl`, `.3mf`, `.obj`, `.zip`, ≤`MAX_UPLOAD_MB`) → job; the response adds `archive` and `threemf` when the upload was unpacked or switched a profile |
 | GET | `/api/jobs` | list jobs, newest first |
-| GET | `/api/jobs/{id}` | status, stats, error |
+| GET | `/api/jobs/{id}` | status, stats, error, plus the fit/orient fields described under [Auto-orient and shrink to fit](#auto-orient-and-shrink-to-fit) |
 | GET | `/api/jobs/{id}/gcode` | download the sliced gcode |
 | POST | `/api/jobs/{id}/print` | upload to Moonraker and start the print |
 | DELETE | `/api/jobs/{id}` | remove job files |
@@ -146,6 +173,9 @@ is a secret — treat it like a password.
 | POST | `/api/printers/{id}/test` | test printer connection |
 | DELETE | `/api/jobs` | remove all jobs |
 
+A read never `409`s on a fresh install: `GET /api/profile` answers `200` with `"imported": false` and
+null selections when nothing is imported. `409` with `detail.error: "no_printer_profile"` comes only
+from actions that need a preset: slice/upload, profile select, and printer pairing.
 
 ## 3MF and .zip uploads
 
@@ -168,7 +198,8 @@ slice so OrcaSlicer accepts it.
   still fits, otherwise nothing — a half match leaves the stored pairing alone and the reason
   goes into the job's notes.
 - Switching at the app level is not enough: OrcaSlicer applies the 3MF's own project settings,
-  so a foreign `printer_settings_id` still yields `-17`. The portal therefore writes
+  so a foreign `printer_settings_id` still yields `-17` — the 3MF's process does not list the
+  machine the presets provide. The portal therefore writes
   `upload/slice-<stem>.3mf` in the job directory with `printer_settings_id`, `printer_model`,
   `printer_variant`, `print_settings_id` and `compatible_printers` set to the local presets,
   with every other member's contents preserved — the archive is re-zipped, so members are
@@ -196,8 +227,10 @@ slice so OrcaSlicer accepts it.
 
 `POST /api/profile/upload` takes a `.orca_printer` bundle (a ZIP containing `printer/`, `process/`,
 `filament/` and `bundle_structure.json`) or a single preset `.json`, normalises it and writes it
-into the datadir. `POST /api/profile/select` chooses which machine/process/filament the slicer
-loads; the choice is stored in `profile.json`. Selecting a preset in the dashboard applies it
+into the datadir **under the bundle's own names**: the machine becomes its own preset file, gets an
+entry in `system/Custom.json`, and the bundle's processes are pointed at it. No pre-existing file is
+rewritten except that index. `POST /api/profile/select` chooses which machine/process/filament the
+slicer loads; the choice is stored in `profile.json`. Selecting a preset in the dashboard applies it
 immediately — there is no Enable step — and the chosen machine/process pair is written back onto
 the selected printer (see [Printer pairing](#printer-pairing)).
 
@@ -229,10 +262,50 @@ A bundle carries none of the local wiring the CLI needs, so import has to fix it
 | Problem in the bundle | What import does |
 |---|---|
 | no `type` field | derived from the folder (`printer/`→machine, `process/`, `filament/`) |
-| `inherits` a vendor preset that does not exist here | re-rooted to `fdm_klipper_common` / `fdm_process_klipper_common` / `fdm_filament_pla` |
-| `compatible_printers` names a machine preset we do not have | rewritten to the machine slot's name |
+| `from` missing, `"user"` or `"System"` on a machine preset | set to `"system"` — the load-bearing literal: the CLI answers `-17` for `"user"` and `251` for `"System"` or an absent `from` |
+| `inherits` a preset that is not here | left as-is: the CLI tolerates a dangling `inherits` |
+| `compatible_printers` names a machine preset we do not have | rewritten to the imported machine's own name |
 | `default_print_profile` / `default_filament_profile` point at vendor presets | re-pointed at the presets just imported |
 | `printable_area` bigger than the bed | clamped to `BED_SIZE` |
+
+### Auto-orient and shrink to fit
+
+Two more switches live in `options`, and unlike supports and brim they never reach the derived
+process preset — they become command-line flags on the slice. `auto_orient` defaults to `true`,
+`shrink_to_fit` to `false`; `POST /api/profile/options` stores both, there is no separate
+endpoint.
+
+- **`auto_orient`** adds `--orient 1` (the literal `1`: the CLI rejects a bare `--orient` and
+  `--orient auto` with rc 254), so OrcaSlicer's own orientation search picks the flattest stable
+  pose. It is a no-op for a model that already lies flat, whose gcode is identical to a slice
+  without it apart from the slicer's `; generated by OrcaSlicer … at <timestamp>` banner.
+- **`shrink_to_fit`** measures the uploaded mesh against the selected machine preset's
+  `printable_area` and `printable_height` and computes one uniform factor
+  `k = min(1, (X span − 16)/size_x, (Y span − 16)/size_y, Z max/size_z)`, capped at 1 (never
+  enlarged) and rounded down to three decimals (never rounded up). It passes `--scale k` only
+  when `k < 1`; every real shrink also forces `--orient 1`, because the CLI produces no plate
+  with `--scale` alone (`-50 "One of the plate is empty"`). Units are millimetres and the scale
+  is uniform — no per-axis distortion.
+- The 16 mm is the clearance kept on each of X and Y for brim and skirt, empirically the largest
+  that still slices on a 220 mm bed: `k = 0.68` slices cleanly (gcode spans 1.0–219.1 mm) while
+  `k = 0.69` reaches 220.6 mm and fails. Nothing is reserved above the part, so Z uses
+  `printable_height` as it stands.
+- A factor below `0.25` is refused rather than silently producing a uselessly tiny part. The
+  message names the model's dimensions, the factor it would have needed, the bed limits, the
+  floor and the minimum size to re-export at.
+- With shrink off, a model larger than the bed is refused before the CLI runs, with a message
+  naming the model dimensions and the bed; the CLI's own `-50 "One of the plate is empty or has
+  no objects"` names no dimensions.
+- Geometry is read for STL (ASCII and binary) and OBJ. 3MF is a known limitation: its geometry
+  lives in `3D/3dmodel.model`, which the portal does not parse (`app/threemf.py` only rewrites
+  preset identity). With shrink off a 3MF slices exactly as before and auto-orient still applies.
+  A machine preset without `printable_area`/`printable_height` only blocks shrink, never a
+  normal slice.
+
+Job records — `GET /api/jobs/{id}` and the SSE stream — carry what was decided: `auto_orient`,
+`auto_orient_used` (true when orient actually ran, e.g. because a shrink forced it),
+`shrink_to_fit`, `fit_scale` (`1.0` when nothing was scaled, `null` when the model could not be
+measured), and `model_size` / `bed_limits` as `{x,y,z}` spans in millimetres.
 
 ### Process presets follow the selected machine
 
@@ -269,16 +342,15 @@ These are the behaviours the code works around; keep them in mind when debugging
   `estimated printing time` / `total filament used [g]` to ~230 kB into the file. The parser reads
   2 MB and falls back to the Prusa-style `;TIME:` / `;Filament used:` lines.
 - **Preset filenames must not contain spaces** (CLI quirk). The importer replaces them.
-- **The `-17` rebase rule.** OrcaSlicer's CLI refuses a machine preset that is not the identity it
-  expects: a bundle machine written under its own name returns
-  `-17 "The selected printer is not compatible with the process preset in the 3mf"` even when the
-  process lists that exact name in `compatible_printers`. `printer_model`, `inherits` and
-  `compatible_printers` do not help. Import therefore merges the bundle machine onto the resolved
-  machine slot (identity keys preserved, everything else overwritten) and keeps the original label
-  in `profile.json` for display. The slot is resolved at runtime (`MACHINE_SLOT` → datadir default →
-  first instantiated machine), so any datadir with a machine preset works. The same rule bites an
-  uploaded `.3mf`: its embedded project identity overrides `--load-settings`, so the upload path
-  rewrites that identity in a job-local copy instead (see [3MF identity](#3mf-identity)).
+- **The `-17` compatibility rule.** `-17` (`"The selected printer is not compatible with the
+  process preset in the 3mf"`) is the *process ↔ machine* check: the process preset does not list the
+  selected machine in `compatible_printers`. It is not a restriction on the machine's identity.
+  Measured with OrcaSlicer 2.4.2: a separately named machine with its own index entry sliced fine,
+  and patching the process preset's `compatible_printers` to that name changed the result to `rc=0`
+  `"Success."`. Import therefore rewrites `compatible_printers` to the imported machine's own name,
+  which is why an imported bundle slices. The same rule bites an uploaded `.3mf`: its embedded
+  project identity overrides `--load-settings`, so the upload path rewrites that identity in a
+  job-local copy instead (see [3MF identity](#3mf-identity)).
 
 ## Troubleshooting
 
@@ -286,7 +358,10 @@ These are the behaviours the code works around; keep them in mind when debugging
 |---|---|
 | `printer unreachable` (503) | The container cannot reach `PRINTER_URL`. Check the URL, that the container has a route to the printer host, and that Moonraker is listening. See [docs/deployment.md](docs/deployment.md). |
 | `Moonraker rejected the API key` (502) | `MOONRAKER_API_KEY` is wrong or the key is not allowed for this client. Regenerate the key in Moonraker and update `.env` or Settings. |
-| `-17 incompatible profile` | A `.3mf`'s embedded project settings still name a printer or process the local presets do not accept, or an imported machine preset was not rebased onto the resolved slot. Uploads are re-identified automatically into `upload/slice-<stem>.3mf`; the job's `threemf.rewrite` field says what happened (`identity`, `stripped` or `none`). If it still fails, set `STRIP = True` in `app/threemf.py` to drop the settings member instead of rewriting it. For bundles, re-import through `/api/profile/upload`. |
+| `-17 incompatible profile` | A `.3mf`'s embedded project settings still name a printer or process the local presets do not accept, or a process preset does not list the selected machine in `compatible_printers`. Uploads are re-identified automatically into `upload/slice-<stem>.3mf`; the job's `threemf.rewrite` field says what happened (`identity`, `stripped` or `none`). If it still fails, set `STRIP = True` in `app/threemf.py` to drop the settings member instead of rewriting it. For bundles, re-import through `/api/profile/upload` — an imported process preset always lists the machine it came with. |
+| my model is bigger than my bed | Turn on **shrink to fit** for the job, or scale the model yourself and upload it again. The portal's refusal message names the model's dimensions and the bed, so it tells you how much to take off. |
+| shrink to fit refuses my model | The uniform factor needed is under the `0.25` floor, so the part would no longer print as designed. The message names the factor it would have needed and the smallest size that works — scale the model to at least that and upload it again. |
+| shrink to fit fails on a 3MF | 3MF geometry lives in `3D/3dmodel.model`, which the portal does not parse — `app/threemf.py` only rewrites preset identity there. Turn shrink to fit off for this job, or export the model as STL and upload that. A bounding-box reader for 3MF is separate follow-up work, not part of this change. |
 | `missing shared library` | The image was built for the wrong architecture, or the OrcaSlicer binary cannot find its bundled libraries. The image is amd64 only; rebuild with `--platform linux/amd64`. |
 | `mkdir: cannot create directory '/data/...': Permission denied` and the container exits | The bind-mounted `./data` directory is owned by root — Compose creates it that way when it does not exist yet on the host, while the image runs as uid 1000. Fix ownership on the host: `sudo chown -R 1000:1000 ./data`. |
 

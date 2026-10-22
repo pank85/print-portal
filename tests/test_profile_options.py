@@ -17,7 +17,8 @@ from fastapi.testclient import TestClient
 import main
 import profiles as prof
 
-DEFAULTS = {"supports": False, "brim": True, "hide_profiles": False}
+DEFAULTS = {"supports": False, "brim": True, "hide_profiles": False,
+            "auto_orient": True, "shrink_to_fit": False}
 SELECTED_PROCESS = prof.DEFAULT_PROFILE["process"]
 
 
@@ -70,15 +71,18 @@ def test_partial_option_updates_merge_and_persist(client, isolated_profile):
     assert first.status_code == 200, first.text
     assert first.json() == {"ok": True,
                             "options": {"supports": True, "brim": True,
-                                        "hide_profiles": False}}
+                                        "hide_profiles": False,
+                                        "auto_orient": True, "shrink_to_fit": False}}
 
     second = client.post("/api/profile/options", json={"brim": False})
     assert second.status_code == 200, second.text
     assert second.json()["options"] == {"supports": True, "brim": False,
-                                        "hide_profiles": False}
+                                        "hide_profiles": False,
+                                        "auto_orient": True, "shrink_to_fit": False}
 
     stored = json.loads(isolated_profile.read_text())
-    assert stored["options"] == {"supports": True, "brim": False, "hide_profiles": False}
+    assert stored["options"] == {"supports": True, "brim": False, "hide_profiles": False,
+                                 "auto_orient": True, "shrink_to_fit": False}
     assert stored["machine_label"] == "Shop Floor"       # unrelated keys survive the merge
     assert stored["process"] == SELECTED_PROCESS
 
@@ -102,7 +106,34 @@ def test_options_survive_profile_select(client):
     assert select.status_code == 200, select.text
 
     assert options_of(client.get("/api/profile")) == {"supports": True, "brim": True,
-                                                     "hide_profiles": True}
+                                                     "hide_profiles": True,
+                                                     "auto_orient": True,
+                                                     "shrink_to_fit": False}
+
+
+def test_the_new_options_round_trip_through_the_api(client, isolated_profile):
+    response = client.post("/api/profile/options", json={"auto_orient": False})
+
+    assert options_of(response) == {"supports": False, "brim": True, "hide_profiles": False,
+                                    "auto_orient": False, "shrink_to_fit": False}
+    profile = client.get("/api/profile").json()
+    assert profile["options"]["auto_orient"] is False
+    assert profile["options"]["shrink_to_fit"] is False
+    assert profile["effective"]["auto_orient"] is False
+
+
+def test_a_partial_update_keeps_the_other_new_option(client, isolated_profile):
+    assert client.post("/api/profile/options",
+                       json={"shrink_to_fit": True}).status_code == 200
+    response = client.post("/api/profile/options", json={"auto_orient": False})
+
+    assert response.status_code == 200, response.text
+    stored = json.loads(isolated_profile.read_text())["options"]
+    assert stored["shrink_to_fit"] is True
+    assert stored["auto_orient"] is False
+    profile = client.get("/api/profile").json()
+    assert profile["effective"]["shrink_to_fit"] is True
+    assert profile["effective"]["auto_orient"] is False
 
 
 @pytest.mark.parametrize("payload,status,detail", [
@@ -110,6 +141,8 @@ def test_options_survive_profile_select(client):
     ({"supports": "yes"}, 400, "supports must be true or false"),   # a string is not a bool
     ({"supports": 1}, 400, "supports must be true or false"),       # 0/1 are not bools either
     ({"support": True}, 400, "unknown option: support"),            # unknown key (typo)
+    ({"auto_orient": "yes"}, 400, "auto_orient must be true or false"),
+    ({"shrink_to_fit": 1}, 400, "shrink_to_fit must be true or false"),
     ([], 422, None),                     # non-object body is a FastAPI validation error
     ("x", 422, None),
 ])
@@ -143,7 +176,8 @@ def test_generated_process_encodes_supports_and_brim(datadir):
     selected = datadir / SELECTED_PROCESS
 
     path = prof.write_derived_process(selected, datadir,
-                                      {"supports": True, "brim": True, "hide_profiles": False})
+                                      {"supports": True, "brim": True, "hide_profiles": False,
+                                       "auto_orient": True, "shrink_to_fit": False})
 
     assert path == datadir / prof.PORTAL_PROCESS_REL
     data = json.loads(path.read_text())
@@ -157,11 +191,28 @@ def test_generated_process_encodes_supports_and_brim(datadir):
     assert data["layer_height"] == "0.2"
 
     prof.write_derived_process(selected, datadir,
-                               {"supports": False, "brim": False, "hide_profiles": False})
+                               {"supports": False, "brim": False, "hide_profiles": False,
+                                "auto_orient": True, "shrink_to_fit": False})
     off = json.loads(path.read_text())
     assert off["enable_support"] == "0"
     assert off["brim_type"] == "no_brim"
     assert off["brim_width"] == "0"
+
+
+def test_the_new_options_do_not_change_the_derived_preset(client, datadir):
+    assert client.post("/api/profile/options",
+                       json={"shrink_to_fit": True}).status_code == 200
+    # The two new switches are command-line flags, so only supports/brim may reach the preset.
+    saved = client.post("/api/profile/options",
+                        json={"auto_orient": False, "supports": True, "brim": False})
+    assert saved.status_code == 200, saved.text
+
+    preset = json.loads((datadir / prof.PORTAL_PROCESS_REL).read_text())
+    assert "auto_orient" not in preset
+    assert "shrink_to_fit" not in preset
+    assert preset["enable_support"] == "1"
+    assert preset["brim_type"] == "no_brim"
+    assert preset["brim_width"] == "0"
 
 
 def test_generated_process_preserves_preset_brim_width(datadir):
@@ -171,11 +222,13 @@ def test_generated_process_preserves_preset_brim_width(datadir):
                                    "from": "system", "brim_width": "7.5"}))
 
     path = prof.write_derived_process(selected, datadir,
-                                      {"supports": False, "brim": True, "hide_profiles": False})
+                                      {"supports": False, "brim": True, "hide_profiles": False,
+                                       "auto_orient": True, "shrink_to_fit": False})
     assert json.loads(path.read_text())["brim_width"] == "7.5"
 
     prof.write_derived_process(selected, datadir,
-                               {"supports": False, "brim": False, "hide_profiles": False})
+                               {"supports": False, "brim": False, "hide_profiles": False,
+                                "auto_orient": True, "shrink_to_fit": False})
     assert json.loads(path.read_text())["brim_width"] == "0"
 
 

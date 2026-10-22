@@ -1,5 +1,8 @@
 #!/usr/bin/env python3
-"""Build-time smoke test: slice a cube with the image's OrcaSlicer binary + presets.
+"""Build-time smoke test: import the bundle, then slice a cube with the image's presets.
+
+The seeded datadir ships no preset, so the machine/process/filament the CLI is given come
+from importing ``--bundle`` through the same ``profiles.import_into`` the app uses.
 
 Exits 0 and prints a single line starting ``smoke: ok`` on success; exits 1 with
 diagnostics on any failure. Runnable as uid 1000.
@@ -13,10 +16,6 @@ import shutil
 import subprocess
 import sys
 from pathlib import Path
-
-DEFAULT_MACHINE = "system/Custom/machine/generic-klipper-0.4.json"
-DEFAULT_PROCESS = "system/Custom/process/generic-0.20-standard.json"
-DEFAULT_FILAMENT = "system/Custom/filament/generic-pla.json"
 
 
 def fail(msg: str, proc: subprocess.CompletedProcess | None = None) -> None:
@@ -45,10 +44,10 @@ def main() -> None:
     ap.add_argument("--stl", required=True)
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--app-dir", default="/app")
-    ap.add_argument("--machine", default=DEFAULT_MACHINE)
-    ap.add_argument("--process", default=DEFAULT_PROCESS)
-    ap.add_argument("--filament", default=DEFAULT_FILAMENT)
+    ap.add_argument("--bundle", default="/opt/smoke/bundle.orca_printer")
+    ap.add_argument("--bed", default="220x220")
     args = ap.parse_args()
+    bed = tuple(float(part) for part in args.bed.lower().split("x"))
 
     workdir = Path(args.workdir)
     datadir = workdir / "datadir"
@@ -67,9 +66,34 @@ def main() -> None:
     env["DISPLAY"] = ""
     env["LC_ALL"] = "C"
 
-    machine_path = datadir / args.machine
-    process_path = datadir / args.process
-    filament_path = datadir / args.filament
+    sys.path.insert(0, args.app_dir)
+    try:
+        import profiles
+    except Exception as e:
+        fail(f"smoke: cannot import profiles: {e}")
+
+    bundle = Path(args.bundle)
+    try:
+        result = profiles.import_into(datadir, bundle.read_bytes(), bundle.name, bed)
+    except Exception as e:
+        fail(f"smoke: import failed: {e}")
+
+    imported = result["imported"]
+
+    def first_path(ptype: str) -> Path | None:
+        for row in imported:
+            if row["type"] == ptype:
+                return datadir / row["path"]
+        return None
+
+    machine_path = first_path("machine")
+    process_path = first_path("process")
+    filament_path = first_path("filament")
+    if not result["ok"] or machine_path is None or process_path is None or filament_path is None:
+        print("smoke: import failed", file=sys.stderr)
+        for note in result.get("notes", []):
+            print(f"note: {note}", file=sys.stderr)
+        raise SystemExit(1)
 
     cmd = [
         args.orca,
@@ -102,7 +126,6 @@ def main() -> None:
             fail(f"smoke: bad result.json: {e}", proc)
 
     gcode = gcodes[0]
-    sys.path.insert(0, args.app_dir)
     try:
         from gcode import parse_gcode_stats
     except Exception as e:
