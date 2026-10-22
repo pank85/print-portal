@@ -127,6 +127,22 @@ endpoint: `GET /api/jobs/{jid}` carries the text in `error`.
 
 A slice exceeding `SLICE_TIMEOUT` fails with `slice timed out after <n>s` (`main.py:664`).
 
+### Slicer CLI quirks the code works around
+
+Keep these in mind before changing the slice invocation — each one has bitten the portal:
+
+* **`--export-3mf` does not slice.** It writes a project 3MF with `layer_height: 0.0`. Slicing needs
+  `--slice 0 --outputdir DIR`, which writes `plate_1.gcode` and `result.json`.
+* **The loader flags matter.** The CLI is called with `--load-settings "<machine>;<process>"`,
+  `--load-filaments <filament>` and `--datadir` pointing at the writable datadir.
+* **A bare `--orient` and `--orient auto` are rejected (rc 254)** — the flag needs the literal `1`.
+* **`--scale` alone produces no plate** (`-50 "One of the plate is empty"`), so a shrink also forces
+  `--orient 1`.
+* **The gcode summary is not always near the top.** A profile that prints every setting can push
+  `estimated printing time` / `total filament used [g]` ~230 kB into the file; the parser reads 2 MB
+  and then falls back to the Prusa-style `;TIME:` / `;Filament used:` lines.
+* **Preset filenames must not contain spaces** — the importer replaces them.
+
 ## Container exits at startup — `/data` not writable (both states)
 
 ```text
