@@ -521,3 +521,176 @@ def test_dashboard_source_order_and_desktop_grid(page):
     for area, title in (("printer", "printerCardTitle"), ("upload", "uploadTitle"), ("profile", "profCardTitle")):
         assert re.search(rf'\[aria-labelledby="{title}"\]\s*\{{\s*grid-area:\s*{area};', style), title
     assert not re.search(r"[;{\s]order\s*:", style, re.I), "the layout must not depend on `order:`"
+
+
+# ---------------------------------------------------------------- slicing wait (task 4)
+def test_active_job_row_carries_an_indeterminate_slice_indicator(page):
+    """The CLI reports no slice fraction, so the row must not imply one.
+
+    The bar is a named ``role="progressbar"`` with no value attributes: the tabular
+    ``aria-valuenow`` set belongs to the Moonraker print bar (``#progTrack``) only, and
+    copying it here would turn an honest "length unknown" into a second fake percentage.
+    """
+    row = function_body(page, "refresh")
+    assert 'class="slice-wait"' in row
+    assert 'aria-busy="true"' in row
+    assert 'role="progressbar"' in row
+    assert 'class="slice-track"' in row
+
+    bar = slice_between(row, 'class="slice-track"', "</span>")
+    assert 'aria-label="${label}"' in bar
+    assert "aria-valuenow" not in bar
+    assert "aria-valuemin" not in bar
+    assert "aria-valuemax" not in bar
+
+
+def test_queued_and_slicing_use_different_wait_labels(page):
+    """Waiting for the slicer and slicing are different waits, so they read differently.
+
+    Both labels are literals in ``SLICE_LABELS``; the row takes its label from that map by
+    status, so the text cannot drift away from the state it describes.
+    """
+    labels = slice_between(page, "const SLICE_LABELS", "};")
+    assert re.search(r'queued:\s*"waiting for the slicer…"', labels)
+    assert re.search(r'slicing:\s*"slicing…"', labels)
+    row = function_body(page, "refresh")
+    assert "SLICE_LABELS[j.status]" in row
+    # the row interpolates that map's value, so a hard-coded label cannot pass this test
+    label_span = slice_between(row, 'class="slice-wait-label"', "</span>")
+    assert re.search(r'class="slice-wait-label"[^>]*>\s*\$\{\s*label\s*\}\s*$', label_span)
+
+
+def test_slice_indicator_is_gated_off_for_done_and_failed_jobs(page):
+    """Only a live slice gets the bar: a failure shows its error text and no progress at all.
+
+    ``sliced`` / ``printed`` are finished and ``failed`` carries an error, so the two guards
+    together (status in the helper, ``!j.error`` at the call site) make ``.slice-wait``
+    unreachable for all three.
+    """
+    refresh_body = function_body(page, "refresh")
+    assert "const active = isSlicing(j.status) && !j.error;" in refresh_body
+    assert "isSlicing(j.status)" in refresh_body
+    assert "!j.error" in refresh_body
+    # the guard only means anything if the markup is driven by it: `active` picks the bar and
+    # the other branch is the empty string, so no finished or failed row can render one
+    assert re.search(r"const wait\s*=\s*active\s*\?", refresh_body)
+    assert "${wait}" in refresh_body
+    assert re.search(r'const wait\s*=\s*active\s*\?\s*`[^`]*`\s*:\s*""\s*;', refresh_body)
+    # the error itself is still rendered — nothing is hidden, only the bar is withheld.
+    # The row markup is pinned inside the row template, not page-wide: a page-wide match would
+    # still pass off the catch-path markup if the per-row error line were deleted.
+    assert re.search(r'<p\s+class="err">\$\{esc\(j\.error\)\}</p>', refresh_body)
+    assert re.search(r'\$\{j\.error\s*\?\s*`<p\s+class="err"\s*>\$\{\s*esc\(j\.error\)\s*\}', refresh_body)
+    # ...and the load-failure message is its own, separately required piece of markup
+    catch_body = re.split(r"\}\s*catch\s*\(\s*e\s*\)\s*\{", refresh_body)[-1]
+    assert re.search(r'<p\s+class="err">Could not load jobs:\s*\$\{\s*esc\(e\.message\)\s*\}</p>', catch_body)
+
+    helper = function_body(page, "isSlicing")
+    # function_body runs to the next column-0 brace, so bound the one-line helper first
+    decl = helper[:helper.index("\n")]
+    assert '"queued"' in decl and '"slicing"' in decl
+    for status in ("sliced", "printed", "failed", "error", "done", "canceled", "cancelled"):
+        assert f'"{status}"' not in decl, status
+
+
+def test_upload_card_shows_the_wait_state_in_a_hidden_region(page):
+    """The upload card mirrors the same wait, starts hidden, and its bar has no value either."""
+    card = slice_between(page, '<section class="card" aria-labelledby="uploadTitle">', "</section>")
+    assert 'id="uploadWait"' in card
+    assert 'class="slice-wait"' in card
+    assert 'id="uploadWaitModel"' in card
+    assert "hidden" in slice_between(card, 'id="uploadWait"', ">")
+    # beside the drop zone, not inside it: #drop is one big click target
+    assert 'id="uploadWait"' not in slice_between(card, 'id="drop"', "</div>")
+
+    bar = slice_between(card, 'class="slice-track"', "</span>")
+    assert 'id="uploadWaitTrack"' in bar
+    assert 'role="progressbar"' in bar
+    assert "aria-valuenow" not in bar
+    assert "aria-valuemin" not in bar
+    assert "aria-valuemax" not in bar
+
+    style = page[page.index("<style>"):page.index("</style>")]
+    # .slice-wait sets display:flex, an author rule that beats the UA [hidden] rule
+    assert re.search(r"\.slice-wait\[hidden\]\s*\{\s*display:\s*none", style)
+
+
+def test_upload_wait_region_is_updated_in_place_without_innerhtml(page):
+    """The card is not re-rendered by the poll, so it is toggled and retitled in place.
+
+    Re-parsing it on every poll would restart the animation and could flash the region.
+    """
+    body = function_body(page, "setUploadWait")
+    assert "hidden" in body
+    assert "textContent" in body
+    assert "innerHTML" not in body
+    # failed wins in the card too, so a contradictory payload cannot paint a bar over an error
+    assert "const active = !!job && isSlicing(job.status) && !job.error;" in body
+    # the bar's accessible name tracks the visible label, and it is synced on its own guard: the
+    # role=progressbar track is not a descendant of the label span, so a reader of the bar cannot
+    # see the label text. Folding this back inside the labelEl guard would leave a stale name.
+    assert re.search(
+        r'if\s*\(\s*track\.getAttribute\("aria-label"\)\s*!==\s*label\s*\)\s*'
+        r'track\.setAttribute\("aria-label",\s*label\)',
+        body,
+    )
+    refresh_body = function_body(page, "refresh")
+    assert "setUploadWait(jobs[0])" in refresh_body
+    # a failed poll clears the card's wait too, so it cannot contradict the error row list —
+    # and only the catch branch may clear it: clearing on the happy path would blank a live slice
+    try_part, catch_part = re.split(r"\}\s*catch\s*\(\s*e\s*\)\s*\{", refresh_body)
+    assert re.search(r"setUploadWait\s*\(\s*null\s*\)", catch_part)
+    assert not re.search(r"setUploadWait\s*\(\s*null\s*\)", try_part)
+
+
+def test_reduced_motion_keeps_the_slice_indicator_visible(page):
+    """Motion off freezes the sweep, so the frozen state has to be a visible static bar.
+
+    A 35 % segment stuck at phase 0 plus real label text is the fallback; this test pins the
+    static fill so a later translucent-sweep redesign cannot leave an empty-looking track.
+    The animated base is pinned alongside it: the fallback is only enough while the moving
+    state is a visible segment that the keyframes sweep.
+    """
+    style = page[page.index("<style>"):page.index("</style>")]
+    # (0) the animated base: a named sweep over a segment that is already visible at phase 0,
+    # so "motion off" is a frozen copy of something rather than the only filled state
+    assert re.search(r"@keyframes\s+slice-sweep\s*\{", style)
+    base_rules = re.findall(r"\.slice-track\s*>\s*i\s*\{([^}]*)\}", style)
+    assert base_rules, "no base .slice-track > i rule"
+    base = base_rules[0]  # the reduced-motion override is a later rule in the same block
+    assert re.search(r"animation:\s*slice-sweep\b", base)
+    width = re.search(r"width:\s*([\d.]+)%", base)
+    assert width and float(width.group(1)) > 0, base
+    base_width = float(width.group(1))
+
+    block = slice_between(style, "@media (prefers-reduced-motion: reduce)", "\n}\n")
+    # (a) the global freeze is still the block's first rule
+    assert re.search(
+        r"\*,\s*\*::before,\s*\*::after\s*\{\s*transition:\s*none\s*!important\s*;\s*"
+        r"animation:\s*none\s*!important\s*;?\s*\}",
+        block,
+    ), "the block still freezes every transition and animation"
+    # (b) the frozen segment becomes a static, full-width striped fill
+    assert ".slice-track" in block
+    assert "repeating-linear-gradient" in block
+    assert re.search(r"width:\s*100%", block)
+    frozen = re.search(r"width:\s*([\d.]+)%", block)
+    assert frozen and float(frozen.group(1)) > base_width, "the frozen fill is the full track"
+    assert "transform:none" in block
+    assert "content:" not in block, "the fallback is real text, not a ::before"
+    # (c) the labels are DOM text, so they read the same with motion off
+    label = slice_between(page, 'id="uploadWaitLabel">', "</span>")
+    assert re.fullmatch(r"\s*waiting for the slicer…\s*", label.split(">", 1)[1])
+
+
+def test_print_progress_bar_stays_determinate_and_separate(page):
+    """#progTrack reports the Moonraker print fraction and keeps its own determinate track."""
+    track = slice_between(page, 'id="progTrack"', "</div>")
+    assert 'aria-valuenow="0"' in track
+    assert 'aria-valuemin="0"' in track and 'aria-valuemax="100"' in track
+    assert "slice-track" not in track
+
+    style = page[page.index("<style>"):page.index("</style>")]
+    assert re.search(r"\.bar\s*\{[^}]*height:\s*8px", style)
+    # the print bar still starts at width:0 — the indeterminate bar is a separate rule
+    assert re.search(r"\.bar\s*>\s*i\s*\{[^}]*width:\s*0", style)

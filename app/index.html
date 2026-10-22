@@ -179,6 +179,29 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
 .bar{ height:8px; background:var(--color-muted); border-radius:var(--radius-pill); overflow:hidden; }
 .bar > i{ display:block; height:100%; width:0; background:var(--color-accent); transition:width 300ms var(--ease); }
 
+/* indeterminate slicing wait — the CLI reports no fraction, so nothing here claims one */
+.slice-wait{
+  display:flex; flex-wrap:wrap; align-items:center;
+  gap:var(--space-1) var(--space-3);
+  font-size:var(--text-sm); color:var(--color-warning);
+}
+.slice-wait[hidden]{ display:none; }
+.slice-wait-label{ font-weight:500; white-space:nowrap; }
+.slice-wait-model{
+  font-size:var(--text-xs); color:var(--color-muted-foreground);
+  max-width:24ch; white-space:nowrap; overflow:hidden; text-overflow:ellipsis;
+}
+.slice-track{
+  flex:1 1 120px; max-width:220px; height:6px;
+  background:var(--color-muted); border-radius:var(--radius-pill); overflow:hidden;
+}
+.slice-track > i{
+  display:block; height:100%; width:35%;
+  background:var(--color-warning); border-radius:var(--radius-pill);
+  animation:slice-sweep 1000ms var(--ease) infinite alternate;
+}
+@keyframes slice-sweep{ from{ transform:translateX(0); } to{ transform:translateX(180%); } }
+
 /* ---------- form controls ---------- */
 .field{ display:grid; gap:6px; min-width:0; }
 #profileSelectors{ display:grid; gap:var(--space-3); min-width:0; }
@@ -256,6 +279,8 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 .job-stats{ display:flex; flex-wrap:wrap; gap:var(--space-4); margin-top:var(--space-2);
   color:var(--color-muted-foreground); font-size:var(--text-sm); }
 .job-stats b{ color:var(--color-foreground); font-weight:500; font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
+/* the card stacks the wait on its own grid gap; the row needs the extra step below .job-meta */
+.job .slice-wait{ margin-top:var(--space-2); }
 .job-actions{ display:flex; flex-wrap:wrap; gap:var(--space-2); }
 @media (max-width:599px){ .job-actions .btn{ flex:1 1 100%; } }
 .empty-line{ color:var(--color-muted-foreground); font-size:var(--text-sm); padding:var(--space-2) 0; }
@@ -324,6 +349,11 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 
 @media (prefers-reduced-motion: reduce){
   *,*::before,*::after{ transition:none!important; animation:none!important; }
+  /* motion off: a frozen sweep would read as an empty track, so paint a static striped fill */
+  .slice-track > i{
+    width:100%; transform:none;
+    background:repeating-linear-gradient(135deg, var(--color-warning) 0 6px, #F59E0B55 6px 12px);
+  }
 }
 </style>
 </head>
@@ -414,6 +444,11 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
           <span class="drop-title">Drop an STL here or press to select</span>
           <span class="hint">.stl / .3mf / .obj / .zip — sliced with the active profile</span>
+        </div>
+        <div id="uploadWait" class="slice-wait" aria-busy="true" hidden>
+          <span class="slice-wait-label" id="uploadWaitLabel">waiting for the slicer…</span>
+          <span class="slice-wait-model mono" id="uploadWaitModel"></span>
+          <span class="slice-track" id="uploadWaitTrack" role="progressbar" aria-label="waiting for the slicer…"><i></i></span>
         </div>
       </section>
 
@@ -520,6 +555,9 @@ const toast = (m, ms=2800) => { const t=$("#toast"); t.textContent=m; t.classLis
 const fmtBytes = b => { if(!b) return "—"; const u=["B","KB","MB"]; let i=0; while(b>1024&&i<2){b/=1024;i++;} return b.toFixed(b<10?1:0)+" "+u[i]; };
 const fmtDate = iso => { if(!iso) return "—"; try { return new Date(iso).toLocaleString(undefined,{day:"2-digit",month:"2-digit",hour:"2-digit",minute:"2-digit"}); } catch { return iso; } };
 const kv = pairs => pairs.map(([k,v]) => `<span>${esc(k)}</span><span>${esc(v ?? "—")}</span>`).join("");
+/* One source of truth for the two wait labels; both are literals, never server text. */
+const SLICE_LABELS = { queued: "waiting for the slicer…", slicing: "slicing…" };
+function isSlicing(status) { return status === "queued" || status === "slicing"; }
 
 /* ---------------- routing ---------------- */
 let currentView = null;
@@ -903,6 +941,21 @@ async function deleteAllJobs() {
   refresh();
 }
 
+/* The upload card is not re-rendered by the poll, so its element is updated in place
+   (.hidden / textContent): the bar keeps its animation phase and nothing is re-parsed. */
+function setUploadWait(job) {
+  const box = $("#uploadWait"), labelEl = $("#uploadWaitLabel"),
+        modelEl = $("#uploadWaitModel"), track = $("#uploadWaitTrack");
+  const active = !!job && isSlicing(job.status) && !job.error;
+  box.hidden = !active;
+  if (!active) return;
+  const label = SLICE_LABELS[job.status] || SLICE_LABELS.queued;
+  if (labelEl.textContent !== label) labelEl.textContent = label;
+  if (track.getAttribute("aria-label") !== label) track.setAttribute("aria-label", label);
+  const model = job.filename || "";
+  if (modelEl.textContent !== model) { modelEl.textContent = model; modelEl.title = model; }
+}
+
 async function refresh() {
   if (currentView === "settings" || document.hidden) return;
   const box = $("#jobs"), count = $("#jobCount"), delAll = $("#btnDeleteAll");
@@ -912,6 +965,7 @@ async function refresh() {
     count.textContent = String(jobs.length);
     delAll.disabled = jobs.length === 0;
     delAll.setAttribute("aria-disabled", jobs.length === 0 ? "true" : "false");
+    setUploadWait(jobs[0]);
     if (!jobs.length) {
       box.innerHTML = `<p class="empty-line">No jobs yet. Drop a model above to slice it.</p>`;
       return;
@@ -919,6 +973,13 @@ async function refresh() {
     box.innerHTML = jobs.map(j => {
       const s = j.stats || {};
       const out = j.output_name ? `<span class="mono" title="sliced as">→ ${esc(j.output_name)}.gcode</span>` : "";
+      const active = isSlicing(j.status) && !j.error;
+      const label = SLICE_LABELS[j.status] || SLICE_LABELS.queued;
+      const wait = active ? `
+          <div class="slice-wait" aria-busy="true">
+            <span class="slice-wait-label">${label}</span>
+            <span class="slice-track" role="progressbar" aria-label="${label}"><i></i></span>
+          </div>` : "";
       const stats = j.status === "sliced" ? `
         <div class="job-stats">
           <span>time <b>${esc(s.time || "?")}</b></span>
@@ -947,6 +1008,7 @@ async function refresh() {
             ${out}
             ${j.remote_file ? `<span class="mono" title="on printer">on printer: ${esc(j.remote_file)}</span>` : ""}
           </p>
+          ${wait}
           ${stats}
           ${j.error ? `<p class="err">${esc(j.error)}</p>` : ""}
         </div>
@@ -962,6 +1024,8 @@ async function refresh() {
     }).join("");
   } catch (e) {
     box.innerHTML = `<p class="err">Could not load jobs: ${esc(e.message)}</p>`;
+    /* the row list says the load failed, so the card must not keep asserting a live slice */
+    setUploadWait(null);
   }
 }
 
