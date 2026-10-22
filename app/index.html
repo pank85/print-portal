@@ -230,6 +230,21 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
 }
 @keyframes slice-sweep{ from{ transform:translateX(0); } to{ transform:translateX(180%); } }
 
+/* determinate transfer — the one wait that has a real fraction */
+.slice-wait.is-uploading{ color:var(--color-accent); }
+.slice-track.is-determinate > i{
+  width:0; background:var(--color-accent); animation:none;
+  transition:width 200ms var(--ease);
+}
+
+/* the card's latest-job line: model, output, error, and the one action it allows */
+.upload-latest{ display:grid; gap:var(--space-2); justify-items:start; font-size:var(--text-sm); }
+.upload-latest[hidden]{ display:none; }
+.upload-latest-head{ display:flex; flex-wrap:wrap; align-items:baseline; gap:var(--space-1) var(--space-3); min-width:0; }
+.upload-latest-head .mono{ font-size:var(--text-xs); word-break:break-word; }
+.upload-latest-out{ color:var(--color-muted-foreground); }
+.btn[hidden]{ display:none; }
+
 /* ---------- form controls ---------- */
 .field{ display:grid; gap:6px; min-width:0; }
 #profileSelectors{ display:grid; gap:var(--space-3); min-width:0; }
@@ -281,6 +296,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 .icon{ width:18px; height:18px; flex:0 0 auto; }
 
 /* ---------- drop zone ---------- */
+#drop.is-busy{ opacity:.6; cursor:progress; }
 #drop{
   display:grid; gap:var(--space-1); place-items:center; text-align:center;
   min-height:120px; padding:var(--space-6) var(--space-4);
@@ -488,16 +504,28 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
         </div>
         <label for="file" class="sr-only">Model file to slice</label>
         <input id="file" type="file" accept=".stl,.3mf,.obj,.zip" hidden>
-        <div id="drop" role="button" tabindex="0">
+        <div id="drop" role="button" tabindex="0" aria-disabled="false">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
           <span class="drop-title">Drop an STL here or press to select</span>
           <span class="hint">.stl / .3mf / .obj / .zip — sliced with the active profile</span>
         </div>
         <div id="uploadWait" class="slice-wait" aria-busy="true" hidden>
-          <span class="slice-wait-label" id="uploadWaitLabel">waiting for the slicer…</span>
+          <span class="slice-wait-label" role="status" aria-live="polite" id="uploadWaitLabel">waiting for the slicer…</span>
           <span class="slice-wait-model mono" id="uploadWaitModel"></span>
           <span class="slice-track" id="uploadWaitTrack" role="progressbar" aria-label="waiting for the slicer…"><i></i></span>
+        </div>
+        <div id="uploadLatest" class="upload-latest" hidden>
+          <p class="upload-latest-head">
+            <span class="mono" id="uploadLatestName"></span>
+            <span class="mono upload-latest-out" id="uploadLatestOut" hidden></span>
+          </p>
+          <p class="err" id="uploadLatestErr" hidden></p>
+          <button type="button" class="btn btn-primary" id="uploadLatestPrint"
+                  data-act="print" aria-label="Print the sliced model" hidden>
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+            Print
+          </button>
         </div>
       </section>
 
@@ -939,17 +967,104 @@ async function saveProfile() {
 
 /* ---------------- upload ---------------- */
 const drop = $("#drop"), input = $("#file");
-function openFilePicker() { input.click(); }
+/* One transfer at a time: a second drop or pick must not race the job being created. */
+let uploading = false;
+/* True while the request body is still moving. The poll must not repaint the box then. */
+let transferPhase = false;
+/* Last time the transfer label was rewritten; the polite live region is throttled by this. */
+let lastPaint = 0;
+function openFilePicker() { if (!uploading) input.click(); }
+
+/* The transfer is the one wait with a real fraction: xhr.upload.onprogress is the only way to
+   see it (fetch cannot report request-body progress), and a silent multi-minute upload is what
+   made the page look broken. Text repaints at most once a second; bar and aria-valuenow move
+   with every event. An unknown total stays indeterminate and never claims a value. */
+function setUploadProgress(sent, total) {
+  const box = $("#uploadWait"), labelEl = $("#uploadWaitLabel"),
+        modelEl = $("#uploadWaitModel"), track = $("#uploadWaitTrack");
+  transferPhase = true;
+  box.hidden = false;
+  box.classList.add("is-uploading");
+  if (modelEl.textContent) modelEl.textContent = "";
+  const pct = total ? Math.min(100, Math.round((sent / total) * 100)) : null;
+  const now = Date.now();
+  const mb = (sent / 1048576).toFixed(1);
+  if (!lastPaint || now - lastPaint >= 1000 || sent >= total) {
+    lastPaint = now;
+    labelEl.textContent = pct === null
+      ? `Uploading ${mb} MB…`
+      : `Uploading ${pct}% · ${mb} / ${(total / 1048576).toFixed(1)} MB`;
+  }
+  track.setAttribute("aria-label", labelEl.textContent);
+  track.removeAttribute("aria-valuemin");
+  track.removeAttribute("aria-valuemax");
+  track.removeAttribute("aria-valuenow");
+  track.classList.remove("is-determinate");
+  track.firstElementChild.style.width = "";
+  if (pct !== null) {
+    track.setAttribute("aria-valuemin", "0");
+    track.setAttribute("aria-valuemax", "100");
+    track.setAttribute("aria-valuenow", String(pct));
+    track.classList.add("is-determinate");
+    track.firstElementChild.style.width = pct + "%";
+  }
+}
+
+/* Back to the indeterminate look, so a finished transfer never leaves a stale fraction. */
+function resetUploadTrack() {
+  const track = $("#uploadWaitTrack");
+  track.removeAttribute("aria-valuenow");
+  track.removeAttribute("aria-valuemin");
+  track.removeAttribute("aria-valuemax");
+  track.classList.remove("is-determinate");
+  track.firstElementChild.style.width = "";
+  track.setAttribute("aria-label", SLICE_LABELS.queued);
+}
+
+/* Every failure path lands here: the card resets instead of leaving a bar spinning. */
+function clearUploadWait() {
+  transferPhase = false;
+  $("#uploadWait").hidden = true;
+  $("#uploadWait").classList.remove("is-uploading");
+  resetUploadTrack();
+  $("#uploadWaitLabel").textContent = SLICE_LABELS.queued;
+  $("#uploadWaitModel").textContent = "";
+}
+
 async function upload(file) {
+  if (uploading) return;                    // a second drop/pick while one is in flight is ignored
+  uploading = true;
+  transferPhase = false;
+  lastPaint = 0;
+  drop.classList.add("is-busy");
+  drop.setAttribute("aria-disabled", "true");
   const fd = new FormData();
   fd.append("file", file);
   const name = ($("#outputName").value || "").trim();
   if (name) fd.append("output_name", name);
   toast(`Uploading: ${file.name}`);
+  setUploadProgress(0, file.size);
   try {
-    const r = await fetch("/api/upload", {method:"POST", body:fd});
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || r.statusText);
+    const j = await new Promise((resolve, reject) => {
+      const xhr = new XMLHttpRequest();
+      xhr.open("POST", "/api/upload");
+      xhr.upload.onprogress = ev => {
+        setUploadProgress(ev.loaded, ev.lengthComputable ? ev.total : 0);
+      };
+      xhr.onload = () => {
+        let body = {};
+        try { body = JSON.parse(xhr.responseText); } catch { /* non-JSON error page */ }
+        if (xhr.status >= 200 && xhr.status < 300) resolve(body);
+        else reject(new Error(body.detail || xhr.statusText));
+      };
+      xhr.onerror = () => reject(new Error("network error"));
+      xhr.send(fd);
+    });
+    /* The job exists now: the same box becomes the indeterminate slice wait, and the poll
+       (refresh → setUploadWait) takes over from here. */
+    transferPhase = false;
+    setUploadWait({status: "queued", filename: file.name});
+    setUploadLatest({id: j.id, status: "queued", filename: file.name});
     if (j.archive) {
       const total = Math.max(1, (j.archive.candidates || []).length);
       toast(`Slicing ${j.archive.member} (1 of ${total} model files)`, 5000);
@@ -968,7 +1083,15 @@ async function upload(file) {
       }
     }
     refresh();
-  } catch (e) { toast("Error: " + e.message, 5000); }
+  } catch (e) {
+    toast("Error: " + e.message, 5000);
+    clearUploadWait();
+    setUploadLatest(null);
+  } finally {
+    uploading = false;
+    drop.classList.remove("is-busy");
+    drop.setAttribute("aria-disabled", "false");
+  }
 }
 
 /* ---------------- jobs ---------------- */
@@ -1011,16 +1134,42 @@ async function deleteAllJobs() {
 /* The upload card is not re-rendered by the poll, so its element is updated in place
    (.hidden / textContent): the bar keeps its animation phase and nothing is re-parsed. */
 function setUploadWait(job) {
+  if (transferPhase) return;      // the body is still moving: the transfer owns the box
   const box = $("#uploadWait"), labelEl = $("#uploadWaitLabel"),
         modelEl = $("#uploadWaitModel"), track = $("#uploadWaitTrack");
   const active = !!job && isSlicing(job.status) && !job.error;
   box.hidden = !active;
   if (!active) return;
+  box.classList.remove("is-uploading");
+  resetUploadTrack();             // an indeterminate bar must not keep the transfer's value
   const label = SLICE_LABELS[job.status] || SLICE_LABELS.queued;
   if (labelEl.textContent !== label) labelEl.textContent = label;
   if (track.getAttribute("aria-label") !== label) track.setAttribute("aria-label", label);
   const model = job.filename || "";
   if (modelEl.textContent !== model) { modelEl.textContent = model; modelEl.title = model; }
+}
+
+/* The Slice card is the live surface for jobs[0]: what went in, what came out, and the one
+   action it allows. It reads the poll's first row, so a reload mid-slice lands here too. */
+function setUploadLatest(job) {
+  const box = $("#uploadLatest"), nameEl = $("#uploadLatestName"),
+        outEl = $("#uploadLatestOut"), errEl = $("#uploadLatestErr"),
+        print = $("#uploadLatestPrint");
+  if (!job) { box.hidden = true; return; }
+  box.hidden = false;
+  const model = job.filename || "";
+  if (nameEl.textContent !== model) { nameEl.textContent = model; nameEl.title = model; }
+  outEl.hidden = !job.output_name;
+  outEl.textContent = job.output_name ? `→ ${job.output_name}.gcode` : "";
+  errEl.hidden = !job.error;
+  errEl.textContent = job.error || "";
+  /* the print action is the table's own path: same button, same printJob(id) */
+  const printable = job.status === "sliced" && !job.error;
+  print.hidden = !printable;
+  if (printable) {
+    print.dataset.ref = job.id;
+    print.setAttribute("aria-label", `Print ${model}`);
+  }
 }
 
 async function refresh() {
@@ -1033,6 +1182,7 @@ async function refresh() {
     delAll.disabled = jobs.length === 0;
     delAll.setAttribute("aria-disabled", jobs.length === 0 ? "true" : "false");
     setUploadWait(jobs[0]);
+    setUploadLatest(jobs[0]);
     if (!jobs.length) {
       box.innerHTML = `<p class="empty-line">No jobs yet. Drop a model above to slice it.</p>`;
       return;
@@ -1097,6 +1247,7 @@ async function refresh() {
     box.innerHTML = `<p class="err">Could not load jobs: ${esc(e.message)}</p>`;
     /* the row list says the load failed, so the card must not keep asserting a live slice */
     setUploadWait(null);
+    setUploadLatest(null);
   }
 }
 
@@ -1450,8 +1601,13 @@ function boot() {
   });
   ["dragenter","dragover"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.add("hot"); }));
   ["dragleave","drop"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove("hot"); }));
-  drop.addEventListener("drop", ev => { if (ev.dataTransfer.files[0]) upload(ev.dataTransfer.files[0]); });
-  input.addEventListener("change", () => { if (input.files[0]) upload(input.files[0]); input.value = ""; });
+  drop.addEventListener("drop", ev => { if (uploading) return; if (ev.dataTransfer.files[0]) upload(ev.dataTransfer.files[0]); });
+  input.addEventListener("change", () => { if (uploading) return; if (input.files[0]) upload(input.files[0]); input.value = ""; });
+  /* same code path as the jobs table: one printJob(id), one confirm dialog, one toast */
+  $("#uploadLatest").addEventListener("click", ev => {
+    const btn = ev.target.closest('button[data-act="print"]');
+    if (btn && btn.dataset.ref) printJob(btn.dataset.ref);
+  });
 
   $("#profFile").addEventListener("change", async ev => {
     const f = ev.target.files[0]; if (!f) return;
