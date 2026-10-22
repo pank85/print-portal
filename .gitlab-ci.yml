@@ -36,6 +36,9 @@ variables:
   # MIRROR_IMAGE=none disables the mirror push.
   PRIMARY_IMAGE: ""
   MIRROR_IMAGE: ""
+  # Docker Hub publishing is opt-in: set DOCKERHUB_USER and a masked DOCKERHUB_TOKEN
+  # under Settings > CI/CD > Variables. DOCKERHUB_IMAGE overrides the repo name
+  # (default <user>/print-portal). With them unset the job prints a skip line.
 
 test:
   stage: test
@@ -127,6 +130,24 @@ docker:
         done
       else
         echo "mirror push skipped (MIRROR_IMAGE=none)"
+      fi
+
+      # Docker Hub (public) publish. Opt-in: skipped unless BOTH the account and a
+      # token are configured as CI variables, so a fork with no secrets still gets a
+      # green pipeline. The image is already in this job's daemon, so this costs no
+      # second build — only the upload of the layers Docker Hub does not have yet.
+      # Publish the release version and `latest`; the commit-sha tags stay internal.
+      if [ -n "${DOCKERHUB_USER:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
+        HUB="${DOCKERHUB_IMAGE:-$DOCKERHUB_USER/print-portal}"
+        echo "Docker Hub target: $HUB"
+        echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin docker.io
+        for tag in "$APP_VERSION" "latest"; do
+          docker tag "$TARGET:$FULL_VERSION" "$HUB:$tag"
+          docker push "$HUB:$tag"
+        done
+        printf 'DOCKERHUB_PUBLISHED=%s:%s\n' "$HUB" "$APP_VERSION" >> release.env
+      else
+        echo "Docker Hub publish skipped (set DOCKERHUB_USER and DOCKERHUB_TOKEN to enable)"
       fi
 
       # Hand the exact pushed digest to the deploy job. A tag can move; the digest
