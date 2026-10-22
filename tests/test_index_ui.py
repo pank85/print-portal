@@ -694,3 +694,69 @@ def test_print_progress_bar_stays_determinate_and_separate(page):
     assert re.search(r"\.bar\s*\{[^}]*height:\s*8px", style)
     # the print bar still starts at width:0 — the indeterminate bar is a separate rule
     assert re.search(r"\.bar\s*>\s*i\s*\{[^}]*width:\s*0", style)
+
+
+# ---------------------------------------------------------------- header nav / mobile disclosure
+def test_header_nav_keeps_the_two_hash_destinations(page):
+    # drop the <nav> opening tag (it carries its own nav* id) so only the link ids are collected
+    nav = slice_between(page, 'id="navSections"', "</nav>").split(">", 1)[1]
+    assert re.findall(r'id="(nav[\w-]+)"', nav) == ["navDash", "navSettings"]
+    assert 'id="navDash" href="#/"' in nav
+    assert 'id="navSettings" href="#/settings"' in nav
+    assert nav.count("<a ") == 2
+
+
+def test_switcher_is_one_compact_row_inside_the_header_bar(page):
+    bar = page.index('<div class="header-bar">')
+    assert "</div>" not in page[bar:page.index('id="navToggle"')]
+    assert "</div>" not in page[bar:page.index('id="navSections"')]
+    style = page[page.index("<style>"):page.index("</style>")]
+    assert not re.search(r"\n\.tabs\s*\{[^}]*margin-top", style)
+    base_tab = re.search(r"\n\.tab\s*\{([^}]*)\}", style).group(1)
+    assert "var(--target-min)" not in base_tab
+
+
+def test_mobile_nav_toggle_is_a_closed_disclosure(page):
+    # anchor the slice on the toggle's own id, then walk back to that button's opening tag —
+    # `type="button"` and the aria-* attributes live on the opening tag, so the slice must start
+    # there; starting at `id="navToggle"` would begin after them and the checks below could not fail
+    toggle = page.index('id="navToggle"')
+    btn = page[page.rindex("<button", 0, toggle):page.index("</button>", toggle)]
+    assert re.search(r'aria-expanded="false"', btn)          # closed by default
+    assert re.search(r'aria-controls="navSections"', btn)    # controls the real menu
+    assert re.search(r'<nav[^>]*id="navSections"', page)     # and that target is a real <nav>
+    assert re.search(r'aria-label="[^"]+"', btn)              # icon-only button has a name
+    assert 'type="button"' in btn
+    assert "<svg" in btn and 'aria-hidden="true"' in btn      # inline SVG, decorative
+    assert "class=\"icon\"" in btn
+
+
+def test_nav_disclosure_is_wired_and_the_router_is_untouched(page):
+    script = script_block(page)
+    body = function_body(page, "setNavOpen")
+    assert "aria-expanded" in body and "is-open" in body      # one place syncs both
+    esc = slice_between(script, 'document.addEventListener("keydown"', "});")
+    assert 'ev.key !== "Escape"' in esc
+    assert "setNavOpen(false)" in esc and ".focus()" in esc   # Escape closes + returns focus
+    assert 'closest("a")' in script                           # destination click closes
+    assert "setNavOpen(false)" in function_body(page, "setView")   # route change closes
+    # frozen router
+    assert "let currentView = null;" in script
+    assert script.count('if (currentView === "settings" || document.hidden) return;') == 2
+
+
+def test_closed_mobile_menu_leaves_nothing_focusable(page):
+    style = page[page.index("<style>"):page.index("</style>")]
+    block = slice_between(style, "@media (max-width:720px)", "\n}\n")
+    assert re.search(r"\.tabs\s*\{\s*display:\s*none", block)
+    assert re.search(r"\.tabs\.is-open\s*\{[^}]*display:\s*flex", block)
+    assert "visibility" not in block and "opacity" not in block
+
+
+def test_skip_link_still_precedes_the_header(page):
+    assert page.index('id="skip"') < page.index('class="app-header"')
+    assert page.index('class="app-header"') < page.index('id="main"')
+    assert 'id="skip" href="#main"' in page
+    assert re.search(r'id="main"[^>]*tabindex="-1"', page)
+    bar = page.index('<div class="header-bar">')
+    assert "</div>" not in page[bar:page.index('id="printerPill"')]   # pill stays in the top bar

@@ -79,19 +79,47 @@ ul{ padding:0; list-style:none; }
 .header-bar{ display:flex; align-items:center; justify-content:space-between; gap:var(--space-3); flex-wrap:wrap; }
 .brand{ font-size:var(--text-xl); font-weight:600; letter-spacing:-.01em; }
 .tabs{
-  display:flex; flex-wrap:wrap; gap:var(--space-1); margin-top:var(--space-2);
-  padding:var(--space-1); width:max-content; max-width:100%;
+  display:flex; flex-wrap:wrap; gap:var(--space-1); margin-left:auto;
+  padding:2px; width:max-content; max-width:100%;
   background:var(--color-muted); border:1px solid var(--color-border); border-radius:var(--radius-pill);
 }
 .tab{
   display:inline-flex; align-items:center; justify-content:center;
-  min-height:var(--target-min); padding:10px 14px;
+  min-height:32px; padding:4px 12px;
   border-radius:var(--radius-pill); color:var(--color-muted-foreground);
   font-size:var(--text-sm); font-weight:500; text-decoration:none;
   transition:background var(--dur) var(--ease), color var(--dur) var(--ease);
 }
 .tab:hover{ color:var(--color-foreground); }
 .tab[aria-current="page"]{ background:var(--color-secondary); color:#FFFFFF; }
+.nav-toggle{
+  display:none;
+  align-items:center; justify-content:center;
+  min-width:var(--target-min); min-height:var(--target-min);
+  margin-left:auto; padding:0;
+  background:var(--color-muted); color:var(--color-foreground);
+  border:1px solid var(--color-border); border-radius:var(--radius-sm);
+  transition:background var(--dur) var(--ease);
+}
+.nav-toggle:hover{ background:var(--color-secondary); }
+
+@media (max-width:720px){
+  .nav-toggle{ display:inline-flex; }
+  .tabs{ display:none; }
+  .tabs.is-open{
+    display:flex; flex-direction:column; align-items:stretch;
+    /* width must solve from left/right so the panel is full-bleed; the base width:max-content
+       would make all three definite and drop right */
+    width:auto;
+    position:absolute; top:100%; left:0; right:0;
+    padding:var(--space-2); gap:var(--space-1);
+    border-radius:0; border-inline:0;
+  }
+  .tabs.is-open .tab{
+    justify-content:flex-start; min-height:var(--target-min); padding:10px 14px;
+    border-radius:var(--radius-sm);
+  }
+}
 
 /* ---------- pills / chips ---------- */
 .pill{
@@ -365,11 +393,16 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     <div class="header-bar">
       <p class="brand">print-portal</p>
       <span id="printerPill" class="pill pill-dot" title="printer status">printer…</span>
+      <button type="button" class="nav-toggle" id="navToggle" aria-label="Sections"
+              aria-controls="navSections" aria-expanded="false">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h16"/><path d="M4 12h16"/><path d="M4 17h16"/></svg>
+      </button>
+      <nav class="tabs" id="navSections" aria-label="Sections">
+        <a class="tab" id="navDash" href="#/">Dashboard</a>
+        <a class="tab" id="navSettings" href="#/settings">Settings</a>
+      </nav>
     </div>
-    <nav class="tabs" aria-label="Sections">
-      <a class="tab" id="navDash" href="#/">Dashboard</a>
-      <a class="tab" id="navSettings" href="#/settings">Settings</a>
-    </nav>
   </div>
 </header>
 
@@ -564,6 +597,7 @@ let currentView = null;
 const DASH = () => $("#viewDashboard"), SETT = () => $("#viewSettings");
 
 function setView(name) {
+  setNavOpen(false);
   const settings = name === "settings";
   const moved = currentView !== null && currentView !== name;
   currentView = name;
@@ -591,6 +625,13 @@ function route() {
   if (raw === "" || raw === "dashboard") return setView("dashboard");
   history.replaceState(null, "", "#/");
   setView("dashboard");
+}
+
+/* ---------------- mobile nav disclosure ---------------- */
+function setNavOpen(open) {
+  const t = $("#navToggle"), m = $("#navSections");
+  t.setAttribute("aria-expanded", open ? "true" : "false");
+  m.classList.toggle("is-open", open);
 }
 
 /* ---------------- confirmations ---------------- */
@@ -1352,6 +1393,21 @@ function boot() {
   booted = true;
 
   window.addEventListener("hashchange", route);
+
+  $("#navToggle").addEventListener("click", () => {
+    setNavOpen($("#navToggle").getAttribute("aria-expanded") !== "true");
+  });
+  $("#navSections").addEventListener("click", ev => {
+    if (ev.target.closest("a")) setNavOpen(false);
+  });
+  document.addEventListener("keydown", ev => {
+    const t = $("#navToggle");
+    if (ev.key !== "Escape") return;
+    if (t.getAttribute("aria-expanded") !== "true") return;
+    if (document.querySelector("dialog[open]")) return;
+    setNavOpen(false);
+    t.focus();
+  });
 
   $("#skip").addEventListener("click", ev => {
     ev.preventDefault();
