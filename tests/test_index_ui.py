@@ -58,11 +58,10 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
 
     Order inside the Printer card is the tab order (DOM order drives it): machine → process →
     filament → supports → brim → upload → notes. The old Profile card keeps the read-only summary
-    only; task 3 repositions that card, it is not deleted here.
+    only; it is now the last card of the `.cards` cluster, below the upload card.
     """
     printer = page.index('id="printerCardTitle"')
     profile = page.index('id="profCardTitle"')
-    next_card = page.index('id="uploadTitle"')         # the card below .cards
     settings = page.index('id="viewSettings"')
 
     order = [
@@ -97,8 +96,10 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
     assert '<h3 id="profileGroupTitle">Profile</h3>' in page
     assert 'role="group" aria-labelledby="profileGroupTitle"' in page
 
-    # what the Profile card kept, and what it must no longer contain
-    summary = page[profile:next_card]
+    # the Profile card is now the LAST card of the .cards cluster — bound it by its own tag, not by
+    # whatever card happens to follow (the upload card moved above it, see
+    # test_dashboard_source_order_and_desktop_grid)
+    summary = slice_between(page, 'id="profCardTitle"', "</section>")
     for kept in ('id="profSource"', 'id="profInfo"', 'id="profWarning"', 'id="profCompat"'):
         assert kept in summary, kept
     for moved in ('id="profileSelectors"', 'id="profOptions"', 'id="profFile"', 'id="profNotes"'):
@@ -476,3 +477,47 @@ def test_upload_reports_a_profile_switch(page):
     assert "await loadPrinters();" in switch
     assert "await loadProfile();" in switch
     assert switch.index("await loadProfile();") < switch.index("Profile switched to")
+
+
+def test_dashboard_source_order_and_desktop_grid(page):
+    """Source order is the mobile order: printer → uploads → profile info → jobs.
+
+    Desktop is the same DOM split by named grid areas, so the tab order, the skip-link target
+    (#main) and the screen-reader order stay correct without any `order:` reshuffle.
+    """
+    view = slice_between(page, 'id="viewDashboard"', 'id="viewSettings"')
+    printer = view.index('id="printerCardTitle"')
+    upload = view.index('id="uploadTitle"')
+    profile = view.index('id="profCardTitle"')
+    jobs = view.index('id="jobsTitle"')
+
+    # (a) uploads after the Printer card, (b) uploads before the Profile-info card
+    assert printer < upload < profile
+    # (c) the jobs section is last — after every card, and it is not inside the card cluster
+    assert profile < jobs
+    jobs_block = view[jobs:]
+    assert 'id="btnDeleteAll"' in jobs_block and 'id="jobs"' in jobs_block
+    assert 'id="jobCount"' in jobs_block
+
+    # the three cards share one wrapper, which is what makes the two-column split possible
+    cards = view[view.index('<div class="cards"'):jobs]
+    for needle in ('id="printerCardTitle"', 'id="uploadTitle"', 'id="profCardTitle"'):
+        assert needle in cards, needle
+    assert cards.count('class="card"') == 3
+
+    # real nesting: upload must not live inside the printer or profile card
+    printer_slice = slice_between(page, 'aria-labelledby="printerCardTitle"', "</section>")
+    assert 'id="uploadTitle"' not in printer_slice
+    profile_slice = slice_between(page, 'aria-labelledby="profCardTitle"', "</section>")
+    assert 'id="uploadTitle"' not in profile_slice
+
+    # (d) the desktop grid declaration exists, is explicit, and keeps the mobile order as its default
+    style = page[page.index("<style>"):page.index("</style>")]
+    # whitespace-normalised: the assertion must not depend on how the page breaks its declarations
+    assert re.search(r'grid-template-areas:\s*"printer"\s*"upload"\s*"profile"', style)
+    desktop = style[style.index("@media (min-width:900px)"):style.index("\n}", style.index("@media (min-width:900px)"))]
+    assert '"printer upload"' in desktop and '"profile profile"' in desktop
+    assert re.search(r'grid-template-columns:\s*repeat\(2,\s*minmax\(0,\s*1fr\)\)', desktop)
+    for area, title in (("printer", "printerCardTitle"), ("upload", "uploadTitle"), ("profile", "profCardTitle")):
+        assert re.search(rf'\[aria-labelledby="{title}"\]\s*\{{\s*grid-area:\s*{area};', style), title
+    assert not re.search(r"[;{\s]order\s*:", style, re.I), "the layout must not depend on `order:`"

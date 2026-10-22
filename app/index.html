@@ -123,8 +123,25 @@ ul{ padding:0; list-style:none; }
 main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4) var(--space-8); }
 .view{ display:grid; gap:var(--space-4); }
 .view[hidden]{ display:none; }
-.cards{ display:grid; grid-template-columns:1fr; gap:var(--space-4); align-items:start; }
-@media (min-width:900px){ .cards{ grid-template-columns:repeat(2,minmax(0,1fr)); } }
+.cards{
+  display:grid; gap:var(--space-4); align-items:start;
+  grid-template-columns:minmax(0,1fr);
+  grid-template-areas:"printer" "upload" "profile";
+}
+/* a grid item defaults to min-width:auto; the Printer card holds <select>s whose min-content width is
+   the longest preset name, so without this the 50% desktop track grows and the page scrolls sideways */
+.cards > *{ min-width:0; }
+.cards > [aria-labelledby="printerCardTitle"]{ grid-area:printer; }
+.cards > [aria-labelledby="uploadTitle"]{ grid-area:upload; }
+.cards > [aria-labelledby="profCardTitle"]{ grid-area:profile; }
+@media (min-width:900px){
+  .cards{
+    grid-template-columns:repeat(2,minmax(0,1fr));
+    grid-template-areas:
+      "printer upload"
+      "profile profile";
+  }
+}
 .card{
   display:grid; align-content:start; gap:var(--space-3);
   background:var(--color-card); color:var(--color-card-foreground);
@@ -134,7 +151,7 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
 .card > h2{ display:flex; align-items:center; gap:var(--space-2); }
 .card > h2 .pill{ margin-left:auto; }
 .card > .subgroup{
-  display:grid; align-content:start; gap:var(--space-3);
+  display:grid; align-content:start; gap:var(--space-3); min-width:0;
   border-top:1px solid var(--color-border); padding-top:var(--space-3);
 }
 .card > .subgroup > h3{
@@ -163,8 +180,8 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
 .bar > i{ display:block; height:100%; width:0; background:var(--color-accent); transition:width 300ms var(--ease); }
 
 /* ---------- form controls ---------- */
-.field{ display:grid; gap:6px; }
-#profileSelectors{ display:grid; gap:var(--space-3); }
+.field{ display:grid; gap:6px; min-width:0; }
+#profileSelectors{ display:grid; gap:var(--space-3); min-width:0; }
 #profileSelectors[hidden]{ display:none; }
 #profOptions{ display:grid; gap:var(--space-3); grid-template-columns:repeat(2,minmax(0,1fr)); }
 label{ font-size:var(--text-sm); font-weight:500; color:var(--color-muted-foreground); }
@@ -183,7 +200,7 @@ input::placeholder{ color:var(--color-muted-foreground); opacity:.7; }
 .key-row input{ flex:1 1 auto; min-width:0; }
 @media (max-width:400px){ .key-row{ flex-wrap:wrap; } .key-row .btn{ width:100%; } }
 
-select{ appearance:none; background-image:none; margin:0; }
+select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 .acts,.form-actions{ display:flex; flex-wrap:wrap; gap:var(--space-2); }
 @media (max-width:599px){ .form-actions .btn{ flex:1 1 100%; } }
 
@@ -382,6 +399,24 @@ select{ appearance:none; background-image:none; margin:0; }
         </div>
       </section>
 
+      <section class="card" aria-labelledby="uploadTitle">
+        <h2 id="uploadTitle">Slice a model</h2>
+        <div class="field">
+          <label for="outputName">Output file name <span class="hint">(optional)</span></label>
+          <input id="outputName" name="output_name" type="text" maxlength="60" pattern="[A-Za-z0-9 ._-]+"
+                 placeholder="model" autocomplete="off" spellcheck="false" aria-describedby="outputNameHint">
+          <p class="hint" id="outputNameHint">Saved as <span class="mono">&lt;name&gt;.gcode</span> — letters, digits, spaces, dot, dash, underscore. Empty uses the model name.</p>
+        </div>
+        <label for="file" class="sr-only">Model file to slice</label>
+        <input id="file" type="file" accept=".stl,.3mf,.obj,.zip" hidden>
+        <div id="drop" role="button" tabindex="0">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
+          <span class="drop-title">Drop an STL here or press to select</span>
+          <span class="hint">.stl / .3mf / .obj / .zip — sliced with the active profile</span>
+        </div>
+      </section>
+
       <section class="card" aria-labelledby="profCardTitle">
         <h2 id="profCardTitle">Profile <span id="profSource" class="pill">—</span></h2>
         <div class="kv" id="profInfo"><span>—</span><span>—</span></div>
@@ -389,24 +424,6 @@ select{ appearance:none; background-image:none; margin:0; }
         <p class="hint" id="profCompat" role="status" hidden></p>
       </section>
     </div>
-
-    <section class="card" aria-labelledby="uploadTitle">
-      <h2 id="uploadTitle">Slice a model</h2>
-      <div class="field">
-        <label for="outputName">Output file name <span class="hint">(optional)</span></label>
-        <input id="outputName" name="output_name" type="text" maxlength="60" pattern="[A-Za-z0-9 ._-]+"
-               placeholder="model" autocomplete="off" spellcheck="false" aria-describedby="outputNameHint">
-        <p class="hint" id="outputNameHint">Saved as <span class="mono">&lt;name&gt;.gcode</span> — letters, digits, spaces, dot, dash, underscore. Empty uses the model name.</p>
-      </div>
-      <label for="file" class="sr-only">Model file to slice</label>
-      <input id="file" type="file" accept=".stl,.3mf,.obj,.zip" hidden>
-      <div id="drop" role="button" tabindex="0">
-        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
-        <span class="drop-title">Drop an STL here or press to select</span>
-        <span class="hint">.stl / .3mf / .obj / .zip — sliced with the active profile</span>
-      </div>
-    </section>
 
     <section aria-labelledby="jobsTitle">
       <div class="section-head">
