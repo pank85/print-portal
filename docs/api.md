@@ -36,22 +36,27 @@ configured is therefore *unhealthy* — see [troubleshooting.md](troubleshooting
 
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
-| GET | `/api/printer` | live snapshot of the selected printer: state, file, progress, temps, homed axes; adds `host`, `printer{id,name,source}` and `ui_url` (the `PRINTER_UI_URL` the Printer tab frames; empty when unset) | 503 no printer · 500 when Moonraker fails (a `MoonrakerError` is not caught on this route) |
+| GET | `/api/printer` | live snapshot of the selected printer: state, file, progress, temps, homed axes; adds `host`, `printer{id,name,source}` and `ui_url` (the active printer's embedded-UI address, falling back to `PRINTER_UI_URL`; empty when neither is set) | 503 no printer · 500 when Moonraker fails (a `MoonrakerError` is not caught on this route) |
+| GET | `/api/ui` | just the embedded-UI address: `{"printer_ui_url": …}` for the **active** printer, `PRINTER_UI_URL` as the fallback | 200 always — answers `""` only when neither the active printer nor `PRINTER_UI_URL` supplies an address, and the env value otherwise (including with no printer at all or an unreadable store), so the Printer tab can tell "not configured" apart from "cannot reach the printer" |
 
 ## Printer store
 
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
-| GET | `/api/printers` | masked printer views, `selected_id`, `env_seed`, `warning` (corrupt file) | 200 |
-| POST | `/api/printers` | add a printer, optional `profiles` pairing | 201 · 400 invalid body · 409 pairing refused / store error |
-| PATCH | `/api/printers/{pid}` | change name/url/api_key and/or pairing. On the `env` row only `profiles` is accepted | 200 · 404 unknown · 409 read-only env row (`name`/`url`/`api_key` supplied) or pairing refused · 400 `nothing to update` |
+| GET | `/api/printers` | masked printer views (including `ui_url`), `selected_id`, `env_seed`, `warning` (corrupt file) | 200 |
+| POST | `/api/printers` | add a printer, optional `ui_url` and `profiles` pairing | 201 · 400 invalid body (`ui_url must …` names the field) · 409 pairing refused / store error |
+| PATCH | `/api/printers/{pid}` | change name/url/api_key/ui_url and/or pairing; an omitted `ui_url` keeps the stored one, `""` clears it. On the `env` row only `profiles` is accepted | 200 · 404 unknown · 409 read-only env row (`name`/`url`/`api_key`/`ui_url` supplied) or pairing refused · 400 `nothing to update` |
 | DELETE | `/api/printers/{pid}` | remove a printer | 200 · 404 · 409 the `env` row is read-only |
 | POST | `/api/printers/{pid}/select` | make it active and apply its pairing to `profile.json` | 200 · 404 · 409 pairing refused |
 | POST | `/api/printers/{pid}/test` | reachability probe, never raises for an offline printer | 200 always (`ok:false`, `error`, `ms`) · 404 unknown id |
 
 Status mapping is centralised in `printer_call` (`main.py:121`): `PrinterNotFound` → 404,
 `PrinterReadOnly` → 409, `PrinterError` → 400, `PrinterStoreError` → 409. The env seed is read-only
-because its URL and key are deployment-owned (`READ_ONLY_ERROR`, `printers.py:46`).
+because its URL, key and embedded-UI address are deployment-owned (`READ_ONLY_ERROR`, `printers.py:46`).
+
+`ui_url` is an optional key on a stored printer record. A `printers.json` written before the field
+existed reads back as `""` and gains the key on the next save, so the format needs no migration; an
+unusable stored address also reads as `""` rather than corrupting the store.
 
 A pairing is a complete statement about a printer, not a patch: a slot the body omits is cleared
 (`pairing_from_body`, `main.py:288`).

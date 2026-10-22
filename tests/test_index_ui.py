@@ -966,7 +966,12 @@ def test_an_https_portal_warns_instead_of_framing_a_plain_http_ui(page):
     # the link is set before the block decision, so the way forward survives the warning
     assert body.index("open.href = uiUrl") < body.index("isMixedContent(uiUrl)")
     assert "mount.hidden = blocked;" in body                         # blocked → no reserved box
-    assert "if (blocked || mount.firstElementChild) return;" in body  # blocked → no frame
+    assert "if (blocked) return;" in body                           # blocked → no frame
+    # an existing frame is repointed instead of rebuilt, so switching the active printer
+    # navigates the frame once and an unchanged visit navigates it not at all
+    assert "const frame = mount.firstElementChild;" in body
+    assert "if (frame) { frame.src = uiUrl; return; }" in body
+    assert body.index("const frame = mount.firstElementChild;") < body.index("cloneNode")
 
 
 def test_the_poller_pauses_on_the_printer_view_like_settings(page):
@@ -1186,3 +1191,99 @@ def test_transfer_label_is_a_throttled_live_status(page):
     assert 'aria-live="polite"' in label
     progress = function_body(page, "setUploadProgress")
     assert "now - lastPaint >= 1000" in progress
+
+
+def test_the_printer_tab_reads_its_url_from_the_always_200_route(page):
+    """The loader must not depend on /api/printer, which fails while the printer is offline."""
+    body = function_body(page, "loadPrinterUi")
+    assert 'fetch("/api/ui")' in body
+    # the comment above the call names the old route, so assert on the call, not the word
+    assert 'fetch("/api/printer")' not in body
+    assert 'p.printer_ui_url' in body
+
+
+# ---------------------------------------------------------------- per-printer embedded UI url
+def test_the_printer_form_offers_a_labelled_web_ui_url_field(page):
+    """The address is a property of a printer, so it is edited in the printer form."""
+    form = slice_between(page, 'id="printerForm"', "</form>")
+    field = slice_between(form, 'id="pfUiUrl"', "</p>")
+    assert 'type="url"' in field
+    assert 'name="ui_url"' in field
+    assert 'aria-describedby="pfUiUrlHint"' in field
+    assert 'placeholder="http://' in field
+
+    label = slice_between(form, 'for="pfUiUrl"', "</label>")
+    assert "Web UI URL" in label
+
+    hint = slice_between(form, 'id="pfUiUrlHint"', "</p>")
+    for needle in ("Printer", "browser", "mixed content", "Moonraker"):
+        assert needle in hint, needle
+    assert "empty" in hint                       # blank = no embedded UI, not an error
+
+    # it belongs with the connection fields, above the presets
+    assert form.index('id="pfUrl"') < form.index('id="pfKey"') < form.index('id="pfUiUrl"')
+    assert form.index('id="pfUiUrl"') < form.index('id="pfMachine"')
+    # and it is a different control from the Moonraker address, never the same input
+    assert 'id="pfUiUrl" name="ui_url"' in form
+    assert 'id="pfUrl" name="url"' in form
+
+
+def test_the_web_ui_field_is_edited_sent_and_cleared(page):
+    edit = function_body(page, "editPrinter")
+    assert '$("#pfUiUrl").disabled = false' in edit
+    assert '$("#pfUiUrl").value = p.ui_url || ""' in edit
+
+    pairing = function_body(page, "editPairing")
+    assert '$("#pfUiUrl").disabled = true' in pairing     # the env printer's address is fixed
+    assert '$("#pfUiUrl").value = p.ui_url || ""' in pairing
+
+    reset = function_body(page, "resetPrinterForm")
+    assert '$("#pfUiUrl").disabled = false' in reset      # form.reset() empties the box
+
+    request = function_body(page, "submitPrinter")
+    # always sent, so an emptied box clears the stored address (the API spells that "")
+    assert 'ui_url: $("#pfUiUrl").value.trim(),' in request
+    branch = slice_between(request, "if (pairingOnly) {", "\n    return;")
+    assert "ui_url" not in branch, "the env endpoint rejects the deployment-owned field"
+
+
+def test_the_printer_list_shows_the_embedded_ui_address_when_set(page):
+    render = function_body(page, "renderPrinters")
+    line = slice_between(render, "const uiLine =", ': "";')
+
+    assert "p.ui_url" in line
+    assert "web UI" in line              # labelled, so it cannot read as the Moonraker URL
+    assert 'class="printer-pair"' in line
+    assert "${uiLine}" in render
+    assert render.index("printer-url mono") < render.index("${uiLine}")
+
+    # a long address wraps inside its row instead of widening the list
+    style = page[page.index("<style>"):page.index("</style>")]
+    assert re.search(r"\n\.printer-pair \.mono\s*\{[^}]*overflow-wrap:\s*anywhere", style)
+
+
+def test_switching_the_active_printer_reframes_the_tab(page):
+    """Same page load, different active printer: the tab has to show the new printer's UI.
+
+    The once-per-load flag is gone; what is left is a "same address as on screen" guard, so an
+    unchanged visit (and the 2s poll, which does not run on this view) rebuilds nothing, while
+    a switch repoints the existing frame instead of reloading the whole section.
+    """
+    assert "let framedUiUrl = null;" in page
+    assert "printerUiLoaded" not in page
+
+    body = function_body(page, "loadPrinterUi")
+    assert 'fetch("/api/ui")' in body
+    # nothing returns before the fetch: the previous printer's answer is not this one's
+    assert "return" not in body[:body.index('fetch("/api/ui")')]
+    assert "if (uiUrl === framedUiUrl) return;" in body          # unchanged visit: no reload
+    assert body.index("if (uiUrl === framedUiUrl) return;") < body.index("framedUiUrl = uiUrl;")
+    assert body.index("framedUiUrl = uiUrl;") < body.index("renderPrinterUi(uiUrl);")
+
+    # a failed read keeps whatever is framed and retries on the next visit
+    assert body.index("if (!r.ok) return;") < body.index("if (uiUrl === framedUiUrl) return;")
+
+    render = function_body(page, "renderPrinterUi")
+    assert "const frame = mount.firstElementChild;" in render
+    assert "if (frame) { frame.src = uiUrl; return; }" in render   # repoint, never re-clone
+    assert render.index("const frame = mount.firstElementChild;") < render.index("cloneNode")

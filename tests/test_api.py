@@ -509,3 +509,25 @@ def test_settings_view_ids_are_present(client):
 def test_index_page_never_references_main_client_state(client):
     import main as m
     assert not hasattr(m, "client")
+
+
+def test_ui_route_answers_without_a_printer_at_all(client, monkeypatch):
+    """The embedded-UI URL must not ride on a payload that fails when nothing is configured.
+
+    /api/printer is the natural home for it, but it answers 503 when no printer exists and
+    when Moonraker is unreachable — and "printer offline" is precisely when the user opens
+    the Printer tab. /api/ui exists so the tab can tell "not configured" apart from "cannot
+    reach the printer".
+    """
+    monkeypatch.setattr(main, "active_target", lambda: None)
+    monkeypatch.setattr(main, "CONFIG", dataclasses.replace(main.CONFIG,
+        printer_ui_url="http://printer.local/fluidd"))
+
+    response = client.get("/api/ui")
+
+    assert response.status_code == 200
+    assert response.json() == {"printer_ui_url": "http://printer.local/fluidd"}
+
+
+def test_ui_route_reports_empty_when_unset(client):
+    assert client.get("/api/ui").json() == {"printer_ui_url": main.CONFIG.printer_ui_url}

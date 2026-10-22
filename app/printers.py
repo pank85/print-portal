@@ -43,8 +43,8 @@ SCHEMES = ("http", "https")
 
 DECRYPT_ERROR = ("stored API key cannot be decrypted with this key file; "
                  "re-enter the key in Settings")
-READ_ONLY_ERROR = ("the environment printer is read-only: change PRINTER_URL and "
-                   "MOONRAKER_API_KEY in the deployment instead")
+READ_ONLY_ERROR = ("the environment printer is read-only: change PRINTER_URL, "
+                   "MOONRAKER_API_KEY and PRINTER_UI_URL in the deployment instead")
 PROFILES_SHAPE_ERROR = "profiles must be an object with machine/process paths"
 PROFILE_PATH_ERROR = "profile path must be relative to the datadir"
 
@@ -71,6 +71,8 @@ class Printer:
 
     ``profiles`` is the optional machine/process pairing as datadir-relative ``.json``
     paths; ``None`` means the printer inherits the global selection in ``profile.json``.
+    ``ui_url`` is the optional Fluidd/Mainsail page the **Printer** tab frames in the
+    browser; ``""`` means the printer has no embedded UI of its own.
     """
     id: str
     name: str
@@ -79,6 +81,7 @@ class Printer:
     created: str
     updated: str
     profiles: dict[str, str] | None = None
+    ui_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -88,6 +91,7 @@ class SeededPrinter:
     name: str
     url: str
     api_key: str
+    ui_url: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -98,6 +102,7 @@ class PrintTarget:
     url: str
     api_key: str
     source: str
+    ui_url: str = ""
 
 
 # ---------------------------------------------------------------- crypto / masking
@@ -202,6 +207,37 @@ def normalise_url(raw: object) -> str:
     return url.rstrip("/")
 
 
+def normalise_ui_url(raw: object, *, field: str = "ui_url") -> str:
+    """The browser-facing Fluidd/Mainsail page framed by the **Printer** tab.
+
+    Blank is a valid value (no embedded UI). A non-blank one must be ``http(s)`` with a
+    host and without credentials, a query or a fragment, because it is handed to an
+    ``<iframe src>`` in the operator's browser — the portal never fetches it, so this is
+    shape-only validation. One trailing slash is dropped so the stored value matches what
+    the tab navigates to. ``field`` only names the value in the message, which lets the
+    environment parser (``config.parse_ui_url``) share this single implementation.
+    """
+    url = str(raw or "").strip()
+    if not url:
+        return ""
+    if not url.startswith(("http://", "https://")):
+        raise PrinterError(f"{field} must start with http:// or https:// (got {raw!r})")
+    try:
+        parts = urlsplit(url)
+        parts.port
+    except ValueError as exc:
+        raise PrinterError(f"{field} is not a usable URL: {raw!r} ({exc})") from None
+    if not parts.hostname:
+        raise PrinterError(f"{field} must name a host (got {raw!r})")
+    if parts.username is not None or parts.password is not None:
+        raise PrinterError(f"{field} must not embed credentials (got {raw!r})")
+    if parts.query or "?" in url:
+        raise PrinterError(f"{field} must not carry a query string (got {raw!r})")
+    if parts.fragment or "#" in url:
+        raise PrinterError(f"{field} must not carry a fragment (got {raw!r})")
+    return url.rstrip("/")
+
+
 def normalise_api_key(raw: object) -> str:
     key = str(raw or "").strip()
     if not key:
@@ -293,7 +329,24 @@ def _parse_printer(entry: object, version: int) -> Printer | None:
     if not PRINTER_ID_RE.fullmatch(fields["id"]):
         return None
     profiles = normalise_profiles(entry.get("profiles")) if version >= 2 else None
-    return Printer(**fields, profiles=profiles)
+    return Printer(**fields, profiles=profiles, ui_url=_stored_ui_url(entry.get("ui_url")))
+
+
+def _stored_ui_url(raw: object) -> str:
+    """The stored embedded-UI address, ``""`` when it is absent or unusable.
+
+    Absent is the normal case: every ``printers.json`` written before this field existed
+    has no ``ui_url`` key, and that must read as "no embedded UI" rather than as a corrupt
+    document. An unusable value is treated the same way, for the reason ``env_profiles``
+    is: it is one optional address, and blanking Settings (or refusing every write) over
+    it is worse than publishing no frame. Retyping it in Settings replaces it.
+    """
+    if not isinstance(raw, str):
+        return ""
+    try:
+        return normalise_ui_url(raw)
+    except PrinterError:
+        return ""
 
 
 def _parse_env_profiles(data: dict, version: int) -> dict[str, str] | None:
@@ -495,6 +548,7 @@ class PrinterStore:
                     "id": printer.id,
                     "name": printer.name,
                     "url": printer.url,
+                    "ui_url": printer.ui_url,
                     "api_key_masked": self._masked(printer),
                     "has_api_key": True,
                     "selected": printer.id == selected,
@@ -510,6 +564,7 @@ class PrinterStore:
                     "id": ENV_PRINTER_ID,
                     "name": seed.name,
                     "url": seed.url,
+                    "ui_url": seed.ui_url,
                     "api_key_masked": mask_key(seed.api_key),
                     "has_api_key": True,
                     "selected": selected == ENV_PRINTER_ID,
@@ -559,7 +614,7 @@ class PrinterStore:
     def _target(self, printer: Printer) -> PrintTarget:
         return PrintTarget(id=printer.id, name=printer.name, url=printer.url,
                            api_key=decrypt_secret(printer.api_key_enc, self._key),
-                           source="store")
+                           source="store", ui_url=printer.ui_url)
 
     def _pairing(self, printer: Printer) -> dict[str, str | None]:
         return _pairing_shape(printer.profiles)
@@ -572,25 +627,28 @@ class PrinterStore:
             return MASK
 
     # -- mutations
-    def add(self, name: object, url: object, api_key: object,
-            *, profiles: object = None) -> Printer:
+    def add(self, name: object, url: object, api_key: object, *, profiles: object = None,
+            ui_url: object = "") -> Printer:
         """Append a printer; the first one in an empty store becomes the selection.
 
         ``profiles`` is the optional machine/process pairing (datadir-relative paths);
         ``None`` or an all-``None`` dict stores no pairing, i.e. the printer inherits the
-        global profile selection.
+        global profile selection. ``ui_url`` is the optional embedded Fluidd/Mainsail page
+        (``""`` = none).
         """
         name = normalise_name(name)
         url = normalise_url(url)
         api_key = normalise_api_key(api_key)
         pairing = normalise_profiles(profiles)
+        embedded_ui = normalise_ui_url(ui_url)
         with self._lock:
             self._read()
             self._require_writable()
             stamp = _timestamp()
             printer = Printer(id=self._new_id(), name=name, url=url,
                               api_key_enc=encrypt_secret(api_key, self._key),
-                              created=stamp, updated=stamp, profiles=pairing)
+                              created=stamp, updated=stamp, profiles=pairing,
+                              ui_url=embedded_ui)
             first = not self._printers
             self._printers.append(printer)
             if first:
@@ -599,15 +657,16 @@ class PrinterStore:
             return printer
 
     def update(self, printer_id: str, *, name: object = None, url: object = None,
-               api_key: object = None,
-               profiles: object = _UNCHANGED) -> Printer:
+               api_key: object = None, profiles: object = _UNCHANGED,
+               ui_url: object = _UNCHANGED) -> Printer:
         """Change the supplied fields; an omitted API key keeps the stored token.
 
         ``profiles`` tells "leave the pairing alone" apart from "clear it": the
         ``_UNCHANGED`` sentinel default keeps the stored pairing, ``None`` / ``{}`` / an
         all-``None`` dict clears it to ``None`` (the printer then inherits the global
         profile selection), and a supplied dict *is* the complete pairing — a slot left
-        out of it is cleared, so this is a replace, not a merge.
+        out of it is cleared, so this is a replace, not a merge. ``ui_url`` follows the
+        same sentinel rule, with ``""`` the explicit "no embedded UI".
         """
         with self._lock:
             self._read()
@@ -616,7 +675,7 @@ class PrinterStore:
                 raise PrinterReadOnly(READ_ONLY_ERROR)
             index = self._index_of(printer_id)
             if (name is None and url is None and api_key is None
-                    and profiles is _UNCHANGED):
+                    and profiles is _UNCHANGED and ui_url is _UNCHANGED):
                 raise PrinterError("nothing to update")
             current = self._printers[index]
             updated = Printer(
@@ -629,6 +688,8 @@ class PrinterStore:
                 updated=_timestamp(),
                 profiles=(current.profiles if profiles is _UNCHANGED
                           else normalise_profiles(profiles)),
+                ui_url=(current.ui_url if ui_url is _UNCHANGED
+                        else normalise_ui_url(ui_url)),
             )
             self._printers[index] = updated
             self._write()
@@ -703,4 +764,4 @@ def _pairing_shape(stored: dict[str, str] | None) -> dict[str, str | None]:
 
 def _seed_target(seed: SeededPrinter) -> PrintTarget:
     return PrintTarget(id=seed.id, name=seed.name, url=seed.url, api_key=seed.api_key,
-                       source="env")
+                       source="env", ui_url=seed.ui_url)

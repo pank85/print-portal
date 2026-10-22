@@ -17,9 +17,10 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
-from urllib.parse import urlsplit
 
-VERSION = "2.2.4"  # single source of truth; .gitlab-ci.yml APP_VERSION must match
+import printers
+
+VERSION = "2.2.5"  # single source of truth; .gitlab-ci.yml APP_VERSION must match
 
 DEFAULTS: dict[str, str] = {
     "PRINTER_URL": "http://127.0.0.1:7125",
@@ -73,7 +74,7 @@ class Config:
     env_printer_name: str      # ENV_PRINTER_NAME or "Default (environment)"
     env_printer_url: str       # PRINTER_URL (default http://127.0.0.1:7125, rstrip("/"))
     env_printer_api_key: str | None  # None when the env seed is not configured
-    printer_ui_url: str        # PRINTER_UI_URL, "" when not configured (no trailing slash)
+    printer_ui_url: str        # PRINTER_UI_URL fallback for the env printer ("" = none)
 
 
 def parse_bed_size(value: str) -> tuple[float, float]:
@@ -92,33 +93,17 @@ def parse_bed_size(value: str) -> tuple[float, float]:
 
 
 def parse_ui_url(value: str) -> str:
-    """Parse ``PRINTER_UI_URL``: ``""`` or an http(s) URL with no trailing slash.
+    """Parse ``PRINTER_UI_URL`` with the same rule the printer store applies per printer.
 
-    The portal only *publishes* this URL — it is opened by the browser, inside a frame, so
-    the server never contacts it. Validation is therefore about shape, and strict about the
-    parts a browser cannot use: credentials, a query and a fragment all have to be rejected
-    here rather than silently baked into an ``<iframe src>``.
+    A thin adapter over ``printers.normalise_ui_url``: the environment fallback and the
+    ``ui_url`` field on a printer must accept exactly the same strings, so there is one
+    implementation and only the error type differs — a ``ConfigError`` fails startup
+    loudly, a ``PrinterError`` becomes a 400 on the Settings form.
     """
-    raw = str(value or "").strip()
-    if not raw:
-        return ""
-    if not raw.startswith(("http://", "https://")):
-        raise ConfigError(f"PRINTER_UI_URL must start with http:// or https:// (got {value!r})")
     try:
-        parts = urlsplit(raw)
-        host = parts.hostname
-        parts.port  # raises ValueError on a non-numeric or out-of-range port
-    except ValueError as exc:
-        raise ConfigError(f"PRINTER_UI_URL is not a usable URL: {value!r} ({exc})") from None
-    if not host:
-        raise ConfigError(f"PRINTER_UI_URL must name a host (got {value!r})")
-    if parts.username is not None or parts.password is not None:
-        raise ConfigError(f"PRINTER_UI_URL must not embed credentials (got {value!r})")
-    if parts.query or "?" in raw:
-        raise ConfigError(f"PRINTER_UI_URL must not carry a query string (got {value!r})")
-    if parts.fragment or "#" in raw:
-        raise ConfigError(f"PRINTER_UI_URL must not carry a fragment (got {value!r})")
-    return raw.rstrip("/")
+        return printers.normalise_ui_url(value, field="PRINTER_UI_URL")
+    except printers.PrinterError as exc:
+        raise ConfigError(str(exc)) from None
 
 
 def _value(env: Mapping[str, str], name: str) -> str:

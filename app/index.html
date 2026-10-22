@@ -381,6 +381,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
   overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
 .printer-key{ color:var(--color-muted-foreground); font-size:var(--text-sm); letter-spacing:.08em; }
 .printer-pair{ color:var(--color-muted-foreground); font-size:var(--text-sm); }
+.printer-pair .mono{ overflow-wrap:anywhere; }
 .printer-actions{ display:flex; flex-wrap:wrap; gap:var(--space-2); }
 @media (max-width:599px){ .printer-actions .btn{ flex:1 1 calc(50% - var(--space-2)); } }
 .empty{
@@ -594,16 +595,20 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     <h1 id="printerViewTitle" tabindex="-1">Printer</h1>
 
     <p class="secret-note" id="printerUiEmpty" role="status" hidden>
-      Nothing is embedded here yet. Set <span class="mono">PRINTER_UI_URL</span> to the address of your
-      Fluidd or Mainsail page and reload. That address is opened by <em>this browser</em>, not by the
-      portal's server, so it has to be reachable from the device you are using right now — a URL that
-      only works from inside the container will leave this section empty.
+      Nothing is embedded here yet. Set <span class="mono">Web UI URL</span> on the active printer in
+      <span class="mono">Settings</span> — the address of its Fluidd or Mainsail page — and come back. That
+      address is opened by <em>this browser</em>, not by the portal's server, so it has to be reachable from
+      the device you are using right now; a URL that only works from inside the container will leave this
+      section empty. A deployment can also seed it with <span class="mono">PRINTER_UI_URL</span> for the
+      environment printer.
     </p>
 
     <p class="warning" id="printerUiMixed" role="status" hidden>
-      This portal is served over HTTPS and <span class="mono">PRINTER_UI_URL</span> is plain HTTP, so the
-      browser blocks the frame as mixed content. Open the printer UI with the link below instead, or serve
-      it over HTTPS (its own proxy host is enough) to embed it here.
+      This portal is served over HTTPS and the active printer's <span class="mono">Web UI URL</span> is plain
+      HTTP, so the browser blocks the frame as mixed content. Open the printer UI with the link below instead,
+      or serve it over HTTPS (its own proxy host is enough) to embed it here. Change the address per printer in
+      <span class="mono">Settings</span>; <span class="mono">PRINTER_UI_URL</span> is only the environment
+      fallback.
     </p>
 
     <section class="card frame-card" id="printerFrameCard" aria-labelledby="printerFrameTitle" hidden>
@@ -672,6 +677,17 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
           <button type="button" class="btn" id="btnRevealKey" aria-pressed="false" aria-controls="pfKey">Show</button>
         </div>
         <p class="hint" id="pfKeyHint">Sent to the printer as <span class="mono">X-Api-Key</span> and stored encrypted.</p>
+      </div>
+      <div class="field">
+        <label for="pfUiUrl">Web UI URL <span class="meta">(optional)</span></label>
+        <input id="pfUiUrl" name="ui_url" type="url" inputmode="url" autocomplete="off" spellcheck="false"
+               placeholder="http://voron.lan/" aria-describedby="pfUiUrlHint">
+        <p class="hint" id="pfUiUrlHint">
+          The Fluidd or Mainsail page framed in the <strong>Printer</strong> tab — not the Moonraker address
+          above. It is opened by <em>your browser</em>, so it has to be reachable from this device, and an
+          <span class="mono">http</span> page inside an <span class="mono">https</span> portal is blocked as
+          mixed content. Leave empty for no embedded UI.
+        </p>
       </div>
       <div class="field">
         <label for="pfMachine">Machine preset</label>
@@ -780,10 +796,12 @@ function ask(title, body, okLabel = "Delete") {
 }
 
 /* ---------------- embedded printer UI ---------------- */
-/* PRINTER_UI_URL comes from GET /api/printer: the page is static, so the frame is built once
-   per page load from the server's answer. Nothing here polls — a refused frame is silent, so
-   the section keeps a real link out instead of guessing. */
-let printerUiLoaded = false;
+/* The address belongs to the ACTIVE printer (GET /api/ui, with PRINTER_UI_URL only as the
+   server-side fallback), so entering the tab asks again instead of reusing the first answer:
+   switching printers in Settings has to re-frame this tab. Two guards keep that from turning
+   into a reload loop — `framedUiUrl` remembers what is already on screen, so an unchanged
+   visit touches nothing, and the section is only built when the request succeeds. */
+let framedUiUrl = null;
 
 function isMixedContent(url) {
   /* an http: frame inside an https: page never leaves the browser; nothing can be detected
@@ -805,20 +823,25 @@ function renderPrinterUi(uiUrl) {
   mixed.hidden = !blocked;
   note.hidden = blocked;                  // "the frame may be blank" only applies to a frame
   mount.hidden = blocked;                 // no reserved box where no frame may load
-  if (blocked || mount.firstElementChild) return;   // no frame for a URL the browser will block
+  if (blocked) return;                    // no frame for a URL the browser will block
+  const frame = mount.firstElementChild;
+  if (frame) { frame.src = uiUrl; return; }   // another printer: repoint, never reload twice
   mount.replaceChildren($("#printerFrameTpl").content.cloneNode(true));
   $("#printerFrame").src = uiUrl;
 }
 
 async function loadPrinterUi() {
-  if (printerUiLoaded) return;   // built once: re-entering the tab must not reload Fluidd
   let uiUrl = "";
   try {
-    const r = await fetch("/api/printer");
+    /* its own route, not /api/printer: that one fails when the printer is offline, and then
+       the tab would claim the URL is unset exactly when it is set */
+    const r = await fetch("/api/ui");
     const p = await r.json().catch(() => ({}));
-    uiUrl = typeof p.ui_url === "string" ? p.ui_url : "";
-    if (r.ok || uiUrl) printerUiLoaded = true;   // otherwise retry on the next visit
-  } catch { /* offline or unconfigured: fall through to the empty state */ }
+    uiUrl = typeof p.printer_ui_url === "string" ? p.printer_ui_url : "";
+    if (!r.ok) return;                   // keeps what is on screen; retry on the next visit
+  } catch { return; }                    // unreachable portal: an empty state would be a lie
+  if (uiUrl === framedUiUrl) return;     // unchanged visit (or the 2s poll): nothing to rebuild
+  framedUiUrl = uiUrl;
   renderPrinterUi(uiUrl);
 }
 
@@ -1483,11 +1506,17 @@ function renderPrinters(data) {
       .map(slot => `${slot}: ${presetName(slot, pairing[slot])}`)
       .join(" · ");
     const pairedLine = paired ? `<p class="printer-pair">profile ${esc(paired)}</p>` : "";
+    /* the embedded UI address gets its own labelled line, so it can never be read as the
+       Moonraker address above it */
+    const uiLine = p.ui_url
+      ? `<p class="printer-pair">web UI <span class="mono">${esc(p.ui_url)}</span></p>`
+      : "";
     return `<li class="printer${p.selected ? " is-active" : ""}">
       <div class="printer-head">
         <span class="printer-name">${esc(p.name)}</span>${chips}
       </div>
       <p class="printer-url mono" title="${esc(p.url)}">${esc(p.url)}</p>
+      ${uiLine}
       <p class="printer-key mono" title="stored API key">${esc(p.api_key_masked || "—")}</p>
       ${pairedLine}
       <div class="printer-actions">
@@ -1534,11 +1563,13 @@ async function editPrinter(id) {
   $("#pfName").disabled = false;
   $("#pfUrl").disabled = false;
   $("#pfKey").disabled = false;
+  $("#pfUiUrl").disabled = false;
   $("#btnRevealKey").disabled = false;
   const pairing = p.profiles || {};
   await populatePairing(pairing.machine || "", pairing).catch(() => {});
   $("#pfName").value = p.name || "";
   $("#pfUrl").value = p.url || "";
+  $("#pfUiUrl").value = p.ui_url || "";
   $("#pfKey").value = "";
   $("#pfKey").type = "password";
   $("#btnRevealKey").setAttribute("aria-pressed", "false");
@@ -1562,16 +1593,18 @@ async function editPairing(id) {
   $("#pfName").disabled = true;
   $("#pfUrl").disabled = true;
   $("#pfKey").disabled = true;
+  $("#pfUiUrl").disabled = true;
   $("#btnRevealKey").disabled = true;
   const pairing = p.profiles || {};
   await populatePairing(pairing.machine || "", pairing).catch(() => {});
   $("#pfName").value = p.name || "";
   $("#pfUrl").value = p.url || "";
+  $("#pfUiUrl").value = p.ui_url || "";
   $("#pfKey").value = "";
   $("#pfKey").type = "password";
   $("#btnRevealKey").setAttribute("aria-pressed", "false");
   $("#btnRevealKey").textContent = "Show";
-  $("#pfKeyHint").textContent = "The environment fixes this printer's name, URL and key.";
+  $("#pfKeyHint").textContent = "The environment fixes this printer's name, URL, key and web UI address.";
   $("#formTitle").textContent = `Profiles — ${p.name}`;
   $("#btnPrinterSave").textContent = "Save profiles";
   $("#btnPrinterCancel").hidden = false;
@@ -1586,6 +1619,7 @@ function resetPrinterForm() {
   $("#pfName").disabled = false;
   $("#pfUrl").disabled = false;
   $("#pfKey").disabled = false;
+  $("#pfUiUrl").disabled = false;
   $("#btnRevealKey").disabled = false;
   $("#pfKey").type = "password";
   $("#btnRevealKey").setAttribute("aria-pressed", "false");
@@ -1639,6 +1673,8 @@ async function submitPrinter(ev) {
   const body = {
     name: $("#pfName").value.trim(),
     url: $("#pfUrl").value.trim(),
+    /* always sent, so clearing the box clears the stored address ("" = no embedded UI) */
+    ui_url: $("#pfUiUrl").value.trim(),
     /* an empty select means "inherit the global profile", which the API spells null */
     profiles: {machine: $("#pfMachine").value || null, process: $("#pfProcess").value || null},
   };

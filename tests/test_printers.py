@@ -160,8 +160,9 @@ def test_add_printer_persists_a_versioned_file_with_encrypted_key(
     assert len(data["printers"]) == 1
     entry = data["printers"][0]
     assert set(entry) == {"id", "name", "url", "api_key_enc", "created", "updated",
-                          "profiles"}
+                          "profiles", "ui_url"}
     assert entry["profiles"] is None
+    assert entry["ui_url"] == ""                 # no embedded UI unless one is set
     assert printers.PRINTER_ID_RE.fullmatch(entry["id"])
     assert entry["id"] == printer.id
     assert entry["name"] == "Voron 2.4"
@@ -331,9 +332,9 @@ def test_views_mask_keys_and_hide_the_token(store: printers.PrinterStore) -> Non
 
     assert len(views) == 2
     stored, env = views
-    assert set(stored) == {"id", "name", "url", "api_key_masked", "has_api_key", "selected",
-                           "source", "editable", "pairing_editable", "profiles", "created",
-                           "updated"}
+    assert set(stored) == {"id", "name", "url", "ui_url", "api_key_masked", "has_api_key",
+                           "selected", "source", "editable", "pairing_editable", "profiles",
+                           "created", "updated"}
     assert stored["id"] == printer.id
     assert stored["api_key_masked"] == printers.MASK + "cdef"
     assert stored["has_api_key"] is True
@@ -645,3 +646,139 @@ def test_malformed_env_profiles_reads_as_no_pairing(store: printers.PrinterStore
     assert store.corrupt is None
     assert store.views(SEED)[-1]["profiles"] == {"machine": None, "process": None}
     assert store.all() == []
+
+
+# ---------------------------------------------------------------- embedded printer UI (ui_url)
+UI_URL = "http://voron.lan/"
+
+
+def test_ui_url_round_trips_through_the_file_and_the_views(
+        store: printers.PrinterStore) -> None:
+    printer = store.add("Voron 2.4", URL, KEY, ui_url=UI_URL)
+
+    assert printer.ui_url == "http://voron.lan"          # one trailing slash dropped
+    assert stored_json(store)["printers"][0]["ui_url"] == "http://voron.lan"
+    assert store.views(SEED)[0]["ui_url"] == "http://voron.lan"
+
+    reloaded = printers.PrinterStore.open(store.path, store.path.with_name("secret.key"))
+
+    assert reloaded.get(printer.id).ui_url == "http://voron.lan"
+    assert reloaded.active(SEED).ui_url == "http://voron.lan"
+
+
+def test_a_file_without_ui_url_reads_and_gains_the_key_on_save(
+        store: printers.PrinterStore) -> None:
+    """Every ``printers.json`` written before this field existed has no ``ui_url`` key."""
+    entry = stored_entry(store)
+    store.path.write_text(json.dumps({"version": printers.PRINTERS_VERSION,
+                                      "selected_id": entry["id"], "printers": [entry]}),
+                          encoding="utf-8")
+
+    store.reload()
+
+    stored = store.get(entry["id"])
+    assert store.corrupt is None
+    assert stored.ui_url == ""                    # absent reads as "no embedded UI"
+    assert (stored.id, stored.name, stored.url) == (entry["id"], "Voron 2.4", URL)
+    assert stored.api_key_enc == entry["api_key_enc"]
+
+    store.update(entry["id"], name="Voron 2.4 XL")
+
+    written = stored_json(store)["printers"][0]
+    assert written["ui_url"] == ""                # written back as an explicit empty value
+    assert written["name"] == "Voron 2.4 XL"      # the other fields are untouched
+    assert written["url"] == entry["url"]
+    assert written["api_key_enc"] == entry["api_key_enc"]
+    assert written["created"] == entry["created"]
+
+
+def test_update_sets_and_clears_the_ui_url(store: printers.PrinterStore) -> None:
+    printer = add(store)
+
+    set_once = store.update(printer.id, ui_url="https://voron.lan/fluidd/")
+
+    assert set_once.ui_url == "https://voron.lan/fluidd"
+    assert stored_json(store)["printers"][0]["ui_url"] == "https://voron.lan/fluidd"
+
+    kept = store.update(printer.id, name="Voron XL")
+
+    assert kept.ui_url == "https://voron.lan/fluidd"      # omitted keeps the stored value
+
+    cleared = store.update(printer.id, ui_url="")
+
+    assert cleared.ui_url == ""
+    assert stored_json(store)["printers"][0]["ui_url"] == ""
+
+
+@pytest.mark.parametrize("value, message", [
+    ("voron.lan/fluidd", "ui_url must start with http:// or https://"),
+    ("HTTPS://voron.lan/fluidd", "ui_url must start with http:// or https://"),
+    ("http://", "ui_url must name a host"),
+    ("http:///fluidd", "ui_url must name a host"),
+    ("http://user:pass@voron.lan/", "ui_url must not embed credentials"),
+    ("http://voron.lan/?a=1", "ui_url must not carry a query string"),
+    ("http://voron.lan/#top", "ui_url must not carry a fragment"),
+    ("http://voron.lan:notaport/", "ui_url is not a usable URL"),
+])
+def test_ui_url_rejections(store: printers.PrinterStore, value: object,
+                           message: str) -> None:
+    with pytest.raises(printers.PrinterError, match=message):
+        store.add("Voron", URL, KEY, ui_url=value)
+
+    assert not store.path.exists()                # a refused create writes nothing
+
+    printer = add(store)
+    with pytest.raises(printers.PrinterError, match=message):
+        store.update(printer.id, ui_url=value)
+    assert store.get(printer.id).ui_url == ""     # a refused update changes nothing
+
+
+def test_ui_url_normalisation_is_the_one_shared_rule() -> None:
+    """``config.parse_ui_url`` is a thin adapter, so both spell the field in the message."""
+    assert printers.normalise_ui_url("  ") == ""
+    assert printers.normalise_ui_url("http://voron.lan/") == "http://voron.lan"
+    assert printers.normalise_ui_url("https://voron.lan/fluidd//") == "https://voron.lan/fluidd"
+
+    with pytest.raises(printers.PrinterError) as env_style:
+        printers.normalise_ui_url("nope", field="PRINTER_UI_URL")
+    with pytest.raises(printers.PrinterError) as store_style:
+        printers.normalise_ui_url("nope")
+    assert str(env_style.value).startswith("PRINTER_UI_URL ")
+    assert str(store_style.value).startswith("ui_url ")
+
+
+def test_an_unusable_stored_ui_url_reads_as_no_embedded_ui(
+        store: printers.PrinterStore) -> None:
+    """One unusable address must not blank Settings; retyping it in the form replaces it."""
+    entry = stored_entry(store)
+    entry["ui_url"] = "http://voron.lan/?token=secret"
+    store.path.write_text(json.dumps({"version": printers.PRINTERS_VERSION,
+                                      "selected_id": entry["id"], "printers": [entry]}),
+                          encoding="utf-8")
+
+    store.reload()
+
+    assert store.corrupt is None
+    assert store.get(entry["id"]).ui_url == ""
+    assert store.views(SEED)[0]["ui_url"] == ""
+
+    store.update(entry["id"], ui_url="http://voron.lan/fluidd")
+
+    assert stored_json(store)["printers"][0]["ui_url"] == "http://voron.lan/fluidd"
+
+
+def test_the_env_seed_reports_its_ui_url(store: printers.PrinterStore) -> None:
+    seed = printers.SeededPrinter(id=printers.ENV_PRINTER_ID, name="Environment",
+                                  url="http://env.lan:7125", api_key="env-secret-9999",
+                                  ui_url="http://env.lan/fluidd")
+
+    assert store.views(seed)[-1]["ui_url"] == "http://env.lan/fluidd"
+    assert store.active(seed).ui_url == "http://env.lan/fluidd"
+
+
+def test_a_printer_without_a_ui_url_reports_an_empty_one(store: printers.PrinterStore) -> None:
+    printer = add(store)
+
+    assert printer.ui_url == ""
+    assert store.views(SEED)[0]["ui_url"] == ""
+    assert store.active(SEED).ui_url == ""
