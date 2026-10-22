@@ -209,12 +209,18 @@ def test_fit_options_reach_the_options_endpoint_and_a_real_scale_shows_in_the_ro
     assert options.index('id="optAutoOrient"') < options.index('id="fitHint"')
     assert options.index('id="optShrinkFit"') < options.index('id="fitHint"')
 
-    row = function_body(page, "refresh")
-    assert 'typeof j.fit_scale === "number" && j.fit_scale < 1' in row
-    assert "Math.round(j.fit_scale * 100)" in row
-    stats = slice_between(row, 'class="job-stats"', "</div>")
+    # the stats live in the one body both hosts render; the row and the card call it rather than
+    # carrying a second copy of the template (the card passes withWait=false: #uploadWait above
+    # it already paints the live slice state)
+    body = function_body(page, "renderJobBody")
+    assert 'typeof j.fit_scale === "number" && j.fit_scale < 1' in body
+    assert "Math.round(j.fit_scale * 100)" in body
+    stats = slice_between(body, 'class="job-stats"', "</div>")
     assert "scaled <b>${scaled}%</b> to fit" in stats
     assert re.search(r'\$\{\s*scaled === null \? "" :', stats)   # no span at all unless it scaled
+    assert "renderJobBody(j)" in function_body(page, "renderJobRow")
+    assert "renderJobBody(job, false)" in function_body(page, "setUploadLatest")
+    assert "jobs.map(renderJobRow)" in function_body(page, "refresh")
 
 
 def test_only_supports_and_brim_claim_the_preset_was_updated(page):
@@ -589,7 +595,7 @@ def test_active_job_row_carries_an_indeterminate_slice_indicator(page):
     ``aria-valuenow`` set belongs to the Moonraker print bar (``#progTrack``) only, and
     copying it here would turn an honest "length unknown" into a second fake percentage.
     """
-    row = function_body(page, "refresh")
+    row = function_body(page, "renderJobBody")
     assert 'class="slice-wait"' in row
     assert 'aria-busy="true"' in row
     assert 'role="progressbar"' in row
@@ -611,7 +617,7 @@ def test_queued_and_slicing_use_different_wait_labels(page):
     labels = slice_between(page, "const SLICE_LABELS", "};")
     assert re.search(r'queued:\s*"waiting for the slicer…"', labels)
     assert re.search(r'slicing:\s*"slicing…"', labels)
-    row = function_body(page, "refresh")
+    row = function_body(page, "renderJobBody")
     assert "SLICE_LABELS[j.status]" in row
     # the row interpolates that map's value, so a hard-coded label cannot pass this test
     label_span = slice_between(row, 'class="slice-wait-label"', "</span>")
@@ -626,19 +632,24 @@ def test_slice_indicator_is_gated_off_for_done_and_failed_jobs(page):
     unreachable for all three.
     """
     refresh_body = function_body(page, "refresh")
-    assert "const active = isSlicing(j.status) && !j.error;" in refresh_body
-    assert "isSlicing(j.status)" in refresh_body
-    assert "!j.error" in refresh_body
+    body = function_body(page, "renderJobBody")
+    assert "const active = isSlicing(j.status) && !j.error;" in body
+    assert "isSlicing(j.status)" in body
+    assert "!j.error" in body
     # the guard only means anything if the markup is driven by it: `active` picks the bar and
     # the other branch is the empty string, so no finished or failed row can render one
-    assert re.search(r"const wait\s*=\s*active\s*\?", refresh_body)
-    assert "${wait}" in refresh_body
-    assert re.search(r'const wait\s*=\s*active\s*\?\s*`[^`]*`\s*:\s*""\s*;', refresh_body)
+    assert re.search(r"const wait\s*=\s*active\s*\?", body)
+    assert "${waitBlock}" in body
+    assert re.search(r'const wait\s*=\s*active\s*\?\s*`[^`]*`\s*:\s*""\s*;', body)
+    # the card's body is the same template with the bar suppressed, and it is suppressed at the
+    # template (withWait), not by hiding a rendered bar after the fact
+    latest = function_body(page, "setUploadLatest")
+    assert "renderJobBody(job, false)" in latest
     # the error itself is still rendered — nothing is hidden, only the bar is withheld.
     # The row markup is pinned inside the row template, not page-wide: a page-wide match would
     # still pass off the catch-path markup if the per-row error line were deleted.
-    assert re.search(r'<p\s+class="err">\$\{esc\(j\.error\)\}</p>', refresh_body)
-    assert re.search(r'\$\{j\.error\s*\?\s*`<p\s+class="err"\s*>\$\{\s*esc\(j\.error\)\s*\}', refresh_body)
+    assert re.search(r'<p\s+class="err">\$\{esc\(j\.error\)\}</p>', body)
+    assert re.search(r'\$\{j\.error\s*\?\s*`<p\s+class="err"\s*>\$\{\s*esc\(j\.error\)\s*\}', body)
     # ...and the load-failure message is its own, separately required piece of markup
     catch_body = re.split(r"\}\s*catch\s*\(\s*e\s*\)\s*\{", refresh_body)[-1]
     assert re.search(r'<p\s+class="err">Could not load jobs:\s*\$\{\s*esc\(e\.message\)\s*\}</p>', catch_body)
@@ -888,19 +899,61 @@ def test_a_second_drop_or_pick_is_ignored_while_uploading(page):
 
 
 def test_slice_card_shows_the_latest_job_and_reuses_the_print_path(page):
+    """The card's "Last job" block is the job row's own markup, with the row's own actions.
+
+    Before this it showed the model name, the output name and an error — no status, no stats, no
+    delete, no download. Now the block renders ``renderJobBody`` (the row's body) inside a
+    ``<h3>`` subgroup, so every field the list shows is here too; the three actions are static
+    elements driven by ``jobPrintable()`` and routed through the row's delegated handler.
+    """
     card = upload_card(page)
-    for needle in ('id="uploadLatest"', 'id="uploadLatestName"', 'id="uploadLatestOut"',
-                   'id="uploadLatestErr"', 'id="uploadLatestPrint"'):
+    for needle in ('id="uploadLatest"', 'id="uploadLatestBody"', 'id="uploadLatestPrint"',
+                   'id="uploadLatestGcode"', 'id="uploadLatestDelete"'):
         assert needle in card, needle
 
+    # a subgroup heading, one level under the card's own <h2 id="uploadTitle">, and the block is a
+    # named group so the heading names the region for a screen reader
+    assert '<h3 id="uploadLatestTitle">Last job</h3>' in card
+    assert '<h2 id="uploadTitle">' in card
+    assert 'aria-labelledby="uploadLatestTitle"' in slice_between(card, 'id="uploadLatest"', ">")
+    # the heading is the card's existing subgroup rule, not a new type scale
+    assert 'class="upload-latest subgroup"' in card
+
+    # one template for both hosts: the card's body is the row's body with the bar suppressed
+    # (#uploadWait, directly above the block, already paints the live slice state and takes over
+    # for the transfer bar) — so status, stats, output name and error cannot drift apart
     latest = function_body(page, "setUploadLatest")
-    assert "job.filename" in latest                  # the model that was uploaded
-    assert "job.output_name" in latest               # → <output_name>.gcode
-    assert ".gcode" in latest
-    assert 'job.status === "sliced"' in latest
+    assert "renderJobBody(job, false)" in latest
+    row = function_body(page, "renderJobRow")
+    assert "renderJobBody(j)" in row
+
+    # the actions are the row's three, and Print is gated by the row's own predicate
+    assert "jobPrintable(j)" in row and "jobPrintable(job)" in latest
+    printable = function_body(page, "jobPrintable")
+    assert 'j.status === "sliced" && !j.error' in printable
     assert "print.hidden = !printable" in latest
-    assert "print.dataset.ref = job.id" in latest
-    assert "job.error" in latest and "errEl.textContent" in latest
+    assert "gcode.hidden = !printable" in latest
+    assert 'gcode.href = printable ? `/api/jobs/${job.id}/gcode` : "#";' in latest
+    assert "print.dataset.ref = printable ? job.id : " in latest
+    assert "remove.dataset.ref = job.id" in latest
+
+    # re-pointing, not re-parsing: the actions are static markup, so a 2-second poll cannot
+    # throw away the keyboard focus resting on Print. The structure that buys that: the only
+    # node the poll rewrites is #uploadLatestBody, and the three actions live after it, outside
+    # it — so the buttons are never re-created
+    assert "body.innerHTML" in latest
+    assert "box.innerHTML" not in latest
+    rewritten = '<div id="uploadLatestBody"></div>'
+    assert rewritten in card            # empty in markup: the poll is its only writer
+    body_at = card.index('id="uploadLatestBody"')
+    for act in ('id="uploadLatestPrint"', 'id="uploadLatestGcode"', 'id="uploadLatestDelete"'):
+        assert card.index(act) > body_at, act
+
+    # the shared body carries every stats field the list shows, so "the card shows the same
+    # stats" is one template, not a second list of fields to keep in sync
+    shared = function_body(page, "renderJobBody")
+    for field in ("time", "filament", "layers", "height", "slice", "scaled"):
+        assert field in slice_between(shared, 'class="job-stats"', "</div>"), field
 
     # the print button is a real button with a name, hidden until the job is sliced
     button = card[card.rindex("<button", 0, card.index('id="uploadLatestPrint"')):]
@@ -909,15 +962,59 @@ def test_slice_card_shows_the_latest_job_and_reuses_the_print_path(page):
     assert "hidden" in button
     assert "aria-label=" in button
 
+    # Delete carries no hidden: every job can be thrown away, finished or not
+    delete = card[card.rindex("<button", 0, card.index('id="uploadLatestDelete"')):]
+    assert "hidden" not in delete[:delete.index(">")]
+
     # derived from the poll's first row, so a reload mid-slice lands in the same state
     refresh_body = function_body(page, "refresh")
     assert "setUploadLatest(jobs[0])" in refresh_body
     assert re.search(r"setUploadLatest\s*\(\s*null\s*\)", refresh_body.split("catch (e) {")[-1])
 
-    # and it prints through the same implementation, not a second copy
-    handler = slice_between(page, '$("#uploadLatest").addEventListener("click"', "});")
-    assert "printJob(btn.dataset.ref)" in handler
+    # and it prints and deletes through the same implementations: one delegated handler for the
+    # rows and the card, so there is no second copy of printJob(id) or del(id)
+    assert '$("#uploadLatest").addEventListener("click", onJobAction);' in page
+    assert '$("#jobs").addEventListener("click", onJobAction);' in page
+    handler = function_body(page, "onJobAction")
+    assert 'ev.target.closest("[data-act]")' in handler
+    assert 'btn.dataset.act === "print"' in handler and "printJob(btn.dataset.ref)" in handler
+    assert 'btn.dataset.act === "delete"' in handler and "del(btn.dataset.ref)" in handler
     assert 'fetch(`/api/jobs/${id}/print`' in function_body(page, "printJob")
+    assert 'fetch(`/api/jobs/${id}`' in function_body(page, "del")
+
+
+def test_the_last_job_block_renders_the_shared_body_below_a_heading(page):
+    """R3/R4 as structure: one body template, two hosts, and actions that the poll never re-parses.
+
+    The point of the split is what it makes impossible — a field added to the list row cannot be
+    missing from the card, because there is only one template — and what it preserves: the three
+    action elements are static markup outside ``#uploadLatestBody``, so the browser keeps focus
+    on Print across the 2-second refresh instead of re-creating it.
+    """
+    body = function_body(page, "renderJobBody")
+    row = function_body(page, "renderJobRow")
+    latest = function_body(page, "setUploadLatest")
+
+    # both call sites name the same renderer, with the card suppressing only the bar
+    assert "renderJobBody(j)" in row
+    assert "renderJobBody(job, false)" in latest
+    # ...and the suppression is a template flag, not post-render hiding: nothing in the card's
+    # path can emit a .slice-wait for the poll to blank out
+    assert "withWait ? wait : \"\"" in body
+    assert 'class="slice-wait"' in body
+
+    # the row keeps its own frame and its own three actions; the card has them statically
+    assert '<article class="job">' in row
+    assert 'class="job-actions"' in row and 'class="job-actions"' in upload_card(page)
+    assert 'data-act="print"' in row and 'data-act="delete"' in row
+
+    # one delegated listener per host, both pointing at the single handler
+    assert page.count('addEventListener("click", onJobAction)') == 2
+    handler = function_body(page, "onJobAction")
+    assert handler.count("printJob(") == 1 and handler.count("del(") == 1
+    # neither host keeps a private inline listener next to the shared one
+    for host in ("#jobs", "#uploadLatest"):
+        assert f'$("{host}").addEventListener("click", ev =>' not in page, host
 
 
 def test_a_failed_upload_clears_the_bars_state(page):

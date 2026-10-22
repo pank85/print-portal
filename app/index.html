@@ -237,12 +237,12 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
   transition:width 200ms var(--ease);
 }
 
-/* the card's latest-job line: model, output, error, and the one action it allows */
-.upload-latest{ display:grid; gap:var(--space-2); justify-items:start; font-size:var(--text-sm); }
+/* the card's "Last job" block: the body a job row shows (renderJobBody) plus the row's three
+   actions. `.card > .subgroup` already supplies the grid, its gap and the uppercase <h3> rule,
+   so this block only needs the row's type size — nothing of its own */
+.upload-latest{ font-size:var(--text-sm); }
 .upload-latest[hidden]{ display:none; }
-.upload-latest-head{ display:flex; flex-wrap:wrap; align-items:baseline; gap:var(--space-1) var(--space-3); min-width:0; }
-.upload-latest-head .mono{ font-size:var(--text-xs); word-break:break-word; }
-.upload-latest-out{ color:var(--color-muted-foreground); }
+#uploadLatestBody{ min-width:0; }
 .btn[hidden]{ display:none; }
 
 /* ---------- form controls ---------- */
@@ -515,17 +515,30 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
           <span class="slice-wait-model mono" id="uploadWaitModel"></span>
           <span class="slice-track" id="uploadWaitTrack" role="progressbar" aria-label="waiting for the slicer…"><i></i></span>
         </div>
-        <div id="uploadLatest" class="upload-latest" hidden>
-          <p class="upload-latest-head">
-            <span class="mono" id="uploadLatestName"></span>
-            <span class="mono upload-latest-out" id="uploadLatestOut" hidden></span>
-          </p>
-          <p class="err" id="uploadLatestErr" hidden></p>
-          <button type="button" class="btn btn-primary" id="uploadLatestPrint"
-                  data-act="print" aria-label="Print the sliced model" hidden>
-            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
-            Print
-          </button>
+        <div id="uploadLatest" class="upload-latest subgroup" role="group"
+             aria-labelledby="uploadLatestTitle" hidden>
+          <h3 id="uploadLatestTitle">Last job</h3>
+          <!-- the only part the poll rewrites; the actions below are static so keyboard focus
+               on Print survives a 2-second refresh -->
+          <div id="uploadLatestBody"></div>
+          <div class="job-actions">
+            <button type="button" class="btn btn-primary" id="uploadLatestPrint"
+                    data-act="print" aria-label="Print the sliced model" hidden>
+              <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+              Print
+            </button>
+            <a class="btn" id="uploadLatestGcode" href="#" aria-label="Download the sliced gcode" hidden>
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
+              Gcode
+            </a>
+            <button type="button" class="btn btn-danger" id="uploadLatestDelete"
+                    data-act="delete" aria-label="Delete the last job">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m6 6 1 14h10l1-14"/></svg>
+              Delete
+            </button>
+          </div>
         </div>
       </section>
 
@@ -1131,6 +1144,16 @@ async function deleteAllJobs() {
   refresh();
 }
 
+/* one delegated handler for every job action on the page: the rows carry their own markup
+   buttons and the Last-job block of the Slice card has static ones — both land here, so there is
+   exactly one printJob(id) path and one del(id) path for the whole page */
+function onJobAction(ev) {
+  const btn = ev.target.closest("[data-act]");
+  if (!btn) return;
+  if (btn.dataset.act === "print") printJob(btn.dataset.ref);
+  else if (btn.dataset.act === "delete") del(btn.dataset.ref);
+}
+
 /* The upload card is not re-rendered by the poll, so its element is updated in place
    (.hidden / textContent): the bar keeps its animation phase and nothing is re-parsed. */
 function setUploadWait(job) {
@@ -1149,27 +1172,102 @@ function setUploadWait(job) {
   if (modelEl.textContent !== model) { modelEl.textContent = model; modelEl.title = model; }
 }
 
-/* The Slice card is the live surface for jobs[0]: what went in, what came out, and the one
-   action it allows. It reads the poll's first row, so a reload mid-slice lands here too. */
+/* ---------------- one job body, two hosts ----------------
+   jobs[0] is on the page twice: as the first row of the job list and as the "Last job" block in
+   the Slice card. Both come from renderJobBody(), so a field cannot appear in one place and be
+   missing from the other; only the frame differs — the row puts the body beside its markup
+   actions, the card puts it above three static buttons. */
+function jobPrintable(j) {
+  /* a finished slice that still carries an error is not something to send to the printer */
+  return j.status === "sliced" && !j.error;
+}
+
+/* `withWait` is off for the card: #uploadWait, directly above the block, already paints the live
+   slice state (and takes over for the transfer bar), so the body must not sweep a second time. */
+function renderJobBody(j, withWait = true) {
+  const s = j.stats || {};
+  const out = j.output_name ? `<span class="mono" title="sliced as">→ ${esc(j.output_name)}.gcode</span>` : "";
+  const active = isSlicing(j.status) && !j.error;
+  const label = SLICE_LABELS[j.status] || SLICE_LABELS.queued;
+  const wait = active ? `
+      <div class="slice-wait" aria-busy="true">
+        <span class="slice-wait-label">${label}</span>
+        <span class="slice-track" role="progressbar" aria-label="${label}"><i></i></span>
+      </div>` : "";
+  const waitBlock = withWait ? wait : "";
+  /* only a real shrink earns a stat: 1.0 means nothing was scaled, null means the model
+     could not be measured, and an old job predates the field — none of them render */
+  const scaled = typeof j.fit_scale === "number" && j.fit_scale < 1 ? Math.round(j.fit_scale * 100) : null;
+  const stats = j.status === "sliced" ? `
+    <div class="job-stats">
+      <span>time <b>${esc(s.time || "?")}</b></span>
+      <span>filament <b>${s.grams ? s.grams.toFixed(1)+" g" : "?"}</b></span>
+      <span>layers <b>${s.layers || "?"}</b></span>
+      <span>height <b>${esc(s.layer_height || "?")} mm</b></span>
+      <span>slice <b>${esc(j.elapsed || "?")}s</b></span>
+      ${scaled === null ? "" : `<span>scaled <b>${scaled}%</b> to fit</span>`}
+    </div>` : "";
+  return `
+    <p class="job-name mono">${esc(j.filename)}</p>
+    <p class="job-meta">
+      <span class="chip chip-${esc(j.status)}">${esc(j.status)}</span>
+      <span class="mono">${fmtBytes(j.upload_bytes)}</span>
+      <span>${fmtDate(j.created)}</span>
+      ${out}
+      ${j.remote_file ? `<span class="mono" title="on printer">on printer: ${esc(j.remote_file)}</span>` : ""}
+    </p>
+    ${waitBlock}
+    ${stats}
+    ${j.error ? `<p class="err">${esc(j.error)}</p>` : ""}`;
+}
+
+/* the list row: the shared body plus the actions a row owns as markup */
+function renderJobRow(j) {
+  /* gated by jobPrintable(), the same predicate the card's static buttons use */
+  const actions = jobPrintable(j) ? `
+          <button type="button" class="btn btn-primary" data-act="print" data-ref="${esc(j.id)}">
+            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
+            Print
+          </button>
+          <a class="btn" href="/api/jobs/${esc(j.id)}/gcode">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
+            Gcode
+          </a>` : "";
+  return `<article class="job">
+        <div>${renderJobBody(j)}</div>
+        <div class="job-actions">
+          ${actions}
+          <button type="button" class="btn btn-danger" data-act="delete" data-ref="${esc(j.id)}">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m6 6 1 14h10l1-14"/></svg>
+            Delete
+          </button>
+        </div>
+      </article>`;
+}
+
+/* The Slice card's "Last job" block reads the poll's first row, so a reload mid-slice lands here
+   too. Only the text body is rewritten; the three actions are static elements that are shown or
+   hidden and re-pointed, because re-parsing them on every poll would throw away the keyboard
+   focus resting on Print. */
 function setUploadLatest(job) {
-  const box = $("#uploadLatest"), nameEl = $("#uploadLatestName"),
-        outEl = $("#uploadLatestOut"), errEl = $("#uploadLatestErr"),
-        print = $("#uploadLatestPrint");
+  const box = $("#uploadLatest"), body = $("#uploadLatestBody"),
+        print = $("#uploadLatestPrint"), gcode = $("#uploadLatestGcode"),
+        remove = $("#uploadLatestDelete");
   if (!job) { box.hidden = true; return; }
   box.hidden = false;
-  const model = job.filename || "";
-  if (nameEl.textContent !== model) { nameEl.textContent = model; nameEl.title = model; }
-  outEl.hidden = !job.output_name;
-  outEl.textContent = job.output_name ? `→ ${job.output_name}.gcode` : "";
-  errEl.hidden = !job.error;
-  errEl.textContent = job.error || "";
-  /* the print action is the table's own path: same button, same printJob(id) */
-  const printable = job.status === "sliced" && !job.error;
+  const name = job.filename || "this job";
+  body.innerHTML = renderJobBody(job, false);
+  const printable = jobPrintable(job);
   print.hidden = !printable;
-  if (printable) {
-    print.dataset.ref = job.id;
-    print.setAttribute("aria-label", `Print ${model}`);
-  }
+  print.dataset.ref = printable ? job.id : "";
+  print.setAttribute("aria-label", `Print ${name}`);
+  gcode.hidden = !printable;
+  gcode.href = printable ? `/api/jobs/${job.id}/gcode` : "#";
+  gcode.setAttribute("aria-label", `Download ${name} as gcode`);
+  remove.dataset.ref = job.id;
+  remove.setAttribute("aria-label", `Delete ${name}`);
 }
 
 async function refresh() {
@@ -1187,62 +1285,7 @@ async function refresh() {
       box.innerHTML = `<p class="empty-line">No jobs yet. Drop a model above to slice it.</p>`;
       return;
     }
-    box.innerHTML = jobs.map(j => {
-      const s = j.stats || {};
-      const out = j.output_name ? `<span class="mono" title="sliced as">→ ${esc(j.output_name)}.gcode</span>` : "";
-      const active = isSlicing(j.status) && !j.error;
-      const label = SLICE_LABELS[j.status] || SLICE_LABELS.queued;
-      const wait = active ? `
-          <div class="slice-wait" aria-busy="true">
-            <span class="slice-wait-label">${label}</span>
-            <span class="slice-track" role="progressbar" aria-label="${label}"><i></i></span>
-          </div>` : "";
-      /* only a real shrink earns a stat: 1.0 means nothing was scaled, null means the model
-         could not be measured, and an old job predates the field — none of them render */
-      const scaled = typeof j.fit_scale === "number" && j.fit_scale < 1 ? Math.round(j.fit_scale * 100) : null;
-      const stats = j.status === "sliced" ? `
-        <div class="job-stats">
-          <span>time <b>${esc(s.time || "?")}</b></span>
-          <span>filament <b>${s.grams ? s.grams.toFixed(1)+" g" : "?"}</b></span>
-          <span>layers <b>${s.layers || "?"}</b></span>
-          <span>height <b>${esc(s.layer_height || "?")} mm</b></span>
-          <span>slice <b>${esc(j.elapsed || "?")}s</b></span>
-          ${scaled === null ? "" : `<span>scaled <b>${scaled}%</b> to fit</span>`}
-        </div>` : "";
-      const actions = j.status === "sliced" ? `
-          <button type="button" class="btn btn-primary" data-act="print" data-ref="${esc(j.id)}">
-            <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
-            Print
-          </button>
-          <a class="btn" href="/api/jobs/${esc(j.id)}/gcode">
-            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
-            Gcode
-          </a>` : "";
-      return `<article class="job">
-        <div>
-          <p class="job-name mono">${esc(j.filename)}</p>
-          <p class="job-meta">
-            <span class="chip chip-${esc(j.status)}">${esc(j.status)}</span>
-            <span class="mono">${fmtBytes(j.upload_bytes)}</span>
-            <span>${fmtDate(j.created)}</span>
-            ${out}
-            ${j.remote_file ? `<span class="mono" title="on printer">on printer: ${esc(j.remote_file)}</span>` : ""}
-          </p>
-          ${wait}
-          ${stats}
-          ${j.error ? `<p class="err">${esc(j.error)}</p>` : ""}
-        </div>
-        <div class="job-actions">
-          ${actions}
-          <button type="button" class="btn btn-danger" data-act="delete" data-ref="${esc(j.id)}">
-            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m6 6 1 14h10l1-14"/></svg>
-            Delete
-          </button>
-        </div>
-      </article>`;
-    }).join("");
+    box.innerHTML = jobs.map(renderJobRow).join("");
   } catch (e) {
     box.innerHTML = `<p class="err">Could not load jobs: ${esc(e.message)}</p>`;
     /* the row list says the load failed, so the card must not keep asserting a live slice */
@@ -1603,11 +1646,9 @@ function boot() {
   ["dragleave","drop"].forEach(e => drop.addEventListener(e, ev => { ev.preventDefault(); drop.classList.remove("hot"); }));
   drop.addEventListener("drop", ev => { if (uploading) return; if (ev.dataTransfer.files[0]) upload(ev.dataTransfer.files[0]); });
   input.addEventListener("change", () => { if (uploading) return; if (input.files[0]) upload(input.files[0]); input.value = ""; });
-  /* same code path as the jobs table: one printJob(id), one confirm dialog, one toast */
-  $("#uploadLatest").addEventListener("click", ev => {
-    const btn = ev.target.closest('button[data-act="print"]');
-    if (btn && btn.dataset.ref) printJob(btn.dataset.ref);
-  });
+  /* the card's static actions go through the same delegated handler as the rows: one printJob(id),
+     one confirm dialog, one toast */
+  $("#uploadLatest").addEventListener("click", onJobAction);
 
   $("#profFile").addEventListener("change", async ev => {
     const f = ev.target.files[0]; if (!f) return;
@@ -1674,12 +1715,7 @@ function boot() {
   $("#btnPrinterCancel").addEventListener("click", resetPrinterForm);
   $("#printerForm").addEventListener("submit", submitPrinter);
 
-  $("#jobs").addEventListener("click", ev => {
-    const btn = ev.target.closest("[data-act]");
-    if (!btn) return;
-    if (btn.dataset.act === "print") printJob(btn.dataset.ref);
-    else if (btn.dataset.act === "delete") del(btn.dataset.ref);
-  });
+  $("#jobs").addEventListener("click", onJobAction);
 
   $("#printerList").addEventListener("click", ev => {
     const btn = ev.target.closest("[data-act]");
