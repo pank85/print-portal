@@ -814,11 +814,13 @@ async function loadPrinterUi() {
   if (printerUiLoaded) return;   // built once: re-entering the tab must not reload Fluidd
   let uiUrl = "";
   try {
-    const r = await fetch("/api/printer");
+    /* its own route, not /api/printer: that one fails when the printer is offline, and then
+       the tab would claim the URL is unset exactly when it is set */
+    const r = await fetch("/api/ui");
     const p = await r.json().catch(() => ({}));
-    uiUrl = typeof p.ui_url === "string" ? p.ui_url : "";
-    if (r.ok || uiUrl) printerUiLoaded = true;   // otherwise retry on the next visit
-  } catch { /* offline or unconfigured: fall through to the empty state */ }
+    uiUrl = typeof p.printer_ui_url === "string" ? p.printer_ui_url : "";
+    if (r.ok) printerUiLoaded = true;            // otherwise retry on the next visit
+  } catch { /* unreachable portal: fall through to the empty state */ }
   renderPrinterUi(uiUrl);
 }
 

@@ -869,6 +869,17 @@ def api_health():
     return body
 
 
+@app.get("/api/ui")
+def api_ui():
+    """Deployment UI config for the embedded printer page.
+
+    Deliberately its own always-200 route: the printer state call answers 503/500 when no
+    printer is configured or the printer is offline, which is exactly when the Printer tab
+    would otherwise claim PRINTER_UI_URL is unset while it is set.
+    """
+    return {"printer_ui_url": CONFIG.printer_ui_url}
+
+
 @app.get("/api/printer")
 def api_printer():
     target = current_target()

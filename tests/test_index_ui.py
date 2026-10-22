@@ -1186,3 +1186,12 @@ def test_transfer_label_is_a_throttled_live_status(page):
     assert 'aria-live="polite"' in label
     progress = function_body(page, "setUploadProgress")
     assert "now - lastPaint >= 1000" in progress
+
+
+def test_the_printer_tab_reads_its_url_from_the_always_200_route(page):
+    """The loader must not depend on /api/printer, which fails while the printer is offline."""
+    body = function_body(page, "loadPrinterUi")
+    assert 'fetch("/api/ui")' in body
+    # the comment above the call names the old route, so assert on the call, not the word
+    assert 'fetch("/api/printer")' not in body
+    assert 'p.printer_ui_url' in body
