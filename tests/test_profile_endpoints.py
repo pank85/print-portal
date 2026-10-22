@@ -202,7 +202,7 @@ def test_profile_select_regenerates_the_derived_preset(client, datadir):
     """
     client.post("/api/profile/options", json={"supports": True})
     replacement = write_preset(datadir, "process", "voron-fast.json", "0.20mm Voron Fast",
-                               compatible_printers=["Voron 2.4 350"])
+                               compatible_printers=[MACHINE_NAME])  # process must be permitted by the shipped machine
     rel = replacement.relative_to(datadir).as_posix()
 
     response = client.post("/api/profile/select", json={"process": rel})

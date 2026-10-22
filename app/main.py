@@ -255,6 +255,32 @@ def _paired_process(machine: dict | None, process: dict | None,
     return None
 
 
+def _reject_unpermitted_pair(chosen: dict[str, str], merged: dict[str, str]) -> None:
+    """Refuse a selection whose machine/process pair the datadir says the slicer refuses.
+
+    The pair checked is the one ``merged`` is about to hold, not just the slots the body
+    names: a machine-only select drags the stored process along and a process-only select
+    lands under the stored machine, and either can store a combination the slicer answers
+    with ``-17``.
+
+    A filament-only pick is never refused, and a machine row that is missing or unreadable
+    is a broken datadir — `GET /api/profile` reports it — rather than a selection error.
+    The guard runs before anything is written, so a refusal leaves ``profile.json``, the
+    stored pairing and the derived preset exactly as they were.
+
+    :raises HTTPException: 400 when ``merged``'s machine/process pair is not permitted.
+    """
+    if "machine" not in chosen and "process" not in chosen:
+        return
+    machine_row = _preset_row("machine", merged.get("machine"))
+    if not isinstance(machine_row, dict) or machine_row.get("error"):
+        return
+    if _permits(machine_row, _preset_row("process", merged.get("process"))):
+        return
+    raise HTTPException(400, f"process '{merged.get('process')}' is not permitted by "
+                             f"machine '{merged.get('machine')}'")
+
+
 def pairing_from_body(raw: object) -> dict[str, str | None]:
     """The ``{slot: rel}`` pairing in a request body, checked against the datadir.
 
@@ -337,22 +363,26 @@ def apply_pairing_to_active(printer_id: str) -> None:
     pairing in place has to reach the same file, or the saved setting and the presets the
     slicer loads drift apart. Any other printer keeps the global selection untouched.
 
-    Never fails the caller: every caller has already persisted the row, so an error here
-    would answer 409/500 for a write that landed and a retry would duplicate it. Both
-    failures are states ``views()`` tolerates — a stored key that no longer decrypts with
-    this ``secret.key`` (``active_target`` raises 409) and a read-only datadir
+    Never fails the caller for a write that landed: every caller has already persisted the
+    row, so an error here would answer 409/500 and a retry would duplicate it. Exactly two
+    states are absorbed — a stored key that no longer decrypts with this ``secret.key``
+    (``STORE.active`` raises ``PrinterStoreError``) and a read-only datadir
     (``write_profile_file`` raises ``OSError``). The pairing is stored either way, and the
     next select of that printer applies it; the select path calls ``apply_pairing`` itself
     and keeps raising.
+
+    ``printer_view``'s 404 (an empty or corrupt row set) and ``ProfileError`` (a machine
+    slot this datadir cannot resolve) stay reachable: they also fail `GET /api/profile`,
+    so hiding them here would make a broken deployment look healthy.
     """
     try:
-        target = active_target()
-    except HTTPException:
+        target = STORE.active(SEED)
+    except printers.PrinterStoreError:
         return
     if target is not None and target.id == printer_id:
         try:
             apply_pairing(printer_view(printer_id))
-        except (printers.PrinterError, printers.PrinterStoreError, OSError):
+        except OSError:
             return
 
 
@@ -1125,6 +1155,9 @@ def api_profile_select(body: dict):
     merged = {k: relative_to_datadir(v) for k, v in active_paths().items()}
     merged.update(profile_labels())
     merged.update(chosen)
+    # before `write_profile_file`, so a refused pair leaves profile.json, the stored pairing
+    # and the derived preset exactly as they were
+    _reject_unpermitted_pair(chosen, merged)
     write_profile_file(merged)
     write_pairing_back(chosen)
     regenerate_derived(merged)
