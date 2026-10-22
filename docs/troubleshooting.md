@@ -186,6 +186,37 @@ Two possible bodies:
 Archive failures carry `ArchiveError.status`: a hostile or truncated zip is `400`, too many members is
 `413` (`app/archives.py`).
 
+## "My model is bigger than my bed"
+
+With `shrink_to_fit` off — the default — the model is measured before the CLI runs and refused with
+the size it has and the size the bed allows:
+
+```text
+cube.stl is 300x300x300 mm and does not fit the 220x220x250 mm bed of 'printer-1' — turn on shrink to fit (uniform scale) or upload a smaller model
+```
+
+(`_too_big_message`, `app/fit.py:83`; raised from `plan_fit`, `app/fit.py:117`.)
+
+* **Fix:** set **Shrink to fit** to *Yes* in the Printer card — the portal then computes one uniform
+  factor (`--scale k`) and orients the model too (`--orient 1`); the job row reports the percentage
+  it used. Or scale the model yourself to the size the message names and upload that. A factor below
+  `0.25x` is refused as well, and `_below_floor_message` (`app/fit.py:91`) names the minimum size to
+  re-export at.
+
+## "Shrink to fit refuses my 3MF"
+
+```text
+model.3mf: the portal reads STL and OBJ geometry only (3MF geometry lives in 3D/3dmodel.model) — turn shrink to fit off for this job, or export the model as STL and upload that
+```
+
+* **Where:** the job fails with that error, appended in `main.py:695` to the `MeshError` raised by
+  `model_bounding_box` (`app/mesh.py:162`, message at `app/mesh.py:32`).
+* **Why:** only STL and OBJ are measurable (`MEASURABLE_SUFFIXES`, `app/mesh.py:25`). A 3MF's geometry
+  lives in `3D/3dmodel.model`, which the portal does not parse — `app/threemf.py` rewrites the preset
+  identity only. Known limitation, not a bad upload; the same file slices fine with shrink off.
+* **Fix:** turn **Shrink to fit** off for that job (auto-orient still applies), or export the model as
+  STL and upload that with shrink on.
+
 ## "It slices with the wrong printer"
 
 * **A:** a stored `machine` path in `profile.json` is honoured without an existence check
