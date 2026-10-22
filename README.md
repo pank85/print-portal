@@ -67,6 +67,44 @@ Then open <http://localhost:8088>, upload an STL, and press **Print**.
 `.env.example` and `docker-compose.yml` in this repository are the real configuration files; the
 quickstart above is all you need to start.
 
+### Run the published image
+
+The image is also on Docker Hub, so you can run it without cloning anything:
+
+```bash
+curl -fsSLO https://raw.githubusercontent.com/pank85/print-portal/master/docker-compose.hub.yml
+curl -fsSLo .env.example https://raw.githubusercontent.com/pank85/print-portal/master/.env.example
+cp .env.example .env          # set PRINTER_URL and MOONRAKER_API_KEY
+mkdir -p data sliced
+sudo chown -R 1000:1000 data sliced   # the container runs as uid 1000
+docker compose -f docker-compose.hub.yml up -d
+```
+
+Or with plain Docker:
+
+```bash
+docker run -d --name print-portal --restart unless-stopped \
+  -p 8088:8088 -v "$PWD/data:/data" -v "$PWD/sliced:/sliced" \
+  -e SLICED_DIR=/sliced -e PRINTER_URL=http://moonraker:7125 -e MOONRAKER_API_KEY=... \
+  --memory 2g pank85/print-portal:2.2.1
+```
+
+What you need to know before pulling it:
+
+- **Tags.** `latest` follows the newest release; pin an explicit version (`pank85/print-portal:2.2.1`)
+  if you want a fixed artifact. Available tags:
+  <https://hub.docker.com/r/pank85/print-portal/tags>.
+- **amd64 only.** The image wraps the OrcaSlicer AppImage, which upstream ships for x86_64 Linux.
+  On arm64 hosts it will not run.
+- **The image carries no presets.** After the first start, import a `.orca_printer` bundle (see
+  [First run](#first-run)) or the portal will refuse to slice — by design.
+- **Your data lives in `./data`.** The folder holds the OrcaSlicer datadir, the imported presets,
+  the printer list and the job folders. Back it up; deleting it is a factory reset.
+- **`./sliced` is the host-visible output.** Gcode lands in both `/data/jobs/<id>/` and `/sliced`,
+  and `SLICED_DIR` decides where the second copy goes.
+- **The image is ~1 GB** because it contains OrcaSlicer and its runtime. Subsequent pulls are
+  layer-cached.
+
 ## First run
 
 A fresh install ships **no printer, process or filament preset**. The portal cannot slice anything

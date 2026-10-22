@@ -18,7 +18,7 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
-VERSION = "2.2.0"  # single source of truth; .gitlab-ci.yml APP_VERSION must match
+VERSION = "2.2.1"  # single source of truth; .gitlab-ci.yml APP_VERSION must match
 
 DEFAULTS: dict[str, str] = {
     "PRINTER_URL": "http://127.0.0.1:7125",

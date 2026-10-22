@@ -10,3 +10,4 @@ __pycache__/
 .orchestration/
 orca-datadir/
 *.bak
+.ergo/

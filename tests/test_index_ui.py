@@ -818,3 +818,126 @@ def test_skip_link_still_precedes_the_header(page):
     assert re.search(r'id="main"[^>]*tabindex="-1"', page)
     bar = page.index('<div class="header-bar">')
     assert "</div>" not in page[bar:page.index('id="printerPill"')]   # pill stays in the top bar
+
+
+# ---------------------------------------------------------------- transfer progress / latest job
+def upload_card(page: str) -> str:
+    """The "Slice a model" card — the live surface for the most recent job."""
+    return slice_between(page, '<section class="card" aria-labelledby="uploadTitle">', "</section>")
+
+
+def test_upload_transfers_with_xmlhttprequest_not_fetch(page):
+    """fetch cannot report request-body progress, and the silent transfer was the bug."""
+    body = function_body(page, "upload")
+    assert "new XMLHttpRequest()" in body
+    assert 'xhr.open("POST", "/api/upload")' in body
+    assert 'fetch("/api/upload"' not in page
+
+
+def test_upload_onprogress_writes_a_percent_and_an_mb_figure(page):
+    body = function_body(page, "upload")
+    assert "xhr.upload.onprogress = ev =>" in body
+    assert "setUploadProgress(ev.loaded, ev.lengthComputable ? ev.total : 0)" in body
+
+    progress = function_body(page, "setUploadProgress")
+    assert "Math.round((sent / total) * 100)" in progress
+    assert "(sent / 1048576).toFixed(1)" in progress
+    assert '`Uploading ${pct}% · ${mb} / ${(total / 1048576).toFixed(1)} MB`' in progress
+    # an unknown total shows the sent bytes only, never a fraction
+    assert '`Uploading ${mb} MB…`' in progress
+
+
+def test_aria_valuenow_only_while_bytes_move(page):
+    """A determinate transfer claims a value; the slice wait must not keep it."""
+    progress = function_body(page, "setUploadProgress")
+    assert 'track.setAttribute("aria-valuemin", "0")' in progress
+    assert 'track.setAttribute("aria-valuemax", "100")' in progress
+    assert 'track.setAttribute("aria-valuenow", String(pct))' in progress
+    assert 'track.removeAttribute("aria-valuenow")' in progress      # unknown total
+    assert "track.classList.add(\"is-determinate\")" in progress
+    assert "track.classList.remove(\"is-determinate\")" in progress
+
+    # the moment the job exists the box becomes indeterminate, and the poll's takeover strips
+    # every value attribute it inherited from the transfer
+    assert "setUploadWait({status: \"queued\", filename: file.name});" in function_body(page, "upload")
+    wait = function_body(page, "setUploadWait")
+    assert "resetUploadTrack()" in wait
+    reset = function_body(page, "resetUploadTrack")
+    for attr in ("aria-valuenow", "aria-valuemin", "aria-valuemax"):
+        assert f'track.removeAttribute("{attr}")' in reset, attr
+
+    # the static markup never claims a value either
+    bar = slice_between(upload_card(page), 'class="slice-track"', "</span>")
+    for attr in ("aria-valuenow", "aria-valuemin", "aria-valuemax"):
+        assert attr not in bar, attr
+
+
+def test_a_second_drop_or_pick_is_ignored_while_uploading(page):
+    body = function_body(page, "upload")
+    assert "if (uploading) return;" in body
+    # the drop zone is marked busy for the whole flight and released in finally
+    assert 'drop.setAttribute("aria-disabled", "true")' in body
+    assert 'drop.setAttribute("aria-disabled", "false")' in body
+    assert "} finally {" in body
+    assert "if (!uploading) input.click();" in page
+
+    drop_handler = slice_between(page, 'drop.addEventListener("drop"', ");")
+    assert "if (uploading) return;" in drop_handler
+    change_handler = slice_between(page, 'input.addEventListener("change"', ");")
+    assert "if (uploading) return;" in change_handler
+
+
+def test_slice_card_shows_the_latest_job_and_reuses_the_print_path(page):
+    card = upload_card(page)
+    for needle in ('id="uploadLatest"', 'id="uploadLatestName"', 'id="uploadLatestOut"',
+                   'id="uploadLatestErr"', 'id="uploadLatestPrint"'):
+        assert needle in card, needle
+
+    latest = function_body(page, "setUploadLatest")
+    assert "job.filename" in latest                  # the model that was uploaded
+    assert "job.output_name" in latest               # → <output_name>.gcode
+    assert ".gcode" in latest
+    assert 'job.status === "sliced"' in latest
+    assert "print.hidden = !printable" in latest
+    assert "print.dataset.ref = job.id" in latest
+    assert "job.error" in latest and "errEl.textContent" in latest
+
+    # the print button is a real button with a name, hidden until the job is sliced
+    button = card[card.rindex("<button", 0, card.index('id="uploadLatestPrint"')):]
+    button = button[:button.index(">")]
+    assert 'type="button"' in button
+    assert "hidden" in button
+    assert "aria-label=" in button
+
+    # derived from the poll's first row, so a reload mid-slice lands in the same state
+    refresh_body = function_body(page, "refresh")
+    assert "setUploadLatest(jobs[0])" in refresh_body
+    assert re.search(r"setUploadLatest\s*\(\s*null\s*\)", refresh_body.split("catch (e) {")[-1])
+
+    # and it prints through the same implementation, not a second copy
+    handler = slice_between(page, '$("#uploadLatest").addEventListener("click"', "});")
+    assert "printJob(btn.dataset.ref)" in handler
+    assert 'fetch(`/api/jobs/${id}/print`' in function_body(page, "printJob")
+
+
+def test_a_failed_upload_clears_the_bars_state(page):
+    body = function_body(page, "upload")
+    catch = body[body.index("} catch (e) {"):]
+    assert 'toast("Error: " + e.message' in catch   # the server's detail, as everywhere else
+    assert "clearUploadWait();" in catch
+    assert "setUploadLatest(null);" in catch
+
+    clear = function_body(page, "clearUploadWait")
+    assert "transferPhase = false" in clear
+    assert '$("#uploadWait").hidden = true' in clear
+    assert "resetUploadTrack()" in clear
+    assert '$("#uploadWaitLabel").textContent = SLICE_LABELS.queued' in clear
+
+
+def test_transfer_label_is_a_throttled_live_status(page):
+    """The label is polite, but the transfer repaints it at most once a second."""
+    label = slice_between(upload_card(page), 'class="slice-wait-label"', ">")
+    assert 'role="status"' in label
+    assert 'aria-live="polite"' in label
+    progress = function_body(page, "setUploadProgress")
+    assert "now - lastPaint >= 1000" in progress

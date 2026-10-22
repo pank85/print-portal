@@ -1,0 +1,33 @@
+# Run print-portal from the published image — no clone, no build.
+#
+#   curl -fsSLO https://raw.githubusercontent.com/pank85/print-portal/master/docker-compose.hub.yml
+#   curl -fsSLo .env.example https://raw.githubusercontent.com/pank85/print-portal/master/.env.example
+#   cp .env.example .env      # set PRINTER_URL and MOONRAKER_API_KEY
+#   mkdir -p data sliced && sudo chown -R 1000:1000 data sliced
+#   docker compose -f docker-compose.hub.yml up -d
+#
+# The image is amd64 only: the OrcaSlicer AppImage it wraps is x86_64.
+# Pin the version you run; `latest` moves. See README "Run the published image".
+services:
+  print-portal:
+    image: pank85/print-portal:2.2.1
+    container_name: print-portal
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: false
+    ports:
+      - "${PORT:-8088}:${PORT:-8088}"
+    volumes:
+      - ./data:/data
+      # sliced output dir must be writable by uid 1000 (container user)
+      - ./sliced:/sliced
+    environment:
+      - SLICED_DIR=${SLICED_DIR:-/sliced}
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.environ.get('PORT','8088'), timeout=4).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
