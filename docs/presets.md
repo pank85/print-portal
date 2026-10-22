@@ -1,17 +1,19 @@
 # Preset pipeline
 
-Two states exist right now and they behave differently. This page documents both, separately. Nothing
-in **B** is in `develop`.
+Two behaviours have shipped in sequence. **B is now the current behaviour** — it landed on `develop` as
+`5e8d328` ("a fresh install ships no presets — importing a bundle is the first step"). **A** is kept
+below only as history: it is what `dc92ca1` did, and reading it explains why the old code merged a
+bundle machine onto a stock slot.
 
 | | State | What was read | Status |
 |---|---|---|---|
-| **A** | `develop` @ `dc92ca1` | this worktree — `app/profiles.py`, `app/main.py`, `presets/datadir/` | shipped |
-| **B** | `ergo/20261022T123034Z-import-name` | read-only snapshot of `/home/pank/projects/print-portal` (~27 dirty files, uncommitted) | **in progress — NOT in develop** |
+| **A** | `develop` @ `dc92ca1` | `app/profiles.py`, `app/main.py`, `presets/datadir/` at that commit | superseded by `5e8d328` |
+| **B** | `develop` @ `5e8d328`+ | the landed commit in this worktree | **current** |
 
-Verified before writing: none of `VENDOR_LISTS`, `NO_MACHINE_MESSAGE`, `read_vendor_index`,
-`require_machine`, `selection_from_import` or `"imported": False` exists in `dc92ca1` (`grep -F` over
-`app/profiles.py app/main.py` → 0 matches), and `dc92ca1`'s `presets/datadir/` ships 11 preset files.
-Everything attributed to B below comes from the snapshot.
+When this page was first written, B existed only as uncommitted work; the symbols it introduces
+(`VENDOR_LISTS`, `NO_MACHINE_MESSAGE`, `read_vendor_index`, `require_machine`, `selection_from_import`,
+`"imported": False`) had 0 matches in `dc92ca1` and its `presets/datadir/` shipped 11 preset files.
+Those symbols are now in `develop` — see `git show 5e8d328`.
 
 One thing is identical in both states: the **`-17` rule** (§3) — which A misdiagnosed. That misdiagnosis
 is the reason A's import merges onto a stock slot at all.
@@ -74,7 +76,7 @@ onto the resolved machine slot."
 That premise is wrong (§3): patching `compatible_printers` does make the same machine slice. The merge
 is a workaround for a misdiagnosis, and it is why A cannot show the bundle's real printer name.
 
-## 2. State B — uncommitted, NOT in `develop`
+## 2. State B — current behaviour (landed as `5e8d328`)
 
 ### The seed ships no presets
 
@@ -239,7 +241,8 @@ the machine permits the process (`_paired_process`, `main.py:245`), and writes a
 ## UNVERIFIED
 
 * **B may change before it lands.** Re-read `app/profiles.py` on that branch before trusting the symbol
-  names or line numbers above; the snapshot is uncommitted work by another agent.
+  names or line numbers above were read before the commit landed; the memory pointers in §2 now
+  describe `5e8d328`, which is in `develop`.
 * Whether `-17`/`251`/`from` behave the same on OrcaSlicer > 2.4.2. What would confirm: re-run the
   bisect recorded at in-progress `profiles.py:31-43` against the newer binary.
 * Whether A's merge path was ever tested with a bundle whose `compatible_printers` named the machine.
