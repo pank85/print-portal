@@ -46,7 +46,8 @@ and network reachability; it does not need OrcaSlicer, Python or any shared moun
   [docs/printer-setup.md](docs/printer-setup.md)).
 - **An OrcaSlicer preset** — a machine preset, a process preset and a filament preset. The image
   ships a neutral generic set; you can also import your own `.orca_printer` bundle or single
-  preset `.json` through `POST /api/profile/upload`.
+  preset `.json` through `POST /api/profile/upload`. Where presets live on each platform, and how to
+  export a `.orca_printer` from the desktop app: [docs/orcaslicer-presets.md](docs/orcaslicer-presets.md).
 - **Docker** with the Compose plugin, Docker Compose **≥ 2.24** — `docker-compose.yml` uses the
   optional `env_file: {path: .env, required: false}` form, which older Compose releases reject.
 
