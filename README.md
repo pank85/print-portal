@@ -205,8 +205,17 @@ Most configuration is environment variables (read from `.env` via Compose; see `
 | `BED_SIZE` | `220x220` | bed size used to clamp imported machine presets |
 | `MACHINE_SLOT` | *(auto)* | optional override of the machine preset the slicer loads |
 | `SEED_VERSION` | `2.4.2-2` | build-time marker for the seed copy; bump it to re-run seeding on upgrade |
+| `PRINTER_UI_URL` | *(unset)* | optional Fluidd/Mainsail page framed by the **Printer** tab; empty means no embedded UI |
 
 `HOME` for the slicer subprocess is `$DATA_DIR/home` and must be writable.
+
+The **Printer** tab embeds `PRINTER_UI_URL` in an iframe and always offers an "Open in a new tab" link
+next to it. Two caveats are worth knowing before you set it: the URL is opened by *your browser*, so it
+must be reachable from the machine you view the portal on — not from the container; and an `http://` UI
+inside an `https://` portal is blocked by the browser as mixed content, which the tab tells you instead
+of showing a blank frame. Put the printer UI behind HTTPS (its own proxy host is enough) if you need it
+embedded over TLS. Fluidd and Mainsail refuse framing via `X-Frame-Options`/CSP by default; the
+new-tab link is the way in when they do.
 
 An existing deployment keeps the presets it already has: the seed is copied into the datadir with
 `cp -R -n`, which never overwrites, so an empty seed can never resurrect a preset either. Delete
@@ -248,7 +257,7 @@ is a secret — treat it like a password.
 |---|---|---|
 | GET | `/` | upload UI |
 | GET | `/api/health` | `{"status":"ok","app":"print-portal","version":...}` — readiness; returns 503 until a printer is configured |
-| GET | `/api/printer` | live snapshot: state, file, progress, nozzle/bed temps, homed axes |
+| GET | `/api/printer` | live snapshot: state, file, progress, nozzle/bed temps, homed axes, plus `ui_url` (the `PRINTER_UI_URL` the Printer tab frames) |
 | POST | `/api/upload` | multipart `file` (`.stl`, `.3mf`, `.obj`, `.zip`, ≤`MAX_UPLOAD_MB`) → job; the response adds `archive` and `threemf` when the upload was unpacked or switched a profile |
 | GET | `/api/jobs` | list jobs, newest first |
 | GET | `/api/jobs/{id}` | status, stats, error, plus the fit/orient fields described under [Auto-orient and shrink to fit](#auto-orient-and-shrink-to-fit) |

@@ -797,13 +797,16 @@ def test_print_progress_bar_stays_determinate_and_separate(page):
 
 
 # ---------------------------------------------------------------- header nav / mobile disclosure
-def test_header_nav_keeps_the_two_hash_destinations(page):
+def test_header_nav_keeps_the_three_hash_destinations(page):
     # drop the <nav> opening tag (it carries its own nav* id) so only the link ids are collected
     nav = slice_between(page, 'id="navSections"', "</nav>").split(">", 1)[1]
-    assert re.findall(r'id="(nav[\w-]+)"', nav) == ["navDash", "navSettings"]
+    assert re.findall(r'id="(nav[\w-]+)"', nav) == ["navDash", "navPrinter", "navSettings"]
     assert 'id="navDash" href="#/"' in nav
+    assert 'id="navPrinter" href="#/printer"' in nav
     assert 'id="navSettings" href="#/settings"' in nav
-    assert nav.count("<a ") == 2
+    assert nav.count("<a ") == 3
+    # one markup/class contract for all three: no bespoke tab styling for the new one
+    assert nav.count('class="tab"') == 3
 
 
 def test_switcher_is_one_compact_row_inside_the_header_bar(page):
@@ -842,7 +845,6 @@ def test_nav_disclosure_is_wired_and_the_router_is_untouched(page):
     assert "setNavOpen(false)" in function_body(page, "setView")   # route change closes
     # frozen router
     assert "let currentView = null;" in script
-    assert script.count('if (currentView === "settings" || document.hidden) return;') == 2
 
 
 def test_closed_mobile_menu_leaves_nothing_focusable(page):
@@ -860,6 +862,121 @@ def test_skip_link_still_precedes_the_header(page):
     assert re.search(r'id="main"[^>]*tabindex="-1"', page)
     bar = page.index('<div class="header-bar">')
     assert "</div>" not in page[bar:page.index('id="printerPill"')]   # pill stays in the top bar
+
+
+# ---------------------------------------------------------------- printer view (iframe embed)
+def test_the_printer_view_is_its_own_panel_between_the_other_two(page):
+    assert re.search(r'<section class="view" id="viewPrinter"[^>]*aria-labelledby="printerViewTitle"[^>]*hidden',
+                     page)
+    assert 'id="printerViewTitle" tabindex="-1"' in page
+    # DOM order is the tab order: dashboard → printer → settings
+    assert page.index('id="viewDashboard"') < page.index('id="viewPrinter"') < page.index('id="viewSettings"')
+
+
+def test_printer_is_a_cold_loadable_route(page):
+    body = function_body(page, "route")
+    assert 'if (raw === "printer") return setView("printer");' in body
+    # an unknown hash keeps replacing the history entry with the dashboard, as before
+    assert 'history.replaceState(null, "", "#/")' in body
+    setview = function_body(page, "setView")
+    assert 'if (name === "printer") loadPrinterUi();' in setview
+    # exactly one call site, so a deep link cannot be half-wired into the view
+    assert setview.count("loadPrinterUi()") == 1
+
+
+def test_the_printer_tab_shares_the_active_state_contract(page):
+    script = script_block(page)
+    assert re.search(
+        r'const VIEWS = \{ dashboard: DASH, settings: SETT, printer: PRIN \};', script)
+    assert re.search(
+        r'const VIEW_TABS = \{ dashboard: "#navDash", settings: "#navSettings", printer: "#navPrinter" \};',
+        script)
+    body = function_body(page, "setView")
+    assert "panel().hidden = view !== name" in body
+    assert 'setAttribute("aria-current", "page")' in body
+    assert 'removeAttribute("aria-current")' in body
+
+
+def test_the_frame_is_a_real_unsandboxed_iframe(page):
+    # Fluidd/Mainsail are SPAs with their own storage: a sandboxed frame is a blank page
+    assert "sandbox" not in page
+    tpl = slice_between(page, '<template id="printerFrameTpl">', "</template>")
+    frame = tpl[tpl.index("<iframe"):tpl.index(">", tpl.index("<iframe")) + 1]
+    assert 'id="printerFrame"' in frame
+    assert re.search(r'title="[^"]+"', frame)                       # meaningful, not "frame"
+    assert 'loading="lazy"' in frame
+    assert 'referrerpolicy="no-referrer"' in frame
+    assert "fullscreen" in re.search(r'allow="([^"]*)"', frame).group(1)
+    # inert until the portal reports a URL: no iframe, no empty src, no failed load
+    assert '<template id="printerFrameTpl">' in page
+    assert 'src=""' not in tpl
+
+
+def test_the_frame_fills_a_reserved_box_and_cannot_collapse(page):
+    style = page[page.index("<style>"):page.index("</style>")]
+    mount = re.search(r"\n\.frame-mount\s*\{([^}]*)\}", style).group(1)
+    assert "height:min(" in mount and "min-height:" in mount
+    frame = re.search(r"\n\.printer-frame\s*\{([^}]*)\}", style).group(1)
+    assert "width:100%" in frame and "height:100%" in frame
+    assert "height:0" not in mount + frame
+    # the frame scrolls itself; nothing around it traps the page's scroll
+    assert not re.search(r"\n\.frame-mount\s*\{[^}]*overflow", style)
+    assert not re.search(r"\n#viewPrinter\s*\{[^}]*overflow", style)
+
+
+def test_the_way_out_is_a_real_link_in_the_markup(page):
+    card = slice_between(page, 'id="printerFrameCard"', "</section>")
+    link = card[card.index("<a "):card.index("</a>") + len("</a>")]
+    assert 'id="printerOpen"' in link
+    assert 'target="_blank"' in link
+    assert 'rel="noopener noreferrer"' in link
+    assert "href=" in link
+    assert re.search(r">\s*Open in a new tab\s*<", link)            # a visible, readable name
+    # markup, never built or rebuilt by the script — only its destination moves
+    assert "open.href = uiUrl" in function_body(page, "renderPrinterUi")
+    assert 'createElement("a")' not in script_block(page)
+
+
+def test_empty_state_names_the_variable_and_the_browser(page):
+    empty = slice_between(page, 'id="printerUiEmpty"', "</p>")
+    assert "PRINTER_UI_URL" in empty
+    assert "browser" in empty and "server" in empty                  # reachable from the browser
+    assert 'role="status"' in empty
+    body = function_body(page, "renderPrinterUi")
+    assert "empty.hidden = !!uiUrl" in body
+    assert "card.hidden = !uiUrl" in body
+    # .frame-card is display:grid, which loses to the hidden attribute unless the sheet says so
+    style = page[page.index("<style>"):page.index("</style>")]
+    assert re.search(r"\n\.frame-card\[hidden\]\s*\{\s*display:\s*none;?\s*\}", style)
+    # no URL → no iframe at all, which is why the empty state exists
+    assert "if (!uiUrl) return;" in body
+    assert body.index("if (!uiUrl) return;") < body.index("cloneNode")
+
+
+def test_an_https_portal_warns_instead_of_framing_a_plain_http_ui(page):
+    warn = slice_between(page, 'id="printerUiMixed"', "</p>")
+    assert "mixed content" in warn and "PRINTER_UI_URL" in warn
+    assert 'role="status"' in warn
+    helper = function_body(page, "isMixedContent")
+    assert 'location.protocol === "https:"' in helper               # detected, not assumed
+    assert "http:" in helper
+    body = function_body(page, "renderPrinterUi")
+    assert "const blocked = isMixedContent(uiUrl);" in body
+    assert "mixed.hidden = !blocked;" in body
+    # the link is set before the block decision, so the way forward survives the warning
+    assert body.index("open.href = uiUrl") < body.index("isMixedContent(uiUrl)")
+    assert "mount.hidden = blocked;" in body                         # blocked → no reserved box
+    assert "if (blocked || mount.firstElementChild) return;" in body  # blocked → no frame
+
+
+def test_the_poller_pauses_on_the_printer_view_like_settings(page):
+    helper = function_body(page, "pollPaused")
+    assert 'currentView !== "dashboard"' in helper
+    assert "document.hidden" in helper
+    script = script_block(page)
+    assert script.count("if (pollPaused()) return;") == 2           # refresh() and the interval
+    assert "if (pollPaused()) return;" in function_body(page, "refresh")
+    assert "if (pollPaused()) return;" in script[script.index("setInterval("):]
 
 
 # ---------------------------------------------------------------- transfer progress / latest job

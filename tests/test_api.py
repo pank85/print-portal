@@ -7,6 +7,7 @@ swapping ``main.current_client`` for a stub (so the endpoint logic sees a chosen
 """
 from __future__ import annotations
 
+import dataclasses
 import io
 import json
 import os
@@ -247,6 +248,35 @@ def test_printer_offline_is_a_200_with_an_actionable_error(client, monkeypatch):
     assert body["state"] == "offline"
     assert "unreachable" in body["error"]
     assert body["host"] == main.CONFIG.printer_url
+
+
+def test_printer_reports_the_embedded_ui_url_from_config(client, monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+    # the UI URL rides along on every answer, online or not: the Printer tab needs it to build
+    # the frame, and it must not depend on Moonraker being reachable
+    monkeypatch.setattr(
+        main, "CONFIG",
+        dataclasses.replace(main.CONFIG, printer_ui_url="http://printer.local/fluidd"),
+    )
+
+    body = client.get("/api/printer").json()
+
+    assert body["ui_url"] == "http://printer.local/fluidd"
+
+
+def test_printer_omits_no_ui_url_when_the_variable_is_unset(client, monkeypatch):
+    def refuse(*_args, **_kwargs):
+        raise urllib.error.URLError(ConnectionRefusedError(111, "Connection refused"))
+
+    monkeypatch.setattr(urllib.request, "urlopen", refuse)
+
+    body = client.get("/api/printer").json()
+
+    # an empty string, never a missing key: the page reads one shape and shows the empty state
+    assert body["ui_url"] == ""
 
 
 def test_printer_with_a_rejected_key_is_a_200_with_the_api_key_hint(client, monkeypatch):

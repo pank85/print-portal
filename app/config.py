@@ -17,8 +17,9 @@ import sys
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
-VERSION = "2.2.3"  # single source of truth; .gitlab-ci.yml APP_VERSION must match
+VERSION = "2.2.4"  # single source of truth; .gitlab-ci.yml APP_VERSION must match
 
 DEFAULTS: dict[str, str] = {
     "PRINTER_URL": "http://127.0.0.1:7125",
@@ -31,6 +32,7 @@ DEFAULTS: dict[str, str] = {
     "SLICE_TIMEOUT": "900",
     "BED_SIZE": "220x220",
     "ENV_PRINTER_NAME": "Default (environment)",
+    "PRINTER_UI_URL": "",
 }
 
 REQUIRED_HINTS: dict[str, str] = {
@@ -71,6 +73,7 @@ class Config:
     env_printer_name: str      # ENV_PRINTER_NAME or "Default (environment)"
     env_printer_url: str       # PRINTER_URL (default http://127.0.0.1:7125, rstrip("/"))
     env_printer_api_key: str | None  # None when the env seed is not configured
+    printer_ui_url: str        # PRINTER_UI_URL, "" when not configured (no trailing slash)
 
 
 def parse_bed_size(value: str) -> tuple[float, float]:
@@ -86,6 +89,36 @@ def parse_bed_size(value: str) -> tuple[float, float]:
     if not 0 < width < math.inf or not 0 < height < math.inf:
         raise ConfigError(f"BED_SIZE must look like 220x220 (got {value!r})")
     return width, height
+
+
+def parse_ui_url(value: str) -> str:
+    """Parse ``PRINTER_UI_URL``: ``""`` or an http(s) URL with no trailing slash.
+
+    The portal only *publishes* this URL — it is opened by the browser, inside a frame, so
+    the server never contacts it. Validation is therefore about shape, and strict about the
+    parts a browser cannot use: credentials, a query and a fragment all have to be rejected
+    here rather than silently baked into an ``<iframe src>``.
+    """
+    raw = str(value or "").strip()
+    if not raw:
+        return ""
+    if not raw.startswith(("http://", "https://")):
+        raise ConfigError(f"PRINTER_UI_URL must start with http:// or https:// (got {value!r})")
+    try:
+        parts = urlsplit(raw)
+        host = parts.hostname
+        parts.port  # raises ValueError on a non-numeric or out-of-range port
+    except ValueError as exc:
+        raise ConfigError(f"PRINTER_UI_URL is not a usable URL: {value!r} ({exc})") from None
+    if not host:
+        raise ConfigError(f"PRINTER_UI_URL must name a host (got {value!r})")
+    if parts.username is not None or parts.password is not None:
+        raise ConfigError(f"PRINTER_UI_URL must not embed credentials (got {value!r})")
+    if parts.query or "?" in raw:
+        raise ConfigError(f"PRINTER_UI_URL must not carry a query string (got {value!r})")
+    if parts.fragment or "#" in raw:
+        raise ConfigError(f"PRINTER_UI_URL must not carry a fragment (got {value!r})")
+    return raw.rstrip("/")
 
 
 def _value(env: Mapping[str, str], name: str) -> str:
@@ -174,6 +207,10 @@ def load_config(env: Mapping[str, str] | None = None, *, printer_seed_required: 
 
     env_printer_api_key = api_key_raw if api_key_raw else None
 
+    # independent of the printer store and of PRINTER_URL: it is the Fluidd/Mainsail page the
+    # browser is asked to frame, so an unconfigured portal simply has no embedded UI
+    printer_ui_url = parse_ui_url(source.get("PRINTER_UI_URL") or "")
+
     return Config(
         printer_url=printer_url,
         # trimmed of surrounding whitespace; becomes the X-Api-Key header, never printed
@@ -199,6 +236,7 @@ def load_config(env: Mapping[str, str] | None = None, *, printer_seed_required: 
         env_printer_name=env_printer_name,
         env_printer_url=printer_url,
         env_printer_api_key=env_printer_api_key,
+        printer_ui_url=printer_ui_url,
     )
 
 

@@ -343,6 +343,24 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
   border-radius:var(--radius-sm); padding:var(--space-2) var(--space-3); font-size:var(--text-sm);
 }
 
+/* ---------- printer view (embedded Fluidd/Mainsail) ---------- */
+#viewPrinter{ width:100%; }
+.frame-card{ gap:var(--space-3); }
+/* the card is display:grid, which outranks the hidden attribute's UA rule: without this, an
+   unconfigured install shows an empty 480px box under the explanation */
+.frame-card[hidden]{ display:none; }
+.frame-url{ min-width:0; overflow-wrap:anywhere; }
+/* The mount reserves the frame's box before it loads (no layout shift) and never collapses:
+   a 0-height iframe reads as "the portal is broken" rather than "nothing embedded yet". */
+.frame-mount{ height:min(78vh,960px); min-height:480px; }
+.printer-frame{
+  display:block; width:100%; height:100%; border:0;
+  background:var(--color-card); border-radius:var(--radius-sm);
+}
+@media (max-width:720px){
+  .frame-mount{ height:min(74vh,640px); min-height:360px; }
+}
+
 /* ---------- settings ---------- */
 #viewSettings{ width:100%; max-width:720px; margin-inline:auto; }
 .secret-note{
@@ -420,6 +438,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
       </button>
       <nav class="tabs" id="navSections" aria-label="Sections">
         <a class="tab" id="navDash" href="#/">Dashboard</a>
+        <a class="tab" id="navPrinter" href="#/printer">Printer</a>
         <a class="tab" id="navSettings" href="#/settings">Settings</a>
       </nav>
     </div>
@@ -566,6 +585,48 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     </section>
   </section>
 
+  <!-- ================= printer (embedded Fluidd/Mainsail) ================= -->
+  <!-- Three mutually exclusive states share this section: the frame, the empty state, and the
+       mixed-content warning. A cross-origin frame that refuses embedding (X-Frame-Options or
+       CSP frame-ancestors) cannot be detected from script, so the frame card always carries a
+       real link out; that is the only honest fallback. -->
+  <section class="view" id="viewPrinter" aria-labelledby="printerViewTitle" hidden>
+    <h1 id="printerViewTitle" tabindex="-1">Printer</h1>
+
+    <p class="secret-note" id="printerUiEmpty" role="status" hidden>
+      Nothing is embedded here yet. Set <span class="mono">PRINTER_UI_URL</span> to the address of your
+      Fluidd or Mainsail page and reload. That address is opened by <em>this browser</em>, not by the
+      portal's server, so it has to be reachable from the device you are using right now — a URL that
+      only works from inside the container will leave this section empty.
+    </p>
+
+    <p class="warning" id="printerUiMixed" role="status" hidden>
+      This portal is served over HTTPS and <span class="mono">PRINTER_UI_URL</span> is plain HTTP, so the
+      browser blocks the frame as mixed content. Open the printer UI with the link below instead, or serve
+      it over HTTPS (its own proxy host is enough) to embed it here.
+    </p>
+
+    <section class="card frame-card" id="printerFrameCard" aria-labelledby="printerFrameTitle" hidden>
+      <div class="section-head">
+        <h2 id="printerFrameTitle">Embedded printer UI</h2>
+        <a class="btn" id="printerOpen" href="#" target="_blank" rel="noopener noreferrer">Open in a new tab</a>
+      </div>
+      <p class="hint mono frame-url" id="printerUiUrl"></p>
+      <p class="hint" id="printerFrameNote">
+        If the frame stays blank, the printer UI is refusing to be embedded — use the link above, not a reload.
+      </p>
+      <div class="frame-mount" id="printerFrameMount"></div>
+    </section>
+
+    <!-- inert markup: the frame is cloned in only once the portal reports a URL, so an unconfigured
+         install has no iframe in the document at all (no empty src, no failed load) -->
+    <template id="printerFrameTpl">
+      <iframe id="printerFrame" class="printer-frame" title="Printer interface (Fluidd or Mainsail)"
+              loading="lazy" referrerpolicy="no-referrer"
+              allow="fullscreen; clipboard-read; clipboard-write"></iframe>
+    </template>
+  </section>
+
   <!-- ================= settings ================= -->
   <section class="view" id="viewSettings" aria-labelledby="settingsTitle" hidden>
     <h1 id="settingsTitle" tabindex="-1">Settings</h1>
@@ -654,38 +715,43 @@ function isSlicing(status) { return status === "queued" || status === "slicing";
 
 /* ---------------- routing ---------------- */
 let currentView = null;
-const DASH = () => $("#viewDashboard"), SETT = () => $("#viewSettings");
+const DASH = () => $("#viewDashboard"), SETT = () => $("#viewSettings"), PRIN = () => $("#viewPrinter");
+/* One table per direction, so a view added here cannot be half-wired: the panels are the
+   sections, the tabs are the header destinations that own the aria-current state. */
+const VIEWS = { dashboard: DASH, settings: SETT, printer: PRIN };
+const VIEW_TABS = { dashboard: "#navDash", settings: "#navSettings", printer: "#navPrinter" };
 
 function setView(name) {
   setNavOpen(false);
-  const settings = name === "settings";
   const moved = currentView !== null && currentView !== name;
   currentView = name;
-  DASH().hidden = settings;
-  SETT().hidden = !settings;
-  const navDash = $("#navDash"), navSettings = $("#navSettings");
-  if (settings) {
-    navDash.removeAttribute("aria-current");
-    navSettings.setAttribute("aria-current", "page");
-  } else {
-    navSettings.removeAttribute("aria-current");
-    navDash.setAttribute("aria-current", "page");
+  for (const [view, panel] of Object.entries(VIEWS)) panel().hidden = view !== name;
+  for (const [view, selector] of Object.entries(VIEW_TABS)) {
+    const tab = $(selector);
+    if (view === name) tab.setAttribute("aria-current", "page");
+    else tab.removeAttribute("aria-current");
   }
   if (moved) {
-    const head = (settings ? SETT() : DASH()).querySelector("h1");
+    const head = VIEWS[name]().querySelector("h1");
     if (head) head.focus();
   }
-  if (settings) loadPrinters();
+  if (name === "settings") loadPrinters();
+  else if (name === "printer") loadPrinterUi();   // also on a cold #/printer link, not only on `moved`
   else if (moved) refresh();
 }
 
 function route() {
   const raw = location.hash.replace(/^#/, "").replace(/^\/+/, "").replace(/\/+$/, "").toLowerCase();
   if (raw === "settings" || raw === "viewsettings") return setView("settings");
+  if (raw === "printer") return setView("printer");
   if (raw === "" || raw === "dashboard") return setView("dashboard");
   history.replaceState(null, "", "#/");
   setView("dashboard");
 }
+
+/* The poller runs only while the dashboard is the active view and the tab is visible:
+   Settings and Printer each fetch what they need themselves. */
+function pollPaused() { return currentView !== "dashboard" || document.hidden; }
 
 /* ---------------- mobile nav disclosure ---------------- */
 function setNavOpen(open) {
@@ -711,6 +777,49 @@ function ask(title, body, okLabel = "Delete") {
     $("#dlgCancel").onclick = () => { dlg.returnValue = ""; dlg.close(); };
     if (!dlg.open) dlg.showModal();
   });
+}
+
+/* ---------------- embedded printer UI ---------------- */
+/* PRINTER_UI_URL comes from GET /api/printer: the page is static, so the frame is built once
+   per page load from the server's answer. Nothing here polls — a refused frame is silent, so
+   the section keeps a real link out instead of guessing. */
+let printerUiLoaded = false;
+
+function isMixedContent(url) {
+  /* an http: frame inside an https: page never leaves the browser; nothing can be detected
+     after the fact, so the blocked case is decided before the frame is created */
+  return location.protocol === "https:" && /^http:\/\//i.test(url);
+}
+
+function renderPrinterUi(uiUrl) {
+  const empty = $("#printerUiEmpty"), card = $("#printerFrameCard"),
+        mixed = $("#printerUiMixed"), mount = $("#printerFrameMount"),
+        open = $("#printerOpen"), label = $("#printerUiUrl"), note = $("#printerFrameNote");
+  empty.hidden = !!uiUrl;
+  card.hidden = !uiUrl;
+  mixed.hidden = true;
+  if (!uiUrl) return;
+  label.textContent = uiUrl;
+  open.href = uiUrl;                       // the link is markup; only its destination moves
+  const blocked = isMixedContent(uiUrl);
+  mixed.hidden = !blocked;
+  note.hidden = blocked;                  // "the frame may be blank" only applies to a frame
+  mount.hidden = blocked;                 // no reserved box where no frame may load
+  if (blocked || mount.firstElementChild) return;   // no frame for a URL the browser will block
+  mount.replaceChildren($("#printerFrameTpl").content.cloneNode(true));
+  $("#printerFrame").src = uiUrl;
+}
+
+async function loadPrinterUi() {
+  if (printerUiLoaded) return;   // built once: re-entering the tab must not reload Fluidd
+  let uiUrl = "";
+  try {
+    const r = await fetch("/api/printer");
+    const p = await r.json().catch(() => ({}));
+    uiUrl = typeof p.ui_url === "string" ? p.ui_url : "";
+    if (r.ok || uiUrl) printerUiLoaded = true;   // otherwise retry on the next visit
+  } catch { /* offline or unconfigured: fall through to the empty state */ }
+  renderPrinterUi(uiUrl);
 }
 
 /* ---------------- printer status ---------------- */
@@ -1280,7 +1389,7 @@ function setUploadLatest(job) {
 }
 
 async function refresh() {
-  if (currentView === "settings" || document.hidden) return;
+  if (pollPaused()) return;
   const box = $("#jobs"), count = $("#jobCount"), delAll = $("#btnDeleteAll");
   try {
     const jobs = await (await fetch("/api/jobs")).json();
@@ -1748,10 +1857,10 @@ function boot() {
   populatePairing("", null).catch(() => {});   // the form opens on "Inherit current profile"
   refresh();
   refreshPrinter();
-  /* One poller for the page: nothing is fetched while Settings is open or the tab is
+  /* One poller for the page: nothing is fetched while Settings or Printer is open or the tab is
      hidden. The first load above stays unconditional so the dashboard is never blank. */
   setInterval(() => {
-    if (currentView === "settings" || document.hidden) return;
+    if (pollPaused()) return;
     refresh();
     refreshPrinter();
   }, 4000);
