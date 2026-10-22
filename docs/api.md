@@ -72,6 +72,11 @@ A pairing is a complete statement about a printer, not a patch: a slot the body 
 on disk (`main.py:997`). `output_name` rules: no path separators, not a Windows reserved device name,
 at most 60 characters, `[A-Za-z0-9 ._-]` only (`_validated_output_name`, `main.py:891`).
 
+A job object (`GET /api/jobs`, `GET /api/jobs/{jid}` and the SSE stream) also carries the slicing
+decisions: `auto_orient`, `auto_orient_used` (true when orient actually ran, e.g. because a shrink
+forced it), `shrink_to_fit`, `fit_scale` (`1.0` when nothing was scaled, `null` when the model could
+not be measured), plus `model_size` and `bed_limits` as `{x,y,z}` spans in millimetres.
+
 ## Presets
 
 Two states, different behaviour. **A** = `develop` @ `dc92ca1` (this worktree). **B** = the uncommitted
@@ -84,7 +89,7 @@ Full pipeline: [presets.md](presets.md).
 | GET | `/api/profiles` | selectable presets; `?machine=<rel>` narrows `process` | 200 (an unknown/wrong-typed `machine` is ignored) | 200, same rule; empty lists on a fresh install |
 | POST | `/api/profile/upload` | import `.orca_printer` / `.zip` / `.json` | 200 `{imported:[{type,name,label,file,path,rebased_on}],notes,ok}` · 400 unreadable bundle · 413 > 20 MB · **500** when no machine preset resolves | 200 `{…,"registered":true}` · 400 unreadable bundle **or name collision** · 413 > 20 MB |
 | POST | `/api/profile/select` | choose the active presets | 200 · 400 not-a-preset / `nothing to select` / not permitted · **500** when no machine resolves | 200 · 400 same · **409 `no_printer_profile`** |
-| POST | `/api/profile/options` | set `supports` / `brim` / `hide_profiles` | 200 · 400 `options must be an object` / `unknown option: <key>` / `<key> must be true or false` / `nothing to update` | identical |
+| POST | `/api/profile/options` | set `supports` / `brim` / `hide_profiles` / `auto_orient` / `shrink_to_fit` | 200 · 400 `options must be an object` / `unknown option: <key>` / `<key> must be true or false` / `nothing to update` | identical |
 
 `POST /api/upload` differs the same way: A answers **500** when no machine preset resolves (the raise
 happens inside `profile_snapshot()`, after the job dir exists — the `BaseException` handler removes it);

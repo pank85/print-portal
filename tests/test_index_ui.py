@@ -57,8 +57,9 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
     """The printer and the things you change about it are one card.
 
     Order inside the Printer card is the tab order (DOM order drives it): machine → process →
-    filament → supports → brim → upload → notes. The old Profile card keeps the read-only summary
-    only; it is now the last card of the `.cards` cluster, below the upload card.
+    filament → supports → brim → auto-orient → shrink to fit → upload → notes. The old Profile
+    card keeps the read-only summary only; it is now the last card of the `.cards` cluster, below
+    the upload card.
     """
     printer = page.index('id="printerCardTitle"')
     profile = page.index('id="profCardTitle"')
@@ -73,6 +74,9 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
         'id="profOptions"',
         'id="optSupports"',
         'id="optBrim"',
+        'id="optAutoOrient"',
+        'id="optShrinkFit"',
+        'id="fitHint"',
         'for="profFile"',
         'id="profFile"',
         'id="profNotes"',
@@ -109,13 +113,16 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
     for elem in ("printerCardTitle", "printerInfo", "progTrack", "progBar", "printerFile",
                  "profileGroupTitle", "profCardTitle", "profSource", "profInfo", "profWarning",
                  "profCompat", "profileSelectors", "selMachine", "selProcess", "selFilament",
-                 "profOptions", "optSupports", "optBrim", "profFile", "profNotes"):
+                 "profOptions", "optSupports", "optBrim", "optAutoOrient", "optShrinkFit",
+                 "fitHint", "profFile", "profNotes"):
         assert page.count(f'id="{elem}"') == 1, elem
 
     # Settings keeps only the visibility toggle, under the renamed heading
     assert 'id="optHideProfiles"' in page[settings:]
     assert 'id="optSupports"' not in page[settings:]
     assert 'id="optBrim"' not in page[settings:]
+    assert 'id="optAutoOrient"' not in page[settings:]
+    assert 'id="optShrinkFit"' not in page[settings:]
     assert '<h2 id="optionsTitle">Interface</h2>' in page
 
 
@@ -172,6 +179,57 @@ def test_blur_does_not_resubmit_the_same_selection(page):
         body = function_body(page, name)
         assert "saveProfile" not in body, name
     assert ".innerHTML = (rows || []).map(" in page
+
+
+def test_fit_options_reach_the_options_endpoint_and_a_real_scale_shows_in_the_row(page):
+    """Auto-orient and shrink to fit are stored like supports/brim, and the row only shows a real scale.
+
+    ``auto_orient`` is on by default, so the reader has to be ``!== false``: ``!!`` would read a
+    profile written before the option existed as *off*, the opposite of the server's default.
+    The job row is the one place a factor is surfaced, and it must stay quiet for ``1.0``,
+    ``null`` and a job saved before the field existed — hence the guard, not just the markup.
+    """
+    assert "let profileOptions = {supports:false, brim:true, hide_profiles:false, auto_orient:true, shrink_to_fit:false};" in page
+
+    apply = function_body(page, "applyProfileOptions")
+    assert "opts.auto_orient !== false" in apply
+    assert "!!opts.shrink_to_fit" in apply
+    assert '$("#optAutoOrient").value = orient ? "yes" : "no";' in apply
+    assert '$("#optShrinkFit").value = shrink ? "yes" : "no";' in apply
+    # both keys survive into the in-memory options the error path restores from
+    assert "auto_orient: orient, shrink_to_fit: shrink" in apply
+
+    for sel, key in (("#optAutoOrient", "auto_orient"), ("#optShrinkFit", "shrink_to_fit")):
+        assert (f'$("{sel}").addEventListener("change", '
+                f'ev => saveOption("{key}", ev.target.value === "yes"));') in page, key
+
+    # the hint is one muted paragraph inside the options grid, after both selects
+    options = slice_between(page, 'id="profOptions"', 'class="acts"')
+    assert '<p class="hint" id="fitHint">' in options
+    assert options.index('id="optAutoOrient"') < options.index('id="fitHint"')
+    assert options.index('id="optShrinkFit"') < options.index('id="fitHint"')
+
+    row = function_body(page, "refresh")
+    assert 'typeof j.fit_scale === "number" && j.fit_scale < 1' in row
+    assert "Math.round(j.fit_scale * 100)" in row
+    stats = slice_between(row, 'class="job-stats"', "</div>")
+    assert "scaled <b>${scaled}%</b> to fit" in stats
+    assert re.search(r'\$\{\s*scaled === null \? "" :', stats)   # no span at all unless it scaled
+
+
+def test_only_supports_and_brim_claim_the_preset_was_updated(page):
+    """The status line and the card refresh follow the same rule: only preset-backed switches.
+
+    ``auto_orient`` and ``shrink_to_fit`` are slicer arguments, not preset fields, so saving
+    them must not claim a preset update nor trigger a profile reload.
+    """
+    assert 'const PRESET_OPTIONS = new Set(["supports", "brim"]);' in page
+
+    save = function_body(page, "saveOption")
+    assert ('key === "hide_profiles" ? "" : (PRESET_OPTIONS.has(key) ? "Process preset updated" : "Saved")'
+            in save)
+    assert 'if (key !== "hide_profiles" && PRESET_OPTIONS.has(key)) await loadProfile();' in save
+    assert save.count("await loadProfile()") == 1
 
 
 # ---------------------------------------------------------------- machine/process pairing

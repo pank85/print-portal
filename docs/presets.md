@@ -216,7 +216,9 @@ trailing `*` dropped, `@printer` suffix split off).
 
 ## 4. Derived options preset — identical in both states
 
-`supports`, `brim`, `hide_profiles` (`OPTION_KEYS`, `profiles.py:46`) stay out of the selected preset.
+`supports`, `brim`, `hide_profiles`, `auto_orient` and `shrink_to_fit` (`OPTION_KEYS`, `profiles.py:46`)
+stay out of the selected preset. The first three are written into this derived preset; the two
+switches are not — they reach the slicer only as argv, `--orient 1` and `--scale k`.
 `write_derived_process` (`profiles.py:448`) writes a copy to
 `system/Custom/process/print-portal-options.json` named `"<preset> (portal options)"`, `from: "system"`:
 
