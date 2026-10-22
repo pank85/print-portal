@@ -123,7 +123,7 @@ ul{ padding:0; list-style:none; }
 main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4) var(--space-8); }
 .view{ display:grid; gap:var(--space-4); }
 .view[hidden]{ display:none; }
-.cards{ display:grid; grid-template-columns:1fr; gap:var(--space-4); }
+.cards{ display:grid; grid-template-columns:1fr; gap:var(--space-4); align-items:start; }
 @media (min-width:900px){ .cards{ grid-template-columns:repeat(2,minmax(0,1fr)); } }
 .card{
   display:grid; align-content:start; gap:var(--space-3);
@@ -133,6 +133,14 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
 }
 .card > h2{ display:flex; align-items:center; gap:var(--space-2); }
 .card > h2 .pill{ margin-left:auto; }
+.card > .subgroup{
+  display:grid; align-content:start; gap:var(--space-3);
+  border-top:1px solid var(--color-border); padding-top:var(--space-3);
+}
+.card > .subgroup > h3{
+  font-size:var(--text-sm); font-weight:600; letter-spacing:.04em;
+  text-transform:uppercase; color:var(--color-muted-foreground);
+}
 .section-head{ display:flex; align-items:center; justify-content:space-between; gap:var(--space-3); flex-wrap:wrap; }
 .section-head h2{ display:flex; align-items:center; gap:var(--space-2); }
 .count{
@@ -330,6 +338,48 @@ select{ appearance:none; background-image:none; margin:0; }
         <div class="bar" id="progTrack" role="progressbar" aria-label="Print progress"
              aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><i id="progBar"></i></div>
         <p class="meta mono" id="printerFile"></p>
+        <div class="subgroup" role="group" aria-labelledby="profileGroupTitle">
+          <h3 id="profileGroupTitle">Profile</h3>
+          <div id="profileSelectors">
+            <div class="field">
+              <label for="selMachine">Machine</label>
+              <select id="selMachine"></select>
+            </div>
+            <div class="field">
+              <label for="selProcess">Process</label>
+              <select id="selProcess"></select>
+            </div>
+            <div class="field">
+              <label for="selFilament">Filament</label>
+              <select id="selFilament"></select>
+            </div>
+          </div>
+          <div id="profOptions">
+            <div class="field">
+              <label for="optSupports">Supports</label>
+              <select id="optSupports">
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="optBrim">Brim</label>
+              <select id="optBrim">
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+              </select>
+            </div>
+          </div>
+          <div class="acts">
+            <label class="btn" for="profFile">
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
+              Upload .orca_printer
+            </label>
+            <input id="profFile" type="file" accept=".orca_printer,.json,.zip" hidden>
+          </div>
+          <div class="notes" id="profNotes"></div>
+        </div>
       </section>
 
       <section class="card" aria-labelledby="profCardTitle">
@@ -337,45 +387,6 @@ select{ appearance:none; background-image:none; margin:0; }
         <div class="kv" id="profInfo"><span>—</span><span>—</span></div>
         <p class="warning" id="profWarning" role="status" hidden></p>
         <p class="hint" id="profCompat" role="status" hidden></p>
-        <div id="profileSelectors">
-          <div class="field">
-            <label for="selMachine">Machine</label>
-            <select id="selMachine"></select>
-          </div>
-          <div class="field">
-            <label for="selProcess">Process</label>
-            <select id="selProcess"></select>
-          </div>
-          <div class="field">
-            <label for="selFilament">Filament</label>
-            <select id="selFilament"></select>
-          </div>
-        </div>
-        <div id="profOptions">
-          <div class="field">
-            <label for="optSupports">Supports</label>
-            <select id="optSupports">
-              <option value="no">No</option>
-              <option value="yes">Yes</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="optBrim">Brim</label>
-            <select id="optBrim">
-              <option value="no">No</option>
-              <option value="yes">Yes</option>
-            </select>
-          </div>
-        </div>
-        <div class="acts">
-          <label class="btn" for="profFile">
-            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
-            Upload .orca_printer
-          </label>
-          <input id="profFile" type="file" accept=".orca_printer,.json,.zip" hidden>
-        </div>
-        <div class="notes" id="profNotes"></div>
       </section>
     </div>
 

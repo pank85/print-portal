@@ -52,23 +52,86 @@ def test_profile_card_shows_supports_and_brim(page):
     assert "derived.stale" in load and "derived.error" in load
 
 
-def test_supports_and_brim_selects_live_in_the_profile_card(page):
-    card = page.index('id="profCardTitle"')
-    card_end = page.index('id="uploadTitle"')          # the next card on the dashboard
+# ---------------------------------------------------------------- printer card
+def test_profile_edit_controls_live_in_the_printer_card(page):
+    """The printer and the things you change about it are one card.
+
+    Order inside the Printer card is the tab order (DOM order drives it): machine → process →
+    filament → supports → brim → upload → notes. The old Profile card keeps the read-only summary
+    only; task 3 repositions that card, it is not deleted here.
+    """
+    printer = page.index('id="printerCardTitle"')
+    profile = page.index('id="profCardTitle"')
+    next_card = page.index('id="uploadTitle"')         # the card below .cards
     settings = page.index('id="viewSettings"')
 
-    supports = page.index('id="optSupports"')
-    brim = page.index('id="optBrim"')
-    assert card < supports < brim < card_end, "the two option selects must sit in the profile card"
-    assert page.count('id="optSupports"') == 1
-    assert page.count('id="optBrim"') == 1
-    assert page.index('id="profileSelectors"') < supports
+    order = [
+        'id="printerInfo"',
+        'id="profileSelectors"',
+        'id="selMachine"',
+        'id="selProcess"',
+        'id="selFilament"',
+        'id="profOptions"',
+        'id="optSupports"',
+        'id="optBrim"',
+        'for="profFile"',
+        'id="profFile"',
+        'id="profNotes"',
+    ]
+    marks = [page.index(needle) for needle in order]
+    assert printer < min(marks), "the edit controls belong to the Printer card"
+    assert marks == sorted(marks), f"wrong control order inside the Printer card: {order}"
+    assert max(marks) < profile, "the Profile card is the read-only summary only"
+
+    # containment, not just order — two regressions the order list above cannot see:
+    # (a) #profOptions nested inside #profileSelectors would make hide_profiles start hiding
+    #     Supports/Brim, so the selectors wrapper must open and close before the options open
+    seg = page[page.index('id="profileSelectors"'):page.index('id="profOptions"')]
+    assert seg.count("<div") == seg.count("</div>")   # selectors wrapper closed before options open
+    # (b) .subgroup nested deeper than a direct child of the Printer <section> would silently
+    #     kill the `.card > .subgroup` rule at app/index.html:136
+    between = page[page.index('id="printerFile"'):page.index('<div id="profileSelectors"')]
+    assert between.count("<div") == 1 and "</div>" not in between   # .subgroup is the card's direct child
+
+    # the group is one heading level down from the card titles, and it names its group
+    assert '<h3 id="profileGroupTitle">Profile</h3>' in page
+    assert 'role="group" aria-labelledby="profileGroupTitle"' in page
+
+    # what the Profile card kept, and what it must no longer contain
+    summary = page[profile:next_card]
+    for kept in ('id="profSource"', 'id="profInfo"', 'id="profWarning"', 'id="profCompat"'):
+        assert kept in summary, kept
+    for moved in ('id="profileSelectors"', 'id="profOptions"', 'id="profFile"', 'id="profNotes"'):
+        assert moved not in summary, moved
+
+    # a moved node must not be duplicated: every id still resolves exactly once
+    for elem in ("printerCardTitle", "printerInfo", "progTrack", "progBar", "printerFile",
+                 "profileGroupTitle", "profCardTitle", "profSource", "profInfo", "profWarning",
+                 "profCompat", "profileSelectors", "selMachine", "selProcess", "selFilament",
+                 "profOptions", "optSupports", "optBrim", "profFile", "profNotes"):
+        assert page.count(f'id="{elem}"') == 1, elem
 
     # Settings keeps only the visibility toggle, under the renamed heading
     assert 'id="optHideProfiles"' in page[settings:]
     assert 'id="optSupports"' not in page[settings:]
     assert 'id="optBrim"' not in page[settings:]
     assert '<h2 id="optionsTitle">Interface</h2>' in page
+
+
+def test_hide_profiles_still_hides_only_the_selectors(page):
+    """`hide_profiles` gates the three selects — never the options or the upload control.
+
+    The group moved inside the Printer card, so the guard is pinned to the one id it always
+    named: hiding `#profOptions` or the upload button would take Supports/Brim away on a
+    setting that never meant to.
+    """
+    body = function_body(page, "applyProfileVisibility")
+    assert '$("#profileSelectors")' in body
+    assert body.count(".hidden") == 1
+    for untouched in ("#profOptions", "#profFile", "#profNotes", "#optSupports", "#optBrim"):
+        assert untouched not in body, untouched
+    # the id-level display:grid still needs its [hidden] guard, and only that one
+    assert "#profileSelectors[hidden]{ display:none; }" in page
 
 
 def test_enable_button_and_its_wording_are_gone(page):
