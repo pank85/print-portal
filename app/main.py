@@ -10,7 +10,7 @@ Endpoints
     GET    /api/printer          live printer snapshot of the selected printer
     GET    /api/printers         configured printers (masked keys) + selection
     POST   /api/printers         add a printer
-    PATCH  /api/printers/{id}    change name/url/api_key
+    PATCH  /api/printers/{id}    change name/url/api_key/pairing (env: pairing only)
     DELETE /api/printers/{id}    remove a printer
     POST   /api/printers/{id}/select  make it the active printer
     POST   /api/printers/{id}/test    reachability probe (never raises)
@@ -119,7 +119,12 @@ def current_client() -> moonraker.MoonrakerClient:
 
 
 def printer_call(callback, *args, **kwargs):
-    """Run one store operation, mapping its errors onto the documented HTTP codes."""
+    """Run one store-backed operation, mapping its errors onto the documented HTTP codes.
+
+    Used for endpoint bodies too, so a domain error raised under an endpoint (a read-only
+    row, a missing printer) gets the same status code as the same error raised by a store
+    call: one condition, one code.
+    """
     try:
         return callback(*args, **kwargs)
     except printers.PrinterNotFound as exc:
@@ -140,14 +145,19 @@ def printer_view(printer_id: str) -> dict:
     raise HTTPException(404, f"printer {printer_id!r} not found")
 
 
-def select_printer(printer_id: str) -> None:
-    """Persist the selection; the env id only exists while an env seed is configured.
+def require_env_printer(printer_id: str) -> None:
+    """The env id only exists while an env seed is configured.
 
-    Without the seed there is no ``env`` row to select, and persisting it would leave a
-    selection that resolves to no printer at all.
+    Without the seed there is no ``env`` row, so selecting it or pairing it would address
+    a printer that resolves to nothing at all.
     """
     if printer_id == printers.ENV_PRINTER_ID and SEED is None:
         raise printers.PrinterNotFound(f"printer {printer_id!r} not found")
+
+
+def select_printer(printer_id: str) -> None:
+    """Persist the selection."""
+    require_env_printer(printer_id)
     STORE.select(printer_id)
 
 
@@ -245,6 +255,34 @@ def _paired_process(machine: dict | None, process: dict | None,
     return None
 
 
+def _reject_unpermitted_pair(chosen: dict[str, str], merged: dict[str, str], *,
+                             status: int = 400) -> None:
+    """Refuse a selection whose machine/process pair the datadir says the slicer refuses.
+
+    The pair checked is the one ``merged`` is about to hold, not just the slots the body
+    names: a machine-only select drags the stored process along and a process-only select
+    lands under the stored machine, and either can store a combination the slicer answers
+    with ``-17``.
+
+    A filament-only pick is never refused, and a machine row that is missing or unreadable
+    is a broken datadir — `GET /api/profile` reports it — rather than a selection error.
+    The guard runs before anything is written, so a refusal leaves ``profile.json``, the
+    stored pairing and the derived preset exactly as they were.
+
+    :raises HTTPException: ``status`` (400 by default, 409 from the printer endpoints)
+        when ``merged``'s machine/process pair is not permitted.
+    """
+    if "machine" not in chosen and "process" not in chosen:
+        return
+    machine_row = _preset_row("machine", merged.get("machine"))
+    if not isinstance(machine_row, dict) or machine_row.get("error"):
+        return
+    if _permits(machine_row, _preset_row("process", merged.get("process"))):
+        return
+    raise HTTPException(status, f"process '{merged.get('process')}' is not permitted by "
+                                f"machine '{merged.get('machine')}'")
+
+
 def pairing_from_body(raw: object) -> dict[str, str | None]:
     """The ``{slot: rel}`` pairing in a request body, checked against the datadir.
 
@@ -295,15 +333,16 @@ def write_profile_file(data: dict) -> None:
     prof.write_json_atomic(CONFIG.profile_file, data)
 
 
-def apply_pairing(view: dict) -> dict | None:
-    """Copy one printer's pairing onto the global profile selection.
+def resolve_pairing(profiles: object) -> dict | None:
+    """The profile document a pairing resolves to, refused if the datadir forbids the pair.
 
-    A printer without a pairing inherits whatever profile.json already holds, so the file
-    is left untouched — byte-identical — rather than rewritten with the values it happens
-    to have. That keeps "this printer's own presets" and "the global selection" two
-    distinct states the operator can switch between.
+    ``None`` means "inherit": the pairing names no slot, so ``profile.json`` is left alone.
+    Returns the document *ready to write*, so every caller can refuse (409
+    ``_reject_unpermitted_pair``) before it persists anything — the row, the env pairing or
+    the file itself.
+
+    :raises HTTPException: 409 when the merged machine/process pair is not permitted.
     """
-    profiles = view.get("profiles")
     if not isinstance(profiles, dict):
         return None
     chosen = {slot: profiles.get(slot) for slot in printers.PROFILE_SLOTS
@@ -313,35 +352,89 @@ def apply_pairing(view: dict) -> dict | None:
     merged = {k: relative_to_datadir(v) for k, v in active_paths().items()}
     merged.update(profile_labels())
     merged.update(chosen)
+    _reject_unpermitted_pair(chosen, merged, status=409)
     machine = _preset_path(chosen.get("machine"))
     if machine is not None:
         merged["machine_label"] = prof.summarise(machine, "machine", CONFIG.orca_datadir)["name"]
+    return merged
+
+
+def apply_pairing(view: dict) -> dict | None:
+    """Copy one printer's pairing onto the global profile selection.
+
+    A printer without a pairing inherits whatever profile.json already holds, so the file
+    is left untouched — byte-identical — rather than rewritten with the values it happens
+    to have. That keeps "this printer's own presets" and "the global selection" two
+    distinct states the operator can switch between. The pair is resolved (and refused) by
+    ``resolve_pairing``, the rule the printer routes also use before they persist a row.
+    """
+    merged = resolve_pairing(view.get("profiles"))
+    if merged is None:
+        return None
     write_profile_file(merged)
     return merged
+
+
+def apply_pairing_to_active(printer_id: str) -> None:
+    """Re-apply an edited pairing when it belongs to the printer requests already use.
+
+    Selecting a printer copies its pairing onto ``profile.json``; editing that printer's
+    pairing in place has to reach the same file, or the saved setting and the presets the
+    slicer loads drift apart. Any other printer keeps the global selection untouched.
+
+    Never fails the caller for a write that landed: every caller has already persisted the
+    row, so an error here would answer 409/500 and a retry would duplicate it. Exactly two
+    states are absorbed — a stored key that no longer decrypts with this ``secret.key``
+    (``STORE.active`` raises ``PrinterStoreError``) and a read-only datadir
+    (``write_profile_file`` raises ``OSError``). The pairing is stored either way, and the
+    next select of that printer applies it; the select path calls ``apply_pairing`` itself
+    and keeps raising.
+
+    ``printer_view``'s 404 (an empty or corrupt row set) and ``ProfileError`` (a machine
+    slot this datadir cannot resolve) stay reachable: they also fail `GET /api/profile`,
+    so hiding them here would make a broken deployment look healthy.
+    """
+    try:
+        target = STORE.active(SEED)
+    except printers.PrinterStoreError:
+        return
+    if target is not None and target.id == printer_id:
+        try:
+            apply_pairing(printer_view(printer_id))
+        except OSError:
+            return
 
 
 def write_pairing_back(chosen: dict[str, str]) -> None:
     """Record a dashboard selection on the printer it now applies to.
 
     The pairing belongs to the printer, so a selection made on the dashboard has to reach
-    the selected printer or the two views of "the active profile" drift apart. Only the
-    slots that were chosen are touched, and the env seed is skipped: it is read-only and
-    has no store record to write.
+    the selected printer or the two views of "the active profile" drift apart: the stored
+    pairing would keep saying one thing while ``profile.json`` says another, and the next
+    save of that printer's pairing would revert the selection just made. Only the slots
+    that were chosen are touched. The env seed has no printer record, so its pairing is
+    merged into ``env_profiles`` — the one field of that row the operator owns.
     """
     slots = {slot: chosen[slot] for slot in printers.PROFILE_SLOTS if chosen.get(slot)}
     if not slots:
         return
     try:
         target = STORE.active(SEED)
-        if target is None or target.source != "store":
+        if target is None:
+            return
+        if target.source == "env":
+            STORE.merge_env_pairing(slots)
             return
         stored = STORE.get(target.id)
         pairing = {slot: (stored.profiles or {}).get(slot)
                    for slot in printers.PROFILE_SLOTS}
         pairing.update(slots)
         STORE.update(target.id, profiles=pairing)
-    except (printers.PrinterError, printers.PrinterStoreError):
-        return      # a selection that cannot be written back must still succeed
+    except (printers.PrinterError, printers.PrinterStoreError, OSError):
+        # A selection that cannot be written back must still succeed: the store is
+        # best-effort here, and on some deployments printers.json is not writable even
+        # while profile.json is (that write already happened).
+        return
 
 
 def regenerate_derived(document: dict) -> None:
@@ -643,20 +736,51 @@ def api_printers():
 @app.post("/api/printers", status_code=201)
 def api_add_printer(body: dict):
     profiles = pairing_from_body(body.get("profiles")) if "profiles" in body else None
+    resolve_pairing(profiles)  # before the row exists: a refused pair must add no printer
     printer = printer_call(STORE.add, body.get("name"), body.get("url"), body.get("api_key"),
                            profiles=profiles)
+    # ``add`` makes the first printer of an empty store the selection, so this row may have
+    # just become the active one; its pairing then has to reach profile.json the way an
+    # edit of the active printer's pairing does. ``apply_pairing_to_active`` is the one
+    # resolution rule and leaves any other printer's global selection untouched.
+    apply_pairing_to_active(printer.id)
     return {"printer": printer_view(printer.id), "printers": STORE.views(SEED),
             "selected_id": STORE.selected_id()}
 
 
+def patch_env_printer(body: dict) -> dict:
+    """Pair the env seed — the one part of that row the operator owns.
+
+    Its name, URL and API key stay deployment-owned, so a body carrying any of them is the
+    same read-only refusal that deleting the row gets: one condition, one status code
+    (``printer_call`` maps ``PrinterReadOnly`` onto 409).
+    """
+    require_env_printer(printers.ENV_PRINTER_ID)
+    if any(field in body for field in ("name", "url", "api_key")):
+        raise printers.PrinterReadOnly(printers.READ_ONLY_ERROR)
+    if "profiles" not in body:
+        raise printers.PrinterError("nothing to update")
+    pairing = pairing_from_body(body["profiles"])
+    resolve_pairing(pairing)  # refused before the env pairing is stored
+    STORE.set_env_pairing(pairing)
+    apply_pairing_to_active(printers.ENV_PRINTER_ID)
+    return {"printer": printer_view(printers.ENV_PRINTER_ID),
+            "printers": STORE.views(SEED), "selected_id": STORE.selected_id()}
+
+
 @app.patch("/api/printers/{pid}")
 def api_update_printer(pid: str, body: dict):
+    if pid == printers.ENV_PRINTER_ID:
+        return printer_call(patch_env_printer, body)
     fields = {"name": body.get("name"), "url": body.get("url"),
               "api_key": body.get("api_key")}
     if "profiles" in body:
         # an omitted `profiles` keeps the stored pairing; a supplied one replaces it
         fields["profiles"] = pairing_from_body(body["profiles"])
+        resolve_pairing(fields["profiles"])  # merged onto profile.json + the body's slots, refused before the row
     printer = printer_call(STORE.update, pid, **fields)
+    if "profiles" in body:
+        apply_pairing_to_active(printer.id)
     return {"printer": printer_view(printer.id), "printers": STORE.views(SEED),
             "selected_id": STORE.selected_id()}
 
@@ -669,8 +793,10 @@ def api_delete_printer(pid: str):
 
 @app.post("/api/printers/{pid}/select")
 def api_select_printer(pid: str):
+    view = printer_view(pid)
+    resolve_pairing(view.get("profiles"))  # refused before the selection moves
     printer_call(select_printer, pid)
-    apply_pairing(printer_view(pid))
+    apply_pairing(view)
     return {"selected_id": STORE.selected_id(), "printers": STORE.views(SEED)}
 
 
@@ -1054,6 +1180,9 @@ def api_profile_select(body: dict):
     merged = {k: relative_to_datadir(v) for k, v in active_paths().items()}
     merged.update(profile_labels())
     merged.update(chosen)
+    # before `write_profile_file`, so a refused pair leaves profile.json, the stored pairing
+    # and the derived preset exactly as they were
+    _reject_unpermitted_pair(chosen, merged)
     write_profile_file(merged)
     write_pairing_back(chosen)
     regenerate_derived(merged)

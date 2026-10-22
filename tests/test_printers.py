@@ -332,13 +332,15 @@ def test_views_mask_keys_and_hide_the_token(store: printers.PrinterStore) -> Non
     assert len(views) == 2
     stored, env = views
     assert set(stored) == {"id", "name", "url", "api_key_masked", "has_api_key", "selected",
-                           "source", "editable", "profiles", "created", "updated"}
+                           "source", "editable", "pairing_editable", "profiles", "created",
+                           "updated"}
     assert stored["id"] == printer.id
     assert stored["api_key_masked"] == printers.MASK + "cdef"
     assert stored["has_api_key"] is True
     assert stored["selected"] is True
     assert stored["source"] == "store"
     assert stored["editable"] is True
+    assert stored["pairing_editable"] is True
     assert stored["created"] == printer.created
 
     assert set(env) == set(stored)
@@ -594,6 +596,9 @@ def test_view_exposes_the_pairing(store: printers.PrinterStore) -> None:
 
     assert stored_view["profiles"] == {"machine": None, "process": None}
     assert env_view["profiles"] == {"machine": None, "process": None}
+    assert stored_view["pairing_editable"] is True
+    assert env_view["pairing_editable"] is True      # the env pairing is a preference
+    assert env_view["editable"] is False             # its credentials are not
 
     store.update(printer.id, profiles=PAIRING)
     stored_view, env_view = store.views(SEED)
@@ -604,3 +609,39 @@ def test_view_exposes_the_pairing(store: printers.PrinterStore) -> None:
 
     with pytest.raises(printers.PrinterReadOnly):
         store.update(printers.ENV_PRINTER_ID, profiles=PAIRING)
+
+
+def test_env_pairing_is_stored_outside_the_printer_records(
+        store: printers.PrinterStore) -> None:
+    """The env seed has no record of its own: its pairing lives in ``env_profiles``."""
+    assert store.set_env_pairing(PAIRING) == {"machine": MACHINE_REL,
+                                              "process": PROCESS_REL}
+
+    data = stored_json(store)
+    assert data["env_profiles"] == PAIRING
+    assert data["printers"] == []
+    assert store.views(SEED)[-1]["profiles"] == PAIRING
+
+    reloaded = printers.PrinterStore.open(store.path)
+    assert reloaded.views(SEED)[-1]["profiles"] == PAIRING
+
+    assert store.set_env_pairing({"machine": None, "process": None}) == {
+        "machine": None, "process": None}
+    assert stored_json(store)["env_profiles"] is None
+
+    with pytest.raises(printers.PrinterError, match=printers.PROFILE_PATH_ERROR):
+        store.set_env_pairing({"machine": "../outside.json"})
+    assert stored_json(store)["env_profiles"] is None   # a rejected pairing writes nothing
+
+
+def test_malformed_env_profiles_reads_as_no_pairing(store: printers.PrinterStore) -> None:
+    """One unusable preference must not blank the store or block every write."""
+    document = {"version": printers.PRINTERS_VERSION, "selected_id": None,
+                "printers": [], "env_profiles": {"machine": 5}}
+    store.path.write_text(json.dumps(document), encoding="utf-8")
+
+    store.reload()
+
+    assert store.corrupt is None
+    assert store.views(SEED)[-1]["profiles"] == {"machine": None, "process": None}
+    assert store.all() == []

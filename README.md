@@ -46,7 +46,8 @@ and network reachability; it does not need OrcaSlicer, Python or any shared moun
   [docs/printer-setup.md](docs/printer-setup.md)).
 - **An OrcaSlicer preset** — a machine preset, a process preset and a filament preset. The image
   ships a neutral generic set; you can also import your own `.orca_printer` bundle or single
-  preset `.json` through `POST /api/profile/upload`.
+  preset `.json` through `POST /api/profile/upload`. Where presets live on each platform, and how to
+  export a `.orca_printer` from the desktop app: [docs/orcaslicer-presets.md](docs/orcaslicer-presets.md).
 - **Docker** with the Compose plugin, Docker Compose **≥ 2.24** — `docker-compose.yml` uses the
   optional `env_file: {path: .env, required: false}` form, which older Compose releases reject.
 
@@ -139,7 +140,7 @@ is a secret — treat it like a password.
 | POST | `/api/profile/options` | set supports/brim (regenerates the derived process preset) and `hide_profiles` |
 | GET | `/api/printers` | list configured printers, including their `profiles` pairing |
 | POST | `/api/printers` | add a printer, optionally with a machine/process pairing |
-| PATCH | `/api/printers/{id}` | update a printer, including its pairing |
+| PATCH | `/api/printers/{id}` | update a printer, including its pairing; the `env` row accepts only `profiles`, answering `409` when `name`/`url`/`api_key` are supplied, `404` when no environment printer is configured, and `400` (`nothing to update`) when the body carries neither `profiles` nor one of those fields |
 | DELETE | `/api/printers/{id}` | remove a printer |
 | POST | `/api/printers/{id}/select` | select active printer and apply its pairing to the active profile |
 | POST | `/api/printers/{id}/test` | test printer connection |
@@ -317,14 +318,21 @@ configured.
 `profiles: {"machine": <rel>, "process": <rel>}` pairing of datadir-relative preset paths, set
 with `POST`/`PATCH /api/printers` or the machine/process selects in the Settings printer form. An
 absent pairing, or a `null` slot inside one, means that printer inherits the global selection in
-`profile.json`.
+`profile.json`. The environment printer has no printer record to hold one, so its pairing lives in
+an optional top-level `env_profiles` object of the same `{"machine", "process"}` shape (same
+rules: datadir-relative `.json` paths or `null` per slot). It is written only for the environment
+printer, and a malformed value there is ignored on read — that printer falls back to the global
+selection instead of the whole file counting as corrupt.
 
 Selecting a printer (`POST /api/printers/{id}/select`) applies its pairing to `profile.json`,
-including the displayed `machine_label`. Choosing presets on the dashboard writes them back onto
-the selected printer, so the pairing and the active profile cannot drift; the environment printer
-is read-only and is never paired. The pairing is validated in two places: the store checks its
-shape, and the API checks that each path is a preset inside `ORCA_DATADIR`, answering `400` with
-`machine: '<rel>' is not a preset inside the datadir` otherwise.
+including the displayed `machine_label`. Choosing machine and process presets on the dashboard records
+them on the selected printer, so the two stay in step (best effort: a read-only `printers.json`
+loses the stored pairing, never the selection). The environment printer
+can be paired too: the `Profiles` button on its row opens the printer form with the credential
+fields disabled, and only its name, URL and API key stay owned by the environment. The pairing is
+validated in two places: the store checks its shape, and the API checks that each path is a preset
+inside `ORCA_DATADIR`, answering `400` with `machine: '<rel>' is not a preset inside the datadir`
+otherwise.
 
 A version 1 file still loads: reads never rewrite it, and the next change writes the document as
 version 2.
