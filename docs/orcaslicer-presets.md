@@ -59,8 +59,9 @@ standard location).
 
 ## This container
 
-The headless datadir is Bambu/Orca "system JSON" style, so system presets live under `system/`, not
-`user/`:
+The datadir layout is the same either way; what the seed ships, and what import does, is not. Two
+states: **A** = `develop` @ `dc92ca1` (this worktree), **B** = the uncommitted
+`ergo/20261022T123034Z-import-name` branch.
 
 ```text
 $ORCA_DATADIR/system/<Vendor>/machine|process|filament   writable copy (default $DATA_DIR/orca-datadir)
@@ -80,6 +81,11 @@ Imported presets land in `$ORCA_DATADIR/system/Custom/{machine,process,filament}
 own names and are registered in `system/Custom.json`. On container start `docker/entrypoint.sh`
 re-seeds `/opt/orca-datadir` into `$ORCA_DATADIR` whenever the `.seed-version` marker does not match
 `SEED_VERSION` (`2.4.2-2` in the `Dockerfile`).
+
+A machine preset only has to carry `"from": "system"`; its *name* is not policed.
+
+The pipeline itself — normalisation, registration, the derived options preset and the `-17` rule — is in
+[presets.md](presets.md).
 
 ## Gotchas
 
