@@ -247,8 +247,11 @@ main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4
 
 /* ---------- form controls ---------- */
 .field{ display:grid; gap:6px; min-width:0; }
+/* a `.field` is display:grid, so a bare `hidden` attribute loses to that rule. `hide_profiles`
+   drops individual pickers now (Machine and Process only), so this is the rule that takes one
+   off the page for real — and, with it, out of the tab order and out of the a11y tree. */
+.field[hidden]{ display:none; }
 #profileSelectors{ display:grid; gap:var(--space-3); min-width:0; }
-#profileSelectors[hidden]{ display:none; }
 #profOptions{ display:grid; gap:var(--space-3); grid-template-columns:repeat(2,minmax(0,1fr)); }
 #profOptions > .hint{ grid-column:1 / -1; }   /* the hint explains both selects, so it spans the row */
 label{ font-size:var(--text-sm); font-weight:500; color:var(--color-muted-foreground); }
@@ -438,15 +441,15 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
         <div class="subgroup" role="group" aria-labelledby="profileGroupTitle">
           <h3 id="profileGroupTitle">Profile</h3>
           <div id="profileSelectors">
-            <div class="field">
+            <div class="field" id="fieldMachine">
               <label for="selMachine">Machine</label>
               <select id="selMachine"></select>
             </div>
-            <div class="field">
+            <div class="field" id="fieldProcess">
               <label for="selProcess">Process</label>
               <select id="selProcess"></select>
             </div>
-            <div class="field">
+            <div class="field" id="fieldFilament">
               <label for="selFilament">Filament</label>
               <select id="selFilament"></select>
             </div>
@@ -576,7 +579,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     <section class="card" aria-labelledby="optionsTitle">
       <h2 id="optionsTitle">Interface</h2>
       <div class="field">
-        <label><input type="checkbox" id="optHideProfiles"> Hide profile selectors</label>
+        <label><input type="checkbox" id="optHideProfiles"> Hide the machine and process pickers</label>
       </div>
       <p class="hint" id="optionsStatus" role="status" aria-live="polite"></p>
     </section>
@@ -784,8 +787,14 @@ const STALE_DERIVED = "Generated process preset is stale: save the options again
 const PRESET_OPTIONS = new Set(["supports", "brim"]);
 
 function applyProfileVisibility(hide) {
-  const el = $("#profileSelectors");
-  if (el) el.hidden = !!hide;
+  /* Machine and Process only. Filament is deliberately not in this list: a slice still needs a
+     filament, so with the switch on that picker keeps its value, its label, its change handler
+     and its place in the tab order. Hiding the whole `#profileSelectors` wrapper is what used to
+     swallow it. Both states come from the one `el.hidden` write, so re-toggling is immediate. */
+  for (const field of ["#fieldMachine", "#fieldProcess"]) {
+    const el = $(field);
+    if (el) el.hidden = !!hide;
+  }
 }
 
 /* A preset row's display name; the rel is the fallback so a pairing the last list did not
