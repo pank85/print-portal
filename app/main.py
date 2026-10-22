@@ -230,10 +230,11 @@ def _permits(machine: dict, process: dict | None) -> bool:
     """Whether ``process`` may be sliced with ``machine`` — the preset picker's own rule.
 
     A process that is missing or unreadable counts as not permitted, so the caller falls
-    back rather than persisting a pairing the slicer would refuse with `-17`. An unreadable
-    preset reaches this function as the error row `summarise` returns — no ``rel`` to
-    persist and, with no ``compatible_printers`` either, a machine filter would call it
-    universal — so the shape is checked before the compatibility rule.
+    back rather than persisting a pairing the slicer refuses with `-17` — its process↔machine
+    compatibility check ("The selected printer is not compatible with the process preset").
+    An unreadable preset reaches this function as the error row `summarise` returns — no
+    ``rel`` to persist and, with no ``compatible_printers`` either, a machine filter would
+    call it universal — so the shape is checked before the compatibility rule.
     """
     if not isinstance(process, dict) or "rel" not in process:
         return False
@@ -262,7 +263,7 @@ def _reject_unpermitted_pair(chosen: dict[str, str], merged: dict[str, str], *,
     The pair checked is the one ``merged`` is about to hold, not just the slots the body
     names: a machine-only select drags the stored process along and a process-only select
     lands under the stored machine, and either can store a combination the slicer answers
-    with ``-17``.
+    with ``-17``, its process↔machine compatibility check.
 
     A filament-only pick is never refused, and a machine row that is missing or unreadable
     is a broken datadir — `GET /api/profile` reports it — rather than a selection error.
@@ -305,18 +306,131 @@ def read_profile_document() -> dict:
     return stored if isinstance(stored, dict) else {}
 
 
-def active_paths() -> dict[str, Path]:
-    """Which presets the slicer loads: profile.json over the shipped defaults.
+PRESET_KINDS = ("machine", "process", "filament")
 
-    The machine default comes from profiles.machine_slot() so it resolves on any datadir
-    (MACHINE_SLOT env -> datadir default -> first instantiated machine).
+
+def partial_selection() -> dict[str, Path]:
+    """The presets this datadir can load right now; any of the three kinds may be absent.
+
+    The machine comes from profiles.machine_slot() because that resolves on any datadir
+    (MACHINE_SLOT env -> datadir default -> first instantiated machine). `process` and
+    `filament` fall back to `DEFAULT_PROFILE` — the stock preset names — but only while the
+    datadir still ships those files: a fresh install ships none, so no phantom path can be
+    selected, while an upgraded datadir that still carries stock presets keeps the selection
+    it had before an import.
+
+    An unusable `MACHINE_SLOT` override degrades the selection instead of raising: a stale
+    value (the old `.env.example` example named a preset the seed no longer ships) must not
+    turn a read into a 500, so the machine kind is simply dropped. Actions still surface it
+    as the usual 409 `no_printer_profile`, because the machine is what they need.
+
+    The stored document wins over both, because it is what the operator picked: a stored
+    machine is honoured while its file exists (a deleted one is not a selection), and a
+    stored process/filament is honoured verbatim even when the file is gone, so
+    `GET /api/profile` keeps reporting the preset that went missing instead of dropping it.
     """
     datadir = CONFIG.orca_datadir
-    slot = prof.machine_slot(datadir, CONFIG.machine_slot)
-    chosen = {**prof.DEFAULT_PROFILE, "machine": relative_to_datadir(slot)}
+    chosen = dict(prof.DEFAULT_PROFILE)
+    try:
+        slot = prof.machine_slot(datadir, CONFIG.machine_slot)
+    except prof.ProfileError:
+        # a bad override is operator configuration, not an empty datadir: never a 500 here
+        slot = None
+    if slot is None:
+        # no machine resolved at all, so the stock name cannot stand in for one either
+        chosen.pop("machine", None)
+    else:
+        chosen["machine"] = relative_to_datadir(slot)
+    for kind in ("process", "filament"):
+        if not (datadir / chosen[kind]).is_file():
+            chosen.pop(kind)
     stored = read_profile_document()
-    chosen.update({k: v for k, v in stored.items() if k in chosen and v})
-    return {k: datadir / v for k, v in chosen.items()}
+    for kind in PRESET_KINDS:
+        value = stored.get(kind)
+        if not isinstance(value, str) or not value:
+            continue
+        if kind == "machine" and not (datadir / value).is_file():
+            continue
+        chosen[kind] = value
+    return {kind: datadir / rel for kind, rel in chosen.items()}
+
+
+def missing_kinds(paths: dict[str, Path]) -> list[str]:
+    """The preset kinds a selection does not have, in the order the UI shows them."""
+    return [kind for kind in PRESET_KINDS if kind not in paths]
+
+
+def active_paths() -> dict[str, Path]:
+    """The three presets the slicer loads — the selection every action and `run_slice` needs.
+
+    :raises profiles.ProfileError: the selection is incomplete; the message is the
+        `", "`-joined kinds that are missing, so a caller can say which one to import.
+    """
+    paths = partial_selection()
+    missing = missing_kinds(paths)
+    if missing:
+        raise prof.ProfileError(", ".join(missing))
+    return paths
+
+
+NO_PRINTER_HINT = ("upload an .orca_printer bundle exported from OrcaSlicer "
+                   "(File \u2192 Export \u2192 Export Preset Bundle, tick Printer, Process "
+                   "and Filament)")
+
+# what one missing kind is called in `detail.detail`; the machine keeps `NO_MACHINE_MESSAGE`
+MISSING_DETAIL = {"machine": prof.NO_MACHINE_MESSAGE,
+                  "process": "no process preset imported yet",
+                  "filament": "no filament preset imported yet"}
+
+
+def no_printer_profile(missing: list[str] | None = None) -> HTTPException:
+    """The 409 every preset-dependent **action** answers when the selection is incomplete.
+
+    `detail.error` is the machine-readable half and stays a single code (the UI branches on
+    it); `detail.missing` names the kinds, so an operator who imported a Printer-only bundle
+    is told which preset is still needed. One body for every action, one UI case.
+    Reads never get it: `api_profile` answers 200 with a partial selection.
+    """
+    kinds = list(missing or ["machine"])
+    # a missing machine is the whole story — there is nothing to select a process from yet
+    detail = (prof.NO_MACHINE_MESSAGE if "machine" in kinds
+              else ", ".join(MISSING_DETAIL[kind] for kind in kinds))
+    return HTTPException(409, {
+        "error": "no_printer_profile",
+        "detail": detail,
+        "missing": kinds,
+        "hint": NO_PRINTER_HINT,
+    })
+
+
+def require_machine() -> dict[str, Path]:
+    """`partial_selection()`, or the 409 — the machine every preset-dependent action needs.
+
+    Only the machine is required: an action that pairs a printer or switches a slot names the
+    presets it wants itself, so a missing process or filament must not refuse it. The actions
+    that would *slice* need the whole selection instead (`require_selection`).
+
+    :raises HTTPException: 409, never a 500, when no machine resolves.
+    """
+    paths = partial_selection()
+    if "machine" not in paths:
+        raise no_printer_profile(["machine"])
+    return paths
+
+
+def require_selection() -> dict[str, Path]:
+    """`active_paths()`, or the 409 above — what an action that would slice needs.
+
+    `api_upload` only: a partial selection must not reach `profile_snapshot`, which stamps the
+    job with the three presets the slicer is about to load.
+
+    :raises HTTPException: 409, never a 500, when the selection is missing a preset.
+    """
+    try:
+        return active_paths()
+    except prof.ProfileError as exc:
+        # the kinds themselves, not the exception text, are what the 409 names
+        raise no_printer_profile(missing_kinds(partial_selection())) from exc
 
 
 def profile_labels() -> dict:
@@ -349,7 +463,7 @@ def resolve_pairing(profiles: object) -> dict | None:
               if isinstance(profiles.get(slot), str) and profiles.get(slot)}
     if not chosen:
         return None
-    merged = {k: relative_to_datadir(v) for k, v in active_paths().items()}
+    merged = {k: relative_to_datadir(v) for k, v in require_machine().items()}
     merged.update(profile_labels())
     merged.update(chosen)
     _reject_unpermitted_pair(chosen, merged, status=409)
@@ -935,6 +1049,7 @@ async def api_upload(request: Request, file: UploadFile = File(...),
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED:
         raise HTTPException(400, f"unsupported file type '{suffix}' (allowed: {', '.join(sorted(ALLOWED))})")
+    require_selection()        # before the job dir exists, so a 409 leaves nothing behind
     upload_name = Path(file.filename or f"model{suffix}").name
     name = normalise_output_name(output_name, Path(upload_name).stem)
     jid = uuid.uuid4().hex[:12]
@@ -1091,20 +1206,55 @@ def api_delete(jid: str):
 # ---------------------------------------------------------------- profiles
 @app.get("/api/profile")
 def api_profile():
+    """The imported profile, or however much of it exists — always 200.
+
+    A Printer-only import leaves `process`/`filament` unselected, and a fresh install leaves
+    all three so; `imported` is the machine-readable half the UI branches on, and every
+    unselected kind reads as null rather than as a preset that does not exist.
+    """
     datadir = CONFIG.orca_datadir
-    paths = active_paths()
+    paths = partial_selection()                    # never raises; any kind may be absent
     options = profile_options()
+    imported = "machine" in paths
+    process = paths.get("process")
     return {
-        "source": "uploaded" if CONFIG.profile_file.exists() else "bundled default",
-        "machine_label": profile_labels().get("machine_label"),
-        "paths": {k: relative_to_datadir(v) for k, v in paths.items()},
-        "presets": {k: prof.summarise(v, k, datadir) for k, v in paths.items()},
+        "imported": imported,
+        "source": ("uploaded" if CONFIG.profile_file.exists() else "bundled default")
+                  if imported else "none",
+        "machine_label": profile_labels().get("machine_label") if imported else None,
+        "paths": {k: relative_to_datadir(paths[k]) if k in paths else None
+                  for k in PRESET_KINDS},
+        "presets": {k: prof.summarise(paths[k], k, datadir) if k in paths else None
+                    for k in PRESET_KINDS},
         "options": options,
         # additive: what the slicer will actually use, and whether the generated process
-        # preset still matches the options (stale/error instead of a silent wrong slice)
-        "effective": prof.effective_process(paths["process"], datadir, options),
-        "derived": prof.derived_state(paths["process"], datadir, options),
+        # preset still matches the options (stale/error instead of a silent wrong slice).
+        # Without a process preset there is nothing to derive from, so both read as null.
+        "effective": prof.effective_process(process, datadir, options)
+                     if process is not None else None,
+        "derived": prof.derived_state(process, datadir, options)
+                   if process is not None else None,
     }
+
+
+def selection_from_import(result: dict) -> dict[str, str]:
+    """The profile document to persist after an import: what that import just wrote.
+
+    A fresh install has nothing selected, and `machine_slot` would otherwise pick the first
+    machine alphabetically once a second bundle is imported, so the import names its own
+    machine — plus its first process and filament, which is what the deleted "slot defaults"
+    block used to do. `machine_label` is what the profile card shows, and it is not a preset
+    slot, so `profile_labels()` keeps it out of the selection.
+    """
+    rows = [row for row in (result.get("imported") or []) if isinstance(row, dict)]
+    first = {kind: next((row for row in rows if row.get("type") == kind), None)
+             for kind in ("machine", "process", "filament")}
+    selection = {kind: row["path"] for kind, row in first.items()
+                 if row is not None and row.get("path")}
+    machine = first["machine"]
+    if machine is not None and machine.get("label"):
+        selection["machine_label"] = machine["label"]
+    return selection
 
 
 @app.get("/api/profiles")
@@ -1124,8 +1274,14 @@ def api_profiles(machine: str | None = None):
     if target is not None and _preset_type(target) != "machine":
         target = None
     if target is not None:
-        active_rel = relative_to_datadir(active_paths()["process"])
-        active_rows = [row for row in presets["process"] if row.get("rel") == active_rel]
+        active_rows: list[dict] = []
+        # a partial selection is normal here: with no active process there is simply nothing
+        # extra to keep visible, so the picker still renders every preset that exists
+        active = partial_selection().get("process")
+        if active is not None:
+            active_rel = relative_to_datadir(active)
+            active_rows = [row for row in presets["process"]
+                           if row.get("rel") == active_rel]
         chosen = prof.summarise(target, "machine", datadir)
         presets["process"] = prof.filter_process_by_machine(presets["process"], chosen)
         # the active process stays visible even when the filter would hide it: the picker
@@ -1147,16 +1303,16 @@ async def api_profile_upload(request: Request, file: UploadFile = File(...)):
     if not name.lower().endswith(PROFILE_BUNDLE_SUFFIXES):
         raise HTTPException(400, "expected an .orca_printer bundle or a preset .json")
     try:
-        slot = prof.machine_slot(CONFIG.orca_datadir, CONFIG.machine_slot)
-        result = prof.import_into(CONFIG.orca_datadir, blob, name, slot, CONFIG.bed_size)
+        result = prof.import_into(CONFIG.orca_datadir, blob, name, CONFIG.bed_size)
     except prof.ProfileError as exc:
         raise HTTPException(400, str(exc)) from exc
     result["ok"] = bool(result["imported"])
-    machine = next((i for i in result["imported"] if i["type"] == "machine"), None)
-    if machine:
-        labels = profile_labels()
-        labels["machine_label"] = machine["label"]
-        write_profile_file(labels)
+    if result["imported"]:
+        # the import names its own presets: a fresh install has nothing selected, and the
+        # `options`/`machine_label` keys ride along untouched through the same document
+        document = read_profile_document()
+        document.update(selection_from_import(result))
+        write_profile_file(document)
     return result
 
 
@@ -1177,7 +1333,7 @@ def api_profile_select(body: dict):
             chosen[kind] = rel
     if not chosen:
         raise HTTPException(400, "nothing to select")
-    merged = {k: relative_to_datadir(v) for k, v in active_paths().items()}
+    merged = {k: relative_to_datadir(v) for k, v in require_machine().items()}
     merged.update(profile_labels())
     merged.update(chosen)
     # before `write_profile_file`, so a refused pair leaves profile.json, the stored pairing

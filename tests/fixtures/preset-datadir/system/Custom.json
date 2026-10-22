@@ -1,0 +1,18 @@
+{
+  "name": "Custom Printer",
+  "version": "02.04.00.01",
+  "force_update": "0",
+  "description": "Generic configurations",
+  "machine_model_list": [{"name": "Generic Klipper Printer", "sub_path": "machine/generic-klipper.json"}],
+  "process_list": [
+    {"name": "fdm_process_common", "sub_path": "process/fdm_process_common.json"},
+    {"name": "fdm_process_klipper_common", "sub_path": "process/fdm_process_klipper_common.json"},
+    {"name": "0.20mm Standard @Generic Klipper", "sub_path": "process/generic-0.20-standard.json"}
+  ],
+  "filament_list": [
+    {"name": "Generic PLA", "sub_path": "filament/generic-pla.json"}
+  ],
+  "machine_list": [
+    {"name": "Generic Klipper 0.4 nozzle", "sub_path": "machine/generic-klipper-0.4.json"}
+  ]
+}

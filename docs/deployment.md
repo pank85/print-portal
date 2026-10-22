@@ -72,16 +72,23 @@ Mount `./sliced:/sliced` (or set `SLICED_DIR`). Fix permissions: `chown 1000:100
 
 ## Upgrades and `SEED_VERSION`
 
-On startup the entrypoint copies the image's seed presets into `$ORCA_DATADIR` with `cp -R -n`
-(never overwriting), guarded by a `SEED_VERSION` marker file. This means:
+On startup the entrypoint copies the image's seed into `$ORCA_DATADIR` with `cp -R -n`
+(never overwriting), guarded by a `SEED_VERSION` marker file. The seed no longer carries any preset —
+just the empty vendor index `system/Custom.json` — because importing a bundle is the only way presets
+get in. This means:
 
 - **new** seed files appear after an upgrade,
 - your **edits and imports survive**,
-- but **renamed or deleted** seed presets are **not removed** — the old file stays.
+- but **renamed or deleted** seed presets are **not removed** — the old file stays,
+- an empty seed can never resurrect a preset, and
+- an **existing** deployment keeps the presets it already has: `cp -R -n` never overwrites, so this
+  seed change only reaches a new volume (or an operator who deletes the old presets).
 
 `SEED_VERSION` is a build-time value (`ENV` in the Dockerfile, overridable with `--build-arg`).
 Bump it only when you want the copy step to run again (for example, after the seed content changed).
-To remove a stale preset, delete it from `./data/orca-datadir` by hand.
+To remove a stale preset, delete it from `./data/orca-datadir` by hand. For the fresh-install state,
+delete `$DATA_DIR/orca-datadir/system/Custom/` once — that removes the old seed *and* the presets you
+imported, so re-import your bundle afterwards. No migration deletes your data on its own.
 
 Rebuild and recreate the container to pick up a new image (plain compose setup; on the
 homeserver the `docker-compose@print-portal` unit owns the project — see

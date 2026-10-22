@@ -65,16 +65,21 @@ The headless datadir is Bambu/Orca "system JSON" style, so system presets live u
 ```text
 $ORCA_DATADIR/system/<Vendor>/machine|process|filament   writable copy (default $DATA_DIR/orca-datadir)
 $ORCA_DATADIR/system/Custom/...                          where the portal writes imported presets
-/opt/orca-datadir/system/Custom/...                      read-only seed from presets/datadir/ in this repo
+/opt/orca-datadir/system/Custom.json                     read-only seed from presets/datadir/ (index only)
 ```
 
-`app/profiles.py` resolves the machine slot as `system/Custom/machine/generic-klipper-0.4.json`,
-falls back to the first instantiated `system/**/machine/*.json`, and writes the derived options
-preset to `system/Custom/process/print-portal-options.json` (hidden from the picker).
+`app/profiles.py` resolves the machine the slicer loads from `profile.json` (the operator's
+pick in the UI, applied last), then `MACHINE_SLOT` (an explicit override), then the datadir's
+default machine, then the first instantiated `system/**/machine/*.json`; with nothing imported
+there is no machine at all. The derived options preset goes to
+`system/Custom/process/print-portal-options.json` (hidden from the picker). A fresh datadir needs no
+preset file at all — the CLI slices with an empty presets tree, which is why the seed ships only
+`system/Custom.json`.
 
-Imported presets land in `$ORCA_DATADIR/system/Custom/{machine,process,filament}`. On container
-start `docker/entrypoint.sh` re-seeds `/opt/orca-datadir` into `$ORCA_DATADIR` whenever the
-`.seed-version` marker does not match `SEED_VERSION` (`2.4.2-1` in the `Dockerfile`).
+Imported presets land in `$ORCA_DATADIR/system/Custom/{machine,process,filament}` under the bundle's
+own names and are registered in `system/Custom.json`. On container start `docker/entrypoint.sh`
+re-seeds `/opt/orca-datadir` into `$ORCA_DATADIR` whenever the `.seed-version` marker does not match
+`SEED_VERSION` (`2.4.2-2` in the `Dockerfile`).
 
 ## Gotchas
 
@@ -86,9 +91,9 @@ start `docker/entrypoint.sh` re-seeds `/opt/orca-datadir` into `$ORCA_DATADIR` w
   the caveats in the [README](../README.md).
 - OrcaSlicer rescans preset directories at startup only: close it (or restart the container) after
   adding JSON by hand.
-- The CLI refuses a machine identity that is not the indexed slot with `-17` (`"The selected printer
-  is not compatible with the process preset in the 3mf"`), even when the process lists that name in
-  `compatible_printers`.
+- The CLI rejects the pair, not the machine, with `-17` (`"The selected printer is not compatible
+  with the process preset in the 3mf"`): the *process* preset does not list the selected machine in
+  `compatible_printers`. Patch `compatible_printers` and the same machine slices `rc=0` `"Success."`.
 
 ## Exporting your presets (.orca_printer)
 
@@ -102,7 +107,7 @@ On a Windows desktop install:
    it, `POST /api/profile/upload`, is documented under "Importing profiles" in the
    [README](../README.md).
 
-The portal merges the bundle's machine settings onto the stock machine slot and re-points
-`compatible_printers`, so the printer name you see in the portal stays the slot's name rather than
-the name from the bundle. That is deliberate: the OrcaSlicer CLI refuses a new machine identity with
-`-17`, so applying the bundle's settings onto the existing slot is the only way it loads.
+The portal writes the bundle's presets under the bundle's own names — the machine becomes its own
+preset file and is registered in `system/Custom.json`, and the bundle's processes are pointed at it.
+Nothing that already existed is rewritten, so the printer name you see in the portal is the name from
+the bundle.

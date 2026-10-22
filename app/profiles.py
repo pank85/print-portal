@@ -6,13 +6,17 @@ Two jobs:
   2. import a `.orca_printer` bundle (or a bare preset .json) exported from another
      OrcaSlicer install and make it slicable here
 
+A fresh install ships no preset at all (see `machine_slot`), so import is the only way in.
 Why import needs real work: a bundle carries presets with
   * no `type` field at all (the folder it sits in is the only hint),
-  * `inherits` pointing at vendor presets that do not exist in this headless datadir,
-  * `compatible_printers` naming a machine preset that does not exist here either.
-OrcaSlicer fails those with `return -17` / "printer is not compatible with the process
-preset". Import therefore adds the type, re-roots `inherits` onto a base that does exist,
-and rewrites `compatible_printers` to the imported machine's own name.
+  * `compatible_printers` naming a machine preset that does not exist here.
+The one field the CLI is strict about is `from`, measured with OrcaSlicer 2.4.2: a machine
+preset must carry `"from": "system"` (`"user"` -> return_code -17 "The selected printer is not
+compatible with the process preset in the 3mf", `"System"`/`"SYSTEM"`/absent -> return_code 251
+"The input preset file is invalid and can not be parsed"), while process and filament presets
+take `"User"`/`"user"` and reject `"System"`. A dangling `inherits` is tolerated (rc=0) and so is
+an empty `system/Custom.json`, so import sets the type and `from`, rewrites
+`compatible_printers` to the imported machine's own name, and writes everything else as it came.
 """
 from __future__ import annotations
 
@@ -28,21 +32,26 @@ from pathlib import Path, PurePosixPath
 FOLDER_TYPE = {"printer": "machine", "machine": "machine",
                "process": "process", "filament": "filament"}
 
-# OrcaSlicer's CLI refuses ANY machine preset whose identity is not the one it expects:
-# a bundle machine carrying its own name returns -17 "The selected printer is not compatible
-# with the process preset", even when the process lists that name in compatible_printers.
-# The only reliable way in is to apply the bundle's settings onto the stock machine preset
-# (identity preserved) — verified by bisect: every other variant stayed at -17.
-# The slot is resolved at runtime (`MACHINE_SLOT` env -> datadir default -> first
-# instantiated machine), so any datadir with a machine preset works.
+# The legacy stock slot names. `machine` is the hard fallback: `machine_slot` resolves one on
+# any datadir (MACHINE_SLOT -> datadir default -> first instantiated machine). `process` and
+# `filament` are only stand-ins while the datadir still ships those files — the seed ships
+# none, so a fresh install selects nothing there and `partial_selection` drops the key — and
+# an import writes every preset under its own name anyway.
+#
+# The one strict field is `from`. Measured with OrcaSlicer 2.4.2: a machine preset carrying
+# "user" answers -17 "The selected printer is not compatible with the process preset in the
+# 3mf", and "System"/"SYSTEM"/a missing `from` answers 251 "The input preset file is invalid
+# and can not be parsed"; only "system" slices. Process and filament are the mirror image
+# ("User"/"user" fine, "System" invalid). `normalise` enforces both halves.
 DEFAULT_PROFILE = {
     "machine":  "system/Custom/machine/generic-klipper-0.4.json",
     "process":  "system/Custom/process/generic-0.20-standard.json",
     "filament": "system/Custom/filament/generic-pla.json",
 }
 
-# The three persisted "basic options". Defaults mirror the shipped process preset: supports off
-# (`enable_support: "0"`) and a brim on (the inherited `brim_width: "5"`).
+# The three persisted "basic options". These are the portal's own state, not a copy of any
+# preset: supports off, and a brim on because the CLI's own `brim_width` defaults to "5" when
+# nothing overrides it. `regenerate_derived` writes them into the derived process preset.
 OPTION_KEYS = ("supports", "brim", "hide_profiles")
 DEFAULT_OPTIONS = {"supports": False, "brim": True, "hide_profiles": False}
 
@@ -51,12 +60,17 @@ DEFAULT_OPTIONS = {"supports": False, "brim": True, "hide_profiles": False}
 PORTAL_PROCESS_REL = "system/Custom/process/print-portal-options.json"
 PORTAL_PROCESS_FILE = PurePosixPath(PORTAL_PROCESS_REL).name
 
-MACHINE_IDENTITY = {"name", "inherits", "from", "type", "compatible_printers",
-                    "printer_model", "printer_variant"}
+# What every preset-dependent *action* says when nothing has been imported yet. It lives here,
+# next to the preset paths, so the API layer answers with this one sentence instead of inventing
+# its own (a read answers 200 with an empty selection instead).
+NO_MACHINE_MESSAGE = "no printer profile imported yet"
 
-BASE_FOR_TYPE = {"machine": "fdm_klipper_common",
-                 "process": "fdm_process_klipper_common",
-                 "filament": "fdm_filament_pla"}
+# The vendor registry import read-modify-writes. The CLI never opens it (the app passes explicit
+# --load-settings/--load-filaments), it is only where the portal records the presets it wrote.
+VENDOR_INDEX_REL = "system/Custom.json"
+VENDOR_LISTS = {"machine": "machine_list",
+                "process": "process_list",
+                "filament": "filament_list"}
 
 # fields worth showing in the UI, per preset type
 SUMMARISE = {
@@ -142,13 +156,94 @@ def safe_stem(name: str) -> str:
     return stem.strip("_")[:80] or "preset"
 
 
-def machine_slot(datadir: Path, override: str | None = None) -> Path:
-    """Resolve the machine preset that imports rebase onto.
+def read_vendor_index(datadir: Path) -> dict:
+    """`system/Custom.json` as a dict; a missing or unreadable index reads as an empty one.
+
+    The CLI never opens this file — import passes explicit --load-settings/--load-filaments
+    paths — so it is only the registry the portal writes its presets into. A corrupt index
+    must therefore degrade to a fresh document instead of failing an import.
+    """
+    path = Path(datadir) / VENDOR_INDEX_REL
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    for key in ("machine_model_list", "process_list", "filament_list", "machine_list"):
+        if not isinstance(data.get(key), list):
+            data[key] = []
+    return data
+
+
+def register_preset(index: dict, ptype: str, name: str, sub_path: str) -> bool:
+    """Put ``{"name": name, "sub_path": sub_path}`` in ``<ptype>_list``; True if it changed.
+
+    Keyed on `name`, so re-importing a bundle updates its entry in place instead of appending
+    a duplicate, and every other key of the document (machine_model_list, the other types,
+    version, description) is left untouched.
+    """
+    key = VENDOR_LISTS[ptype]
+    rows = index.setdefault(key, [])
+    entry = {"name": name, "sub_path": sub_path}
+    for row in rows:
+        if isinstance(row, dict) and row.get("name") == name:
+            if row == entry:
+                return False
+            row.update(entry)
+            return True
+    rows.append(entry)
+    return True
+
+
+def write_vendor_index(datadir: Path, index: dict) -> Path:
+    """Persist ``system/Custom.json`` atomically (readers see the old or the new document)."""
+    path = Path(datadir) / VENDOR_INDEX_REL
+    write_json_atomic(path, index)
+    return path
+
+
+def _preset_rel(ptype: str, name: str) -> Path:
+    """Where a preset of ``ptype`` named ``name`` lives, relative to the datadir."""
+    return Path("system/Custom") / ptype / f"{safe_stem(name)}.json"
+
+
+def write_preset(datadir: Path, ptype: str, preset: dict) -> Path:
+    """Write one normalised preset to ``system/Custom/<ptype>/<safe_stem(name)>.json``.
+
+    The single writer for all three types (tab-indented, no trailing newline), so the JSON
+    convention lives in one place. A machine preset reaches it only with ``from: "system"``
+    (see `normalise`): the CLI answers -17 for ``"user"`` and 251 for anything else.
+    """
+    dest = Path(datadir) / _preset_rel(ptype, str(preset["name"]))
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    dest.write_text(json.dumps(preset, indent="\t"))
+    return dest
+
+
+def _same_preset(existing: dict, incoming: dict) -> bool:
+    """True when ``incoming`` is the preset already on disk, not a different one reusing its name.
+
+    ``setting_id`` decides when both documents carry one; otherwise the normalised documents
+    must be identical — which is exactly the re-import case, because `normalise` is
+    deterministic. A different bundle reusing a name fails this and is refused.
+    """
+    old_id, new_id = existing.get("setting_id"), incoming.get("setting_id")
+    if isinstance(old_id, str) and old_id and isinstance(new_id, str) and new_id:
+        return old_id == new_id
+    return existing == incoming
+
+
+def machine_slot(datadir: Path, override: str | None = None) -> Path | None:
+    """Resolve the machine preset the slicer should load, or None when the datadir has none.
 
     1. override: relative path inside datadir; must exist and be a machine preset.
     2. else datadir / DEFAULT_PROFILE["machine"] if it exists.
     3. else first `system/**/machine/*.json` with type=="machine" and instantiation=="true".
-    4. else raise ProfileError("no machine preset found in <datadir> (set MACHINE_SLOT)").
+    4. else None — a fresh install ships no presets; importing a bundle is the only way in.
+
+    A bad *override* is still a ProfileError: that is operator configuration, not an empty
+    datadir, and silently ignoring it would slice with a machine the operator did not choose.
     """
     datadir = Path(datadir)
     if override is not None:
@@ -186,7 +281,7 @@ def machine_slot(datadir: Path, override: str | None = None) -> Path:
                 and data.get("instantiation") == "true"):
             return f.relative_to(datadir)
 
-    raise ProfileError(f"no machine preset found in {datadir} (set MACHINE_SLOT)")
+    return None
 
 
 def clamp_area(area: list[str], bed: tuple[float, float]) -> list[str] | None:
@@ -206,25 +301,6 @@ def clamp_area(area: list[str], bed: tuple[float, float]) -> list[str] | None:
     return ["0x0", f"{w:g}x0", f"{w:g}x{h:g}", f"0x{h:g}"]
 
 
-def _all_names(datadir: Path) -> dict[str, set[str]]:
-    """Every preset name already known to this datadir, per type."""
-    found: dict[str, set[str]] = {}
-    for ptype, pattern in (("machine", "system/**/machine/*.json"),
-                           ("process", "system/**/process/*.json"),
-                           ("filament", "system/**/filament/**/*.json")):
-        names: set[str] = set()
-        for f in datadir.glob(pattern):
-            try:
-                data = json.loads(f.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            name = data.get("name") or f.stem
-            names.add(name)
-            names.add(f.stem)
-        found[ptype] = names
-    return found
-
-
 def _guess_type(data: dict, hint: str | None) -> str:
     if hint in ("machine", "process", "filament"):
         return hint
@@ -240,24 +316,31 @@ def _guess_type(data: dict, hint: str | None) -> str:
     return "process"
 
 
-def normalise(data: dict, ptype: str, machine_name: str,
-              known: dict[str, set[str]], bed: tuple[float, float] = (220.0, 220.0)
-              ) -> tuple[dict, list[str]]:
-    """Return (preset, warnings) ready to be loaded by the CLI."""
+def normalise(data: dict, ptype: str, machine_name: str | None,
+              bed: tuple[float, float] = (220.0, 220.0)) -> tuple[dict, list[str]]:
+    """Return (preset, warnings) ready to be loaded by the CLI.
+
+    `from` is forced per type (machine: "system", everything else: "User"/"user"), `inherits`
+    is kept verbatim — a dangling inherits is tolerated by the CLI — and
+    `compatible_printers` is rewritten to `machine_name` only when the bundle brought a machine.
+    """
     notes: list[str] = []
     out = dict(data)
     out["type"] = ptype
-    out.setdefault("from", "User")
+    if ptype == "machine":
+        # measured with OrcaSlicer 2.4.2: anything but these two literals fails the slice
+        # (-17 for "user", 251 for "System"/"SYSTEM"/absent), so neither is the bundle's
+        out["from"] = "system"
+        out["instantiation"] = "true"
+    else:
+        out["from"] = data["from"] if data.get("from") in ("User", "user") else "User"
     out.setdefault("name", safe_stem(str(data.get("name") or "imported")))
 
     parent = out.get("inherits")
-    base = BASE_FOR_TYPE[ptype]
-    if parent and parent not in known.get(ptype, set()):
-        out["inherits"] = base
-        notes.append(f"inherits '{parent}' not present here -> re-rooted to '{base}'")
-    elif not parent:
-        out["inherits"] = base
-        notes.append(f"no inherits -> '{base}'")
+    if parent:
+        # a dangling inherits slices fine (measured), and inventing a base would make the
+        # imported preset depend on a file this datadir does not ship — so it is copied as-is
+        notes.append(f"inherits '{parent}' kept as-is")
 
     if ptype == "machine":
         out["compatible_printers"] = [out["name"]]
@@ -276,8 +359,11 @@ def normalise(data: dict, ptype: str, machine_name: str,
                     out["printable_area"] = clamped
             except (ValueError, IndexError):
                 notes.append("could not parse printable_area — left untouched")
-    else:
+    elif isinstance(machine_name, str) and machine_name:
         out["compatible_printers"] = [machine_name]
+    else:
+        # no machine to point at: the bundle's own list is the only truth we have
+        notes.append("no machine to target — compatible_printers kept as-is")
 
     return out, notes
 
@@ -481,6 +567,8 @@ def _effective_machine(datadir: Path, data: dict) -> str | None:
             return first
     try:
         slot = machine_slot(Path(datadir))
+        if slot is None:
+            return None
         slot_data = json.loads((Path(datadir) / slot).read_text())
     except (ProfileError, OSError, ValueError):
         return None
@@ -613,80 +701,104 @@ def filter_process_by_machine(rows: list[dict], machine: dict | None) -> list[di
     return kept
 
 
-def import_into(datadir: Path, blob: bytes, filename: str, slot: Path,
-                bed: tuple[float, float]) -> dict:
-    """Normalise every preset in the bundle and drop it into the datadir.
+def _plan_import(datadir: Path, items: list[tuple[str, dict]],
+                 bed: tuple[float, float]) -> tuple[list[tuple[str, dict, Path]], list[str]]:
+    """Normalise the whole bundle and resolve every destination before anything is written.
 
-    Machine presets are merged onto the stock slot (see machine_slot); process and filament
-    presets are written as ordinary files and pointed at the slot's name.
+    Machines are planned first so the bundle's own processes/filaments can name the machine
+    that is about to exist rather than whatever was selected before.
+
+    :raises ProfileError: a destination exists and holds a *different* preset with that name,
+        or this one bundle maps two different presets onto one destination (nothing has been
+        written when it raises). The message names the file, so the 400 tells the operator
+        what to delete.
     """
+    datadir = Path(datadir)
+    # machines first: every process/filament the bundle brings must point at the machine it
+    # brought, not at whatever this datadir selected before the import
+    ordered = ([item for item in items if item[0] == "machine"]
+               + [item for item in items if item[0] != "machine"])
+    notes: list[str] = []
+    planned: list[tuple[str, dict, Path]] = []
+    seen: dict[Path, dict] = {}
+    machine = None
+    for ptype, data in ordered:
+        preset, item_notes = normalise(data, ptype, machine, bed)
+        if ptype == "machine" and machine is None:
+            machine = str(preset["name"])
+        notes.extend(f"{preset['name']}: {note}" for note in item_notes)
+        dest = datadir / _preset_rel(ptype, str(preset["name"]))
+        earlier = seen.get(dest)
+        if earlier is not None:
+            # one bundle naming one destination twice: the second write would silently replace
+            # the first. The identical document collapses onto that one file; a different one
+            # is refused like a collision with a file already on disk, before any write.
+            if earlier != preset:
+                name = preset["name"]
+                raise ProfileError(
+                    f"{dest} is written twice by this bundle with different presets named "
+                    f"{name!r}; rename one of them and re-import")
+            continue
+        seen[dest] = preset
+        planned.append((ptype, preset, dest))
+
+    # the machine carries the bundle's own defaults, so the CLI's default resolution points at
+    # a preset that exists here (what the deleted "slot defaults" block used to do). Set before
+    # the collision test, because a re-import has to produce the document that is on disk.
+    machine_preset = next((preset for ptype, preset, _ in planned if ptype == "machine"), None)
+    if machine_preset is not None:
+        process = next((preset for ptype, preset, _ in planned if ptype == "process"), None)
+        filament = next((preset for ptype, preset, _ in planned if ptype == "filament"), None)
+        if process is not None:
+            machine_preset["default_print_profile"] = process["name"]
+        if filament is not None:
+            machine_preset["default_filament_profile"] = [filament["name"]]
+
+    for _ptype, preset, dest in planned:
+        if not dest.is_file():
+            continue
+        try:
+            existing = json.loads(dest.read_text())
+        except (OSError, ValueError):
+            existing = None
+        if not isinstance(existing, dict) or not _same_preset(existing, preset):
+            name = preset["name"]
+            raise ProfileError(
+                f"{dest} already holds a different preset named {name!r}; "
+                f"delete that file and re-import if you want to replace it")
+    return planned, notes
+
+
+def import_into(datadir: Path, blob: bytes, filename: str,
+                bed: tuple[float, float] = (220.0, 220.0)) -> dict:
+    """Write every preset in the bundle into the datadir under its own name.
+
+    Two phases, so a refused import writes nothing: the bundle is read and normalised in
+    memory first (`_plan_import`, which raises on a name collision), then the presets are
+    written machine-first and `system/Custom.json` is updated last — a crash then leaves an
+    unreferenced file rather than an index entry pointing at nothing.
+
+    Returns {"imported": [{"type", "name", "label", "file", "path", "registered"}],
+             "notes": [str], "ok": bool}.
+    """
+    datadir = Path(datadir)
     items = read_bundle(blob, filename)
     if not items:
         return {"imported": [], "notes": ["no presets found in that file"], "ok": False}
 
-    known = _all_names(datadir)
-    datadir = Path(datadir)
-    slot_path = Path(slot)
-    if not slot_path.is_absolute():
-        slot_path = datadir / slot_path
-    slot = json.loads(slot_path.read_text())
-    slot_name = slot.get("name", slot_path.stem)
-    backup = slot_path.with_suffix(".json.orig")
-    if not backup.exists():
-        backup.write_text(json.dumps(slot, indent="\t"))
+    planned, notes = _plan_import(datadir, items, bed)
 
+    index = read_vendor_index(datadir)
+    index_changed = False
     imported: list[dict] = []
-    notes: list[str] = []
-    machine_seen = False
-
-    for ptype, data in items:
-        if ptype == "machine":
-            merged = dict(slot)
-            for key, val in data.items():
-                if key in MACHINE_IDENTITY:
-                    continue
-                merged[key] = val
-            area = merged.get("printable_area")
-            if isinstance(area, list):
-                clamped = clamp_area(area, bed)
-                if clamped is not None:
-                    try:
-                        xs = [float(v.split("x")[0]) for v in area]
-                        ys = [float(v.split("x")[1]) for v in area]
-                        max_x, max_y = max(xs), max(ys)
-                        w, h = bed
-                        notes.append(f"printable_area {max_x:g}x{max_y:g} exceeds the {w:g}x{h:g} bed — clamped")
-                    except (ValueError, IndexError):
-                        pass
-                    merged["printable_area"] = clamped
-            slot_path.write_text(json.dumps(merged, indent="\t"))
-            machine_seen = True
-            imported.append({"type": "machine", "name": data.get("name") or slot_name,
-                             "label": data.get("name") or slot_name,
-                             "file": slot_path.name, "path": str(slot_path.relative_to(datadir)),
-                             "rebased_on": slot_name})
-            notes.append(f"machine '{data.get('name')}' applied onto the stock preset "
-                         f"'{slot_name}' (Orca rejects new machine identities with -17)")
-            continue
-
-        preset, item_notes = normalise(data, ptype, slot_name, known, bed)
-        dest_dir = datadir / "system/Custom" / ptype
-        dest_dir.mkdir(parents=True, exist_ok=True)
-        dest = dest_dir / f"{safe_stem(preset['name'])}.json"
-        dest.write_text(json.dumps(preset, indent="\t"))
+    for ptype, preset, _dest in planned:
+        dest = write_preset(datadir, ptype, preset)
+        index_changed = register_preset(index, ptype, str(preset["name"]),
+                                        f"{ptype}/{dest.name}") or index_changed
         imported.append({"type": ptype, "name": preset["name"], "label": preset["name"],
-                         "file": dest.name, "path": str(dest.relative_to(datadir))})
-        notes.extend(f"{preset['name']}: {n}" for n in item_notes)
-
-    if machine_seen:
-        # keep the slot's own defaults pointing at something that exists
-        slot = json.loads(slot_path.read_text())
-        procs = [i for i in imported if i["type"] == "process"]
-        fils = [i for i in imported if i["type"] == "filament"]
-        if procs:
-            slot["default_print_profile"] = procs[0]["name"]
-        if fils:
-            slot["default_filament_profile"] = [fils[0]["name"]]
-        slot_path.write_text(json.dumps(slot, indent="\t"))
+                         "file": dest.name, "path": str(dest.relative_to(datadir)),
+                         "registered": True})
+    if index_changed:
+        write_vendor_index(datadir, index)
 
     return {"imported": imported, "notes": notes, "ok": bool(imported)}

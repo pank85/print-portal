@@ -50,8 +50,8 @@ def test_profile_reports_effective_supports_and_brim(client, datadir):
 
     body = client.get("/api/profile").json()
 
-    assert set(body) == {"source", "machine_label", "paths", "presets", "options",
-                         "effective", "derived"}
+    assert set(body) == {"imported", "source", "machine_label", "paths", "presets",
+                         "options", "effective", "derived"}
     assert body["effective"] == {"supports": True, "brim": True, "brim_width": "5",
                                  "machine": MACHINE_NAME,
                                  "process": f"{body['presets']['process']['name']} (portal options)",

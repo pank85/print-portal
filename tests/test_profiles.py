@@ -1,10 +1,16 @@
-"""profiles.py: bundle import, bed clamping, inherits re-rooting, machine rebase.
+"""profiles.py: bundle import into an empty datadir, bed clamping, `inherits` kept verbatim.
 
-Every test works on a private copy of the shipped seed datadir (the ``datadir`` fixture),
-because import_into() writes presets and rewrites the machine slot in place.
+Two datadir fixtures, and the difference matters:
+
+* ``empty_datadir`` is a copy of the shipped seed, which holds no preset at all — what a
+  fresh install has and what an import has to fill. Every import test starts there,
+  because re-importing onto existing presets is a different, collision-guarded path.
+* ``datadir`` is the trimmed copy of the presets the old seed used to ship; the machine-slot
+  override tests still need it, since an override has to resolve *something*.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
 import zipfile
@@ -15,7 +21,17 @@ import pytest
 import profiles as prof
 
 ROOT = Path(__file__).resolve().parents[1]
-MACHINE_NAME = "Generic Klipper 0.4 nozzle"
+MACHINE_NAME = "Generic Klipper 0.4 nozzle"           # the machine in `datadir`, not the seed
+
+# What the committed fixture bundle (tests/fixtures/portal-import.orca_printer) carries, and
+# where import writes it. The filenames are `safe_stem()` of the names, spaces included.
+PORTAL_MACHINE = "Portal Test Printer"
+PORTAL_PROCESS = "0.20mm Portal Standard"
+PORTAL_FILAMENT = "Portal PLA"
+IMPORTED_MACHINE_REL = "system/Custom/machine/Portal_Test_Printer.json"
+IMPORTED_PROCESS_REL = "system/Custom/process/0.20mm_Portal_Standard.json"
+IMPORTED_FILAMENT_REL = "system/Custom/filament/Portal_PLA.json"
+SHIPPED_INDEX = "system/Custom.json"
 
 # Strings the brief bans from shipped files: the author's printer subnet, home paths and
 # preset names. Assembled from fragments on purpose — typing them out would make this file
@@ -41,8 +57,28 @@ def bundle(files: dict[str, dict]) -> bytes:
     return buf.getvalue()
 
 
-def test_bundle_zip_imports_every_preset_type(datadir):
-    slot = prof.machine_slot(datadir)
+def machine_bundle(fields: dict | None = None) -> bytes:
+    """A one-preset bundle whose machine is named like the fixture's, plus ``fields``."""
+    data = {"type": "machine", "name": PORTAL_MACHINE, "printer_model": PORTAL_MACHINE,
+            "printer_variant": "0.4", "nozzle_diameter": ["0.4"],
+            "printable_area": ["0x0", "220x0", "220x220", "0x220"]}
+    data.update(fields or {})
+    return bundle({"printer/portal.json": data})
+
+
+def listing(datadir: Path) -> list[str]:
+    """Every file under ``datadir``, relative and sorted — "what got written" as a value."""
+    return sorted(path.relative_to(datadir).as_posix()
+                  for path in datadir.rglob("*") if path.is_file())
+
+
+def digests(datadir: Path) -> dict[str, str]:
+    """sha256 per relative path: proves an import left the bytes alone, not just the names."""
+    return {rel: hashlib.sha256((datadir / rel).read_bytes()).hexdigest()
+            for rel in listing(datadir)}
+
+
+def test_bundle_zip_imports_every_preset_type(empty_datadir):
     blob = bundle({
         "printer/vendor-machine.json": {
             "name": "Vendor Mach", "inherits": "fdm_klipper_common",
@@ -51,74 +87,60 @@ def test_bundle_zip_imports_every_preset_type(datadir):
             "retraction_length": ["1.5"], "nozzle_diameter": ["0.6"],
         },
         "process/vendor 0.28.json": {
-            "name": "vendor 0.28", "inherits": "Vendor Profile",
+            "name": "vendor 0.28", "inherits": "fdm_process_klipper_common",
             "layer_height": "0.28", "wall_loops": "3",
         },
         "filament/vendor pla.json": {
-            "name": "vendor pla", "inherits": "Vendor PLA",
-            "filament_type": ["PLA"], "nozzle_temperature": ["215"],
+            "name": "vendor pla", "filament_type": ["PLA"], "nozzle_temperature": ["215"],
         },
     })
 
-    result = prof.import_into(datadir, blob, "vendor.orca_printer", slot, (220.0, 220.0))
+    result = prof.import_into(empty_datadir, blob, "vendor.orca_printer")
 
     assert result["ok"] is True
     assert [item["type"] for item in result["imported"]] == ["machine", "process", "filament"]
-    assert result["imported"][0]["path"] == str(slot)
+    # the machine becomes a file of its own, named after itself — never applied onto a slot
+    assert result["imported"][0]["path"] == "system/Custom/machine/Vendor_Mach.json"
+    machine = json.loads((empty_datadir / "system/Custom/machine/Vendor_Mach.json").read_text())
+    assert machine["name"] == "Vendor Mach"
+    assert machine["from"] == "system"
+    assert machine["instantiation"] == "true"
+    assert machine["compatible_printers"] == ["Vendor Mach"]
 
-    process_file = datadir / "system/Custom/process/vendor_0.28.json"
-    filament_file = datadir / "system/Custom/filament/vendor_pla.json"
-    assert process_file.is_file() and filament_file.is_file()
+    # the bundle's process and filament name the machine the same bundle brought
+    for rel, kind in (("system/Custom/process/vendor_0.28.json", "process"),
+                      ("system/Custom/filament/vendor_pla.json", "filament")):
+        preset = json.loads((empty_datadir / rel).read_text())
+        assert preset["type"] == kind
+        assert preset["compatible_printers"] == ["Vendor Mach"]
 
-    process = json.loads(process_file.read_text())
-    assert process["type"] == "process"
-    assert process["compatible_printers"] == [MACHINE_NAME]
-    assert process["inherits"] == "fdm_process_klipper_common"
-
-    filament = json.loads(filament_file.read_text())
-    assert filament["type"] == "filament"
-    assert filament["compatible_printers"] == [MACHINE_NAME]
-
-    # the machine never becomes its own file — it is applied onto the slot
-    assert not list((datadir / "system/Custom/machine").glob("Vendor*"))
-
-
-def test_machine_rebase_keeps_the_identity_keys(datadir):
-    slot = prof.machine_slot(datadir)
-    before = json.loads((datadir / slot).read_text())
-    identity = {key: before[key] for key in prof.MACHINE_IDENTITY if key in before}
-    assert {"name", "inherits", "type", "printer_model", "printer_variant"} <= set(identity)
-
-    blob = bundle({
-        "printer/vendor.json": {
-            "name": "Vendor Mach", "inherits": "Vendor Base",
-            "printer_model": "Vendor", "printer_variant": "0.6",
-            "retraction_length": ["1.5"], "nozzle_diameter": ["0.6"],
-        },
-    })
-
-    prof.import_into(datadir, blob, "vendor.orca_printer", slot, (220.0, 220.0))
-
-    after = json.loads((datadir / slot).read_text())
-    for key, value in identity.items():
-        assert after[key] == value, f"{key} must survive the rebase"
-    assert after["retraction_length"] == ["1.5"]
-    assert after["nozzle_diameter"] == ["0.6"]
+    index = json.loads((empty_datadir / SHIPPED_INDEX).read_text())
+    assert index["machine_list"] == [{"name": "Vendor Mach",
+                                     "sub_path": "machine/Vendor_Mach.json"}]
 
 
-def test_machine_rebase_repoints_the_slot_defaults(datadir):
-    slot = prof.machine_slot(datadir)
-    blob = bundle({
-        "printer/vendor.json": {"name": "Vendor Mach", "retraction_length": ["1.5"]},
-        "process/vendor 0.28.json": {"name": "vendor 0.28", "layer_height": "0.28"},
-        "filament/vendor pla.json": {"name": "vendor pla", "filament_type": ["PLA"]},
-    })
+def test_import_into_an_empty_datadir_writes_only_the_bundle_files(empty_datadir, bundle_bytes):
+    assert listing(empty_datadir) == [SHIPPED_INDEX]
 
-    prof.import_into(datadir, blob, "vendor.orca_printer", slot, (220.0, 220.0))
+    result = prof.import_into(empty_datadir, bundle_bytes, "portal-import.orca_printer")
 
-    after = json.loads((datadir / slot).read_text())
-    assert after["default_print_profile"] == "vendor 0.28"
-    assert after["default_filament_profile"] == ["vendor pla"]
+    assert result["ok"] is True
+    assert [row["name"] for row in result["imported"]] == [PORTAL_MACHINE, PORTAL_PROCESS,
+                                                           PORTAL_FILAMENT]
+    assert listing(empty_datadir) == sorted([SHIPPED_INDEX, IMPORTED_MACHINE_REL,
+                                             IMPORTED_PROCESS_REL, IMPORTED_FILAMENT_REL])
+    # the options preset is written per slice, not per import
+    assert not (empty_datadir / prof.PORTAL_PROCESS_REL).exists()
+
+
+def test_a_machine_preset_carries_from_system_verbatim(empty_datadir):
+    """"user" in the bundle is overwritten, not defaulted: the CLI answers -17 for it."""
+    prof.import_into(empty_datadir, machine_bundle({"from": "user"}), "portal.orca_printer")
+
+    machine = json.loads((empty_datadir / IMPORTED_MACHINE_REL).read_text())
+
+    assert machine["from"] == "system"
+    assert machine["instantiation"] == "true"
 
 
 def test_read_bundle_rejects_garbage():
@@ -148,7 +170,7 @@ def test_printable_area_over_the_bed_is_clamped():
     area = ["0x0", "350x0", "350x350", "0x350"]
 
     preset, notes = prof.normalise(
-        {"name": "Big", "printable_area": area}, "machine", MACHINE_NAME, {}, (220.0, 220.0))
+        {"name": "Big", "printable_area": area}, "machine", MACHINE_NAME, (220.0, 220.0))
 
     assert preset["printable_area"] == ["0x0", "220x0", "220x220", "0x220"]
     assert any("350x350" in note and "220x220" in note and "clamped" in note for note in notes)
@@ -158,7 +180,7 @@ def test_printable_area_inside_the_bed_is_untouched():
     area = ["0x0", "200x0", "200x180", "0x180"]
 
     preset, notes = prof.normalise(
-        {"name": "Small", "printable_area": area}, "machine", MACHINE_NAME, {}, (220.0, 220.0))
+        {"name": "Small", "printable_area": area}, "machine", MACHINE_NAME, (220.0, 220.0))
 
     assert preset["printable_area"] == area
     assert not any("clamped" in note for note in notes)
@@ -168,7 +190,7 @@ def test_a_300_bed_does_not_clamp_a_300_area():
     area = ["0x0", "300x0", "300x300", "0x300"]
 
     preset, notes = prof.normalise(
-        {"name": "Large", "printable_area": area}, "machine", MACHINE_NAME, {}, (300.0, 300.0))
+        {"name": "Large", "printable_area": area}, "machine", MACHINE_NAME, (300.0, 300.0))
 
     assert preset["printable_area"] == area
     assert not any("clamped" in note for note in notes)
@@ -183,32 +205,152 @@ def test_clamp_area_edge_cases():
     assert prof.clamp_area(["nonsense"], (220.0, 220.0)) is None
 
 
-def test_unknown_parent_is_re_rooted_to_a_base_that_exists():
+def test_a_dangling_inherits_is_kept_verbatim():
+    """A parent this datadir does not ship is tolerated, so it is copied in untouched."""
     preset, notes = prof.normalise(
         {"name": "Imported", "inherits": "Vendor Pla @0.4", "layer_height": "0.2"},
-        "process", MACHINE_NAME, {}, (220.0, 220.0))
+        "process", MACHINE_NAME)
 
-    assert preset["inherits"] == "fdm_process_klipper_common"
-    assert any("Vendor Pla @0.4" in note and "re-rooted" in note for note in notes)
+    assert preset["inherits"] == "Vendor Pla @0.4"
+    assert notes == ["inherits 'Vendor Pla @0.4' kept as-is"]
 
 
-def test_missing_parent_is_set_to_the_base():
+def test_a_preset_without_inherits_gets_none():
+    """No `inherits` is invented: the preset stays standalone instead of gaining a parent."""
+    preset, notes = prof.normalise({"name": "Bare"}, "filament", MACHINE_NAME)
+
+    assert "inherits" not in preset
+    assert not any("inherits" in note for note in notes)
+
+
+def test_a_known_parent_is_kept(datadir):
+    """A parent the datadir really ships is still copied verbatim — nothing is re-rooted."""
+    known = "fdm_process_klipper_common"
+    assert (datadir / "system/Custom/process" / f"{known}.json").is_file()
+
     preset, notes = prof.normalise(
-        {"name": "Bare"}, "filament", MACHINE_NAME, {}, (220.0, 220.0))
+        {"name": "Kept", "inherits": known, "layer_height": "0.2"}, "process", MACHINE_NAME)
 
-    assert preset["inherits"] == "fdm_filament_pla"
-    assert any("re-rooted" in note or "no inherits" in note for note in notes)
+    assert preset["inherits"] == known
+    assert notes == [f"inherits '{known}' kept as-is"]
 
 
-def test_a_known_parent_is_kept():
-    known = {"process": {"fdm_process_klipper_common"}}
+def test_importing_the_same_bundle_twice_is_idempotent(empty_datadir, bundle_bytes):
+    prof.import_into(empty_datadir, bundle_bytes, "portal-import.orca_printer")
+    first = digests(empty_datadir)
 
-    preset, notes = prof.normalise(
-        {"name": "Kept", "inherits": "fdm_process_klipper_common", "layer_height": "0.2"},
-        "process", MACHINE_NAME, known, (220.0, 220.0))
+    second = prof.import_into(empty_datadir, bundle_bytes, "portal-import.orca_printer")
 
-    assert preset["inherits"] == "fdm_process_klipper_common"
-    assert notes == []
+    assert second["ok"] is True
+    assert digests(empty_datadir) == first      # the same bytes, not just the same names
+    index = json.loads((empty_datadir / SHIPPED_INDEX).read_text())
+    assert [len(index[key]) for key in ("machine_list", "process_list", "filament_list")] \
+        == [1, 1, 1]
+    assert {kind: len(rows) for kind, rows in prof.list_presets(empty_datadir).items()} == {
+        "machine": 1, "process": 1, "filament": 1}
+
+
+def test_a_different_preset_with_the_same_name_is_a_400_and_writes_nothing(empty_datadir,
+                                                                         bundle_bytes):
+    """A different printer reusing an imported name is refused, and the message names the file.
+
+    Overwriting would silently replace the machine the operator imported; the destination
+    path is in the text because the only way out is deleting that one file.
+    """
+    prof.import_into(empty_datadir, bundle_bytes, "portal-import.orca_printer")
+    before = digests(empty_datadir)
+
+    with pytest.raises(prof.ProfileError) as refused:
+        prof.import_into(empty_datadir, machine_bundle({"nozzle_diameter": ["0.6"]}),
+                         "other.orca_printer")
+
+    assert str(empty_datadir / IMPORTED_MACHINE_REL) in str(refused.value)
+    assert digests(empty_datadir) == before     # nothing written, not even a partial file
+
+
+def test_one_bundle_naming_one_destination_twice_is_refused(empty_datadir):
+    """Two bundle members with one name but different bodies map to one file; nothing is written.
+
+    The second write would silently replace the first, so the whole import is refused before
+    any file is touched and the operator renames one of them.
+    """
+    blob = bundle({
+        "process/a.json": {"type": "process", "name": "Dup", "layer_height": "0.2"},
+        "process/b.json": {"type": "process", "name": "Dup", "layer_height": "0.3"},
+    })
+    before = digests(empty_datadir)
+
+    with pytest.raises(prof.ProfileError, match="written twice"):
+        prof.import_into(empty_datadir, blob, "dup.orca_printer")
+
+    assert digests(empty_datadir) == before     # no preset file, no index row
+
+
+def test_one_bundle_naming_one_destination_twice_with_one_body_imports_once(empty_datadir):
+    """The identical document collapses onto that one destination instead of being refused."""
+    dup = {"type": "process", "name": "Dup", "layer_height": "0.2"}
+    blob = bundle({"process/a.json": dup, "process/b.json": dup})
+
+    result = prof.import_into(empty_datadir, blob, "dup.orca_printer")
+
+    assert result["ok"] is True
+    assert [row["path"] for row in result["imported"]] == ["system/Custom/process/Dup.json"]
+    assert listing(empty_datadir) == sorted([SHIPPED_INDEX, "system/Custom/process/Dup.json"])
+    assert len(prof.list_presets(empty_datadir)["process"]) == 1
+    index = json.loads((empty_datadir / SHIPPED_INDEX).read_text())
+    assert index["process_list"] == [{"name": "Dup", "sub_path": "process/Dup.json"}]
+
+
+def test_the_vendor_index_keeps_every_other_key(empty_datadir, bundle_bytes):
+    """Import read-modify-writes `system/Custom.json`: every key it does not own survives."""
+    index_path = empty_datadir / SHIPPED_INDEX
+    seeded = json.loads(index_path.read_text())
+    seeded["machine_model_list"] = [{"name": "Keep Me", "sub_path": "machine/keep.json"}]
+    index_path.write_text(json.dumps(seeded, indent=2))
+
+    prof.import_into(empty_datadir, bundle_bytes, "portal-import.orca_printer")
+
+    index = json.loads(index_path.read_text())
+    ours = ("machine_list", "process_list", "filament_list")
+    assert {k: v for k, v in index.items() if k not in ours} == {
+        k: v for k, v in seeded.items() if k not in ours}
+    assert index["machine_model_list"] == [{"name": "Keep Me",
+                                           "sub_path": "machine/keep.json"}]
+    assert [row["name"] for row in index["machine_list"]] == [PORTAL_MACHINE]
+
+
+def test_a_second_bundle_adds_a_second_machine_and_touches_nothing_else(empty_datadir,
+                                                                      bundle_bytes):
+    prof.import_into(empty_datadir, bundle_bytes, "portal-import.orca_printer")
+    before = digests(empty_datadir)
+
+    second = bundle({
+        "printer/portal-two.json": {
+            "name": "Portal Test Printer Two", "printer_model": "Portal Test Printer Two",
+            "printer_variant": "0.4", "nozzle_diameter": ["0.4"],
+            "printable_area": ["0x0", "220x0", "220x220", "0x220"],
+        },
+        "process/portal-two 0.20.json": {
+            "name": "0.20mm Portal Two", "layer_height": "0.2", "wall_loops": "3",
+        },
+        "filament/portal petg.json": {
+            "name": "Portal PETG", "filament_type": ["PETG"], "nozzle_temperature": ["240"],
+        },
+    })
+
+    result = prof.import_into(empty_datadir, second, "portal-two.orca_printer")
+
+    assert result["ok"] is True
+    assert (empty_datadir / "system/Custom/machine/Portal_Test_Printer_Two.json").is_file()
+    assert (empty_datadir / IMPORTED_MACHINE_REL).is_file()      # the first one is still there
+    index = json.loads((empty_datadir / SHIPPED_INDEX).read_text())
+    assert [row["name"] for row in index["machine_list"]] == [
+        PORTAL_MACHINE, "Portal Test Printer Two"]
+
+    after = digests(empty_datadir)
+    assert set(before) <= set(after)                            # B only adds files
+    assert {rel for rel in before if after[rel] != before[rel]} == {SHIPPED_INDEX}
+    assert len(prof.list_presets(empty_datadir)["machine"]) == 2
 
 
 def test_machine_slot_defaults_to_the_shipped_machine(datadir):
@@ -236,19 +378,13 @@ def test_machine_slot_override_cannot_escape_the_datadir(datadir):
         prof.machine_slot(datadir, "/etc/passwd")
 
 
-def test_a_datadir_without_a_machine_preset_says_how_to_fix_it(tmp_path):
-    with pytest.raises(prof.ProfileError, match="set MACHINE_SLOT"):
-        prof.machine_slot(tmp_path)
+def test_machine_slot_returns_none_without_a_machine(empty_datadir):
+    """No machine is an empty datadir, not a broken one: None lets the caller pick the answer."""
+    assert prof.machine_slot(empty_datadir) is None
 
 
-def test_list_presets_shows_exactly_one_of_each_on_the_seed(datadir):
-    presets = prof.list_presets(datadir)
-
-    assert {kind: len(rows) for kind, rows in presets.items()} == {
-        "machine": 1, "process": 1, "filament": 1}
-    assert presets["machine"][0]["name"] == MACHINE_NAME
-    # the machine_model file (type "machine_model") must not be selectable
-    assert all(row["name"] != "Generic Klipper Printer" for row in presets["machine"])
+def test_list_presets_on_the_empty_seed_is_three_empty_lists(empty_datadir):
+    assert prof.list_presets(empty_datadir) == {"machine": [], "process": [], "filament": []}
 
 
 def test_profiles_module_carries_no_personal_strings():

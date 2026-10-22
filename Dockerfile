@@ -28,7 +28,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ORCA_BIN=/opt/orca/bin/orca-slicer \
     ORCA_DATADIR=/data/orca-datadir \
     HOME=/data/home \
-    SEED_VERSION=2.4.2-1 \
+    SEED_VERSION=2.4.2-2 \
     PATH=/opt/venv/bin:$PATH
 
 RUN set -eu; [ "$(dpkg --print-architecture)" = "amd64" ] || { echo "print-portal images are amd64 only (the OrcaSlicer AppImage is x86_64)"; exit 1; }
@@ -68,11 +68,12 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 COPY scripts/smoke_test.py /opt/smoke_test.py
 COPY tests/fixtures/cube.stl /opt/smoke/cube.stl
+COPY tests/fixtures/portal-import.orca_printer /opt/smoke/bundle.orca_printer
 
 WORKDIR /app
 USER app
 
-RUN set -eu; mkdir -p /tmp/smoke; python3 /opt/smoke_test.py --orca /opt/orca/bin/orca-slicer --datadir /opt/orca-datadir --stl /opt/smoke/cube.stl --workdir /tmp/smoke --app-dir /app; rm -rf /tmp/smoke
+RUN set -eu; mkdir -p /tmp/smoke; python3 /opt/smoke_test.py --orca /opt/orca/bin/orca-slicer --datadir /opt/orca-datadir --stl /opt/smoke/cube.stl --workdir /tmp/smoke --app-dir /app --bundle /opt/smoke/bundle.orca_printer; rm -rf /tmp/smoke
 
 VOLUME ["/data"]
 EXPOSE 8088

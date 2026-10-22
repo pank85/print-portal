@@ -496,7 +496,7 @@ def test_upload_3mf_falls_back_to_the_machines_default_process(storage, api_clie
                                                               three_mf_bytes):
     """A file naming a local machine but a foreign process still gets a local process.
 
-    The shipped `generic-klipper-0.4.json` declares ``default_print_profile``; when the
+    The fixture machine preset declares ``default_print_profile``; when the
     3MF's `print_settings_id` matches no preset at all, that default is what the portal
     slices with, instead of keeping the foreign name and failing with `-17`.
     """

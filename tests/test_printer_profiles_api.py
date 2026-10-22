@@ -704,16 +704,20 @@ def test_process_only_select_is_not_refused_by_an_unreadable_machine_row(
 
     ``GET /api/profile`` reports both states, so the operator already has one place to see
     them; turning them into a selection error would refuse the only action that can repair
-    the datadir. Both requests are process-only, so ``_profile_rel`` never validates the
-    machine slot and the broken rel is reached through ``profile.json``. Pins the
-    machine-row early return of ``_reject_unpermitted_pair`` (app/main.py).
+    the datadir. A stored machine that no longer exists is dropped by ``active_paths`` and
+    replaced with the machine the datadir resolves to; an existing-but-unreadable row is
+    still honoured and reaches the machine-row early return of ``_reject_unpermitted_pair``.
+    Both requests are process-only, so a broken machine slot still never refuses the
+    selection (app/main.py).
     """
     absent_rel = "system/Custom/machine/missing.json"
     profile_file.write_text(json.dumps({"machine": absent_rel}))
     absent = api_client.post("/api/profile/select", json={"process": PROCESS_REL})
 
     assert absent.status_code == 200, absent.text
-    assert json.loads(profile_file.read_text())["machine"] == absent_rel
+    # the missing rel is ignored rather than carried into the slice: the document is
+    # rewritten with the machine the datadir resolves to
+    assert json.loads(profile_file.read_text())["machine"] == MACHINE_REL
 
     broken = datadir / "system/Custom/machine/broken.json"
     broken.write_text("{not json")
@@ -869,24 +873,24 @@ def test_add_printer_reports_an_empty_printer_list_instead_of_swallowing_it(
 
 def test_add_printer_reports_an_unresolvable_machine_slot(printer_store, profile_file,
                                                           api_client, monkeypatch):
-    """A datadir with no machine slot fails ``GET /api/profile``, so it is not absorbed.
+    """A datadir with no machine slot answers the pairing with 409, not a bare error.
 
-    The pairing is resolved through ``active_paths`` before the row exists, so the
-    ``ProfileError`` reaches the caller with nothing persisted: hiding it here would report
-    success for a deployment whose profile page cannot load at all. Pins ``ProfileError``
-    staying outside ``except OSError`` on the add path (app/main.py).
+    The pairing is resolved through the machine half of the selection before the row
+    exists, so the refusal reaches the caller as the same ``no_printer_profile`` body
+    every other preset-dependent action uses, with nothing persisted: hiding it here
+    would report success for a deployment whose profile page cannot slice at all.
     """
-    def no_slot() -> dict:
-        raise prof.ProfileError("no machine preset found in datadir (set MACHINE_SLOT)")
+    monkeypatch.setattr(main, "partial_selection", lambda: {})
 
-    monkeypatch.setattr(main, "active_paths", no_slot)
+    response = api_client.post("/api/printers",
+                               json={"name": "Core One", "url": "http://core.invalid:7125",
+                                     "api_key": "k-fedcba9876543210", "profiles": PAIRING})
 
-    with pytest.raises(prof.ProfileError):
-        # resolved before the add, so a refused pairing never creates the store
-        api_client.post("/api/printers",
-                        json={"name": "Core One", "url": "http://core.invalid:7125",
-                              "api_key": "k-fedcba9876543210", "profiles": PAIRING})
-
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert detail["error"] == "no_printer_profile"
+    assert detail["detail"] == prof.NO_MACHINE_MESSAGE
+    assert detail["missing"] == ["machine"]
     assert not printer_store.path.exists()  # refused before the add, so no row was ever stored
 
 
