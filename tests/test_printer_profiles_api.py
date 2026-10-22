@@ -110,6 +110,37 @@ def second_machine(datadir: Path) -> tuple[str, str]:
     return machine, process
 
 
+def guard_snapshot(printer_store: SimpleNamespace, profile_file: Path,
+                   datadir: Path) -> tuple[bytes, bytes, bytes]:
+    """The three states a refused pairing must leave byte-identical.
+
+    The request being refused writes all of them — the stored pairing in ``printers.json``,
+    the ``profile.json`` the slicer loads and the derived options preset — so a refusal that
+    landed on any one of them is the half-applied state the slicer answered with ``-17``.
+    """
+    return (profile_file.read_bytes(), printer_store.path.read_bytes(),
+            (datadir / prof.PORTAL_PROCESS_REL).read_bytes())
+
+
+def primed(datadir: Path, printer_store: SimpleNamespace, profile_file: Path,
+           api_client: TestClient) -> tuple[str, str]:
+    """A datadir with a forbidden machine, one stored printer and a written profile.
+
+    The printer owns the selection and ``POST /api/profile/select`` has written back its
+    pairing, so ``profile.json``, ``printers.json`` and the derived preset all exist as the
+    state a later refusal has to leave alone. Returns that machine and the process it
+    permits.
+    """
+    voron, voron_process = second_machine(datadir)
+    add_printer(api_client)
+    selected = api_client.post("/api/profile/select", json=PAIRING)
+    assert selected.status_code == 200, selected.text
+    assert profile_file.exists()                            # the selection reached the file
+    assert printer_store.path.exists()                      # and the row that owns it
+    assert (datadir / prof.PORTAL_PROCESS_REL).exists()     # and the derived options preset
+    return voron, voron_process
+
+
 # ---------------------------------------------------------------- add / patch
 def test_add_printer_with_profiles_persists_the_pairing(printer_store, profile_file,
                                                        api_client):
@@ -840,10 +871,10 @@ def test_add_printer_reports_an_unresolvable_machine_slot(printer_store, profile
                                                           api_client, monkeypatch):
     """A datadir with no machine slot fails ``GET /api/profile``, so it is not absorbed.
 
-    ``apply_pairing`` resolves the machine slot through ``active_paths``; hiding that
-    ``ProfileError`` here reported success for a deployment whose profile page cannot load
-    at all. Pins ``ProfileError`` staying outside the ``except OSError`` in
-    ``apply_pairing_to_active`` (app/main.py).
+    The pairing is resolved through ``active_paths`` before the row exists, so the
+    ``ProfileError`` reaches the caller with nothing persisted: hiding it here would report
+    success for a deployment whose profile page cannot load at all. Pins ``ProfileError``
+    staying outside ``except OSError`` on the add path (app/main.py).
     """
     def no_slot() -> dict:
         raise prof.ProfileError("no machine preset found in datadir (set MACHINE_SLOT)")
@@ -851,11 +882,12 @@ def test_add_printer_reports_an_unresolvable_machine_slot(printer_store, profile
     monkeypatch.setattr(main, "active_paths", no_slot)
 
     with pytest.raises(prof.ProfileError):
+        # resolved before the add, so a refused pairing never creates the store
         api_client.post("/api/printers",
                         json={"name": "Core One", "url": "http://core.invalid:7125",
                               "api_key": "k-fedcba9876543210", "profiles": PAIRING})
 
-    assert len(stored_document(printer_store)["printers"]) == 1    # the row still landed
+    assert not printer_store.path.exists()  # refused before the add, so no row was ever stored
 
 
 def test_patch_env_printer_succeeds_when_the_active_rows_key_is_undecryptable(
@@ -894,3 +926,253 @@ def test_select_still_reports_a_pairing_that_cannot_be_applied(printer_store, pr
 
     with pytest.raises(OSError):
         api_client.post(f"/api/printers/{view['id']}/select")
+
+
+# ------------------------------- the guard on every printer write path, not one endpoint
+def test_pairing_guard_refuses_an_unpermitted_add_without_adding_a_row(
+        printer_store, profile_file, api_client, datadir):
+    """A refused pairing must not leave a printer row behind.
+
+    ``POST /api/printers`` resolves before ``STORE.add``, so "no row for a refused pairing"
+    holds by construction — a rollback would have had to rewrite ``selected_id`` and could
+    itself fail on a read-only data dir. Pins the pre-add ``resolve_pairing`` call
+    (app/main.py).
+    """
+    voron, _voron_process = primed(datadir, printer_store, profile_file, api_client)
+    before = guard_snapshot(printer_store, profile_file, datadir)
+
+    response = api_client.post("/api/printers",
+                               json={"name": "Refused", "url": "http://refused.invalid:7125",
+                                     "api_key": "k-fedcba9876543210",
+                                     "profiles": {"machine": voron, "process": PROCESS_REL}})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert voron in detail
+    assert PROCESS_REL in detail
+    assert "not permitted" in detail
+    assert len(stored_document(printer_store)["printers"]) == 1   # the refused add added no row
+    assert guard_snapshot(printer_store, profile_file, datadir) == before
+
+
+def test_pairing_guard_refuses_a_first_printer_without_creating_the_store(
+        printer_store, profile_file, api_client, datadir):
+    """With no printer yet, a refused pairing never brings ``printers.json`` into being."""
+    voron, _voron_process = second_machine(datadir)
+
+    response = api_client.post("/api/printers",
+                               json={"name": "Refused", "url": "http://refused.invalid:7125",
+                                     "api_key": "k-fedcba9876543210",
+                                     "profiles": {"machine": voron, "process": PROCESS_REL}})
+
+    assert response.status_code == 409, response.text
+    assert "not permitted" in response.json()["detail"]
+    assert not printer_store.path.exists()      # not even the store file was written
+    assert not profile_file.exists()            # and nothing was written to profile.json either
+
+
+def test_pairing_guard_permits_an_add_that_the_datadir_allows(
+        printer_store, profile_file, api_client, datadir):
+    """The control for the add path: a pair the process declares compatible is stored."""
+    voron, voron_process = second_machine(datadir)
+
+    view = add_printer(api_client, profiles={"machine": voron, "process": voron_process})
+
+    assert profiles_of(printer_store, view["id"]) == {"machine": voron,
+                                                      "process": voron_process}
+    profile = json.loads(profile_file.read_text())
+    assert profile["machine"] == voron                  # the first printer owns the selection
+    assert profile["process"] == voron_process
+
+
+def test_pairing_guard_refuses_a_machine_only_patch_against_the_stored_process(
+        printer_store, profile_file, api_client, datadir):
+    """A machine-only pairing carries the stored process, so the merged pair is refused.
+
+    Judging the body alone would store ``voron`` with the stored ``PROCESS_REL``, which is
+    the pair the slicer refuses. ``printers.json`` staying byte-identical also pins that the
+    refusal happens before the row is rewritten. Pins the pre-update ``resolve_pairing``
+    call (app/main.py).
+    """
+    voron, _voron_process = primed(datadir, printer_store, profile_file, api_client)
+    active = api_client.get("/api/printers").json()["selected_id"]
+    before_pairing = profiles_of(printer_store, active)
+    before = guard_snapshot(printer_store, profile_file, datadir)
+
+    response = api_client.patch(f"/api/printers/{active}",
+                                json={"profiles": {"machine": voron}})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert voron in detail
+    assert PROCESS_REL in detail    # the process profile.json holds, not a slot named in the body
+    assert "not permitted" in detail
+    assert before_pairing == {"machine": MACHINE_REL, "process": PROCESS_REL}
+    assert profiles_of(printer_store, active) == before_pairing
+    assert guard_snapshot(printer_store, profile_file, datadir) == before
+
+
+def test_pairing_guard_refuses_a_process_only_patch_against_the_stored_machine(
+        printer_store, profile_file, api_client, datadir):
+    """A process-only pairing lands under the stored machine, so that pair is refused too.
+
+    The mirror image of the machine-only case: leaving the machine slot out of the body is
+    not a way to store a process the stored machine forbids. Pins the pre-update
+    ``resolve_pairing`` call (app/main.py).
+    """
+    _voron, voron_process = primed(datadir, printer_store, profile_file, api_client)
+    active = api_client.get("/api/printers").json()["selected_id"]
+    before_pairing = profiles_of(printer_store, active)
+    before = guard_snapshot(printer_store, profile_file, datadir)
+
+    response = api_client.patch(f"/api/printers/{active}",
+                                json={"profiles": {"process": voron_process}})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert voron_process in detail
+    assert MACHINE_REL in detail    # the machine profile.json holds, not a slot named in the body
+    assert "not permitted" in detail
+    assert profiles_of(printer_store, active) == before_pairing
+    assert guard_snapshot(printer_store, profile_file, datadir) == before
+
+
+def test_pairing_guard_permits_a_patch_that_the_datadir_allows(
+        printer_store, profile_file, api_client, datadir):
+    """The control for the patch path: a permitted pair reaches the row and the file."""
+    voron, voron_process = primed(datadir, printer_store, profile_file, api_client)
+    active = api_client.get("/api/printers").json()["selected_id"]
+
+    response = api_client.patch(f"/api/printers/{active}",
+                                json={"profiles": {"machine": voron,
+                                                   "process": voron_process}})
+
+    assert response.status_code == 200, response.text
+    assert profiles_of(printer_store, active) == {"machine": voron, "process": voron_process}
+    profile = json.loads(profile_file.read_text())
+    assert profile["machine"] == voron
+    assert profile["process"] == voron_process
+
+
+def test_pairing_guard_refuses_a_select_of_a_stored_unpermitted_pair(
+        printer_store, profile_file, api_client, datadir):
+    """A row an older build already paired with a forbidden pair cannot be selected.
+
+    ``select_printer`` persists ``selected_id``, so the refusal has to come before it: a
+    selection that moved would leave the operator on a printer whose presets were rejected.
+    Pins the view → resolve → select ordering in ``api_select_printer`` (app/main.py).
+    """
+    voron, _voron_process = primed(datadir, printer_store, profile_file, api_client)
+    selected = api_client.get("/api/printers").json()["selected_id"]
+    legacy = printer_store.store.add("Legacy", "http://legacy.invalid:7125",
+                                     "k-fedcba9876543210",
+                                     profiles={"machine": voron, "process": PROCESS_REL})
+    before = guard_snapshot(printer_store, profile_file, datadir)
+
+    response = api_client.post(f"/api/printers/{legacy.id}/select")
+
+    assert response.status_code == 409, response.text
+    assert "not permitted" in response.json()["detail"]
+    assert api_client.get("/api/printers").json()["selected_id"] == selected
+    assert guard_snapshot(printer_store, profile_file, datadir) == before
+
+
+def test_pairing_guard_permits_a_select_of_a_permitted_pair(printer_store, profile_file,
+                                                            api_client, datadir):
+    """The control for the select path: a permitted stored pair is applied as before."""
+    voron, voron_process = second_machine(datadir)
+    view = add_printer(api_client, profiles={"machine": voron, "process": voron_process})
+    profile_file.write_text(json.dumps({"machine": MACHINE_REL, "process": PROCESS_REL}))
+
+    response = api_client.post(f"/api/printers/{view['id']}/select")
+
+    assert response.status_code == 200, response.text
+    profile = json.loads(profile_file.read_text())
+    assert profile["machine"] == voron
+    assert profile["process"] == voron_process
+
+
+def test_pairing_guard_refuses_an_env_pairing_that_the_datadir_forbids(
+        printer_store, profile_file, api_client, datadir, env_seed):
+    """The env row's pairing is a write like any other, so it is guarded the same way.
+
+    ``env_profiles`` is persisted before the apply, so a refusal after it would store the
+    forbidden pair even though the request failed. Pins the pre-``set_env_pairing``
+    ``resolve_pairing`` call in ``patch_env_printer`` (app/main.py).
+    """
+    voron, _voron_process = primed(datadir, printer_store, profile_file, api_client)
+    paired = api_client.patch("/api/printers/env", json={"profiles": PAIRING})
+    assert paired.status_code == 200, paired.text
+    before = guard_snapshot(printer_store, profile_file, datadir)
+
+    response = api_client.patch("/api/printers/env",
+                                json={"profiles": {"machine": voron,
+                                                   "process": PROCESS_REL}})
+
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert voron in detail
+    assert PROCESS_REL in detail
+    assert "not permitted" in detail
+    assert stored_document(printer_store)["env_profiles"] == PAIRING
+    assert guard_snapshot(printer_store, profile_file, datadir) == before
+
+
+def test_pairing_guard_permits_an_env_pairing_that_the_datadir_allows(
+        printer_store, profile_file, api_client, datadir, env_seed):
+    """The control for the env path: a permitted pair is stored and applied to the file."""
+    voron, voron_process = second_machine(datadir)
+
+    response = api_client.patch("/api/printers/env",
+                                json={"profiles": {"machine": voron,
+                                                   "process": voron_process}})
+
+    assert response.status_code == 200, response.text
+    assert stored_document(printer_store)["env_profiles"] == {"machine": voron,
+                                                              "process": voron_process}
+    profile = json.loads(profile_file.read_text())      # the seed is the selection here
+    assert profile["machine"] == voron
+    assert profile["process"] == voron_process
+
+
+def test_pairing_guard_does_not_refuse_a_select_of_an_unreadable_machine(
+        printer_store, profile_file, api_client, datadir):
+    """A machine row that is gone is a broken datadir, not a forbidden pair.
+
+    ``GET /api/profile`` already reports the missing preset, and refusing the selection
+    would block the only action that can repair it — the same reason the dashboard's own
+    selection is not refused. Pins the machine-row early return of
+    ``_reject_unpermitted_pair`` (app/main.py) on the select path.
+    """
+    missing = "system/Custom/machine/deleted.json"
+    row = printer_store.store.add("Stale", "http://stale.invalid:7125",
+                                  "k-fedcba9876543210",
+                                  profiles={"machine": missing, "process": PROCESS_REL})
+
+    response = api_client.post(f"/api/printers/{row.id}/select")
+
+    assert response.status_code == 200, response.text
+    profile = json.loads(profile_file.read_text())
+    assert profile["machine"] == missing                # carried over, not repaired over
+    assert profile["process"] == PROCESS_REL
+
+
+def test_pairing_guard_keeps_400_for_a_body_named_selection(
+        printer_store, profile_file, api_client, datadir):
+    """The same pair is 409 on a printer route and 400 on the dashboard's own selection.
+
+    On the printer routes the pair conflicts with the stored state; on
+    ``POST /api/profile/select`` the body *is* the pair, so a malformed-body 400 is what eight
+    existing tests pin. One condition, one text, two codes on purpose. Pins the ``status``
+    argument of ``_reject_unpermitted_pair`` (app/main.py).
+    """
+    voron, _voron_process = primed(datadir, printer_store, profile_file, api_client)
+    active = api_client.get("/api/printers").json()["selected_id"]
+    refused_pair = {"machine": voron, "process": PROCESS_REL}
+
+    patched = api_client.patch(f"/api/printers/{active}", json={"profiles": refused_pair})
+    selection = api_client.post("/api/profile/select", json=refused_pair)
+
+    assert patched.status_code == 409, patched.text
+    assert selection.status_code == 400, selection.text
+    assert patched.json()["detail"] == selection.json()["detail"]
