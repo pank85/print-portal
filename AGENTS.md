@@ -25,6 +25,14 @@ over HTTP. One container, no database, no shared filesystem with the printer hos
 Runtime paths inside the container (see `README.md` → Configuration): `ORCA_BIN=/opt/orca/bin/orca-slicer`,
 `ORCA_DATADIR=$DATA_DIR/orca-datadir` (writable copy), `HOME=$DATA_DIR/home`.
 
+## UI work
+
+Any task that changes how the interface looks, feels, moves or is interacted with (`app/index.html`, its
+inline CSS/JS, the dashboard or settings views) must load the pi skill **ui-ux-pro-max** first —
+`/skill:ui-ux-pro-max` in a session, `~/.pi/agent/skills/ui-ux-pro-max` on disk. Follow its guidance for
+layout, spacing, typography, colour, interaction and accessibility instead of ad-hoc CSS choices. Skip it
+only for pure backend work.
+
 ## Presets
 
 The OrcaSlicer CLI refuses a machine preset whose identity is not the indexed slot (`-17`), so the portal merges an imported machine onto the slot `system/Custom/machine/generic-klipper-0.4.json` instead of creating a new machine.
