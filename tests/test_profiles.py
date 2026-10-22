@@ -387,6 +387,81 @@ def test_list_presets_on_the_empty_seed_is_three_empty_lists(empty_datadir):
     assert prof.list_presets(empty_datadir) == {"machine": [], "process": [], "filament": []}
 
 
+def test_bed_limits_reads_the_preset(datadir):
+    limits = prof.bed_limits(datadir / prof.DEFAULT_PROFILE["machine"])
+
+    assert (limits.xmin, limits.ymin, limits.xmax, limits.ymax, limits.zmax) == (
+        0.0, 0.0, 220.0, 220.0, 250.0)
+    assert limits.size == (220.0, 220.0, 250.0)
+    assert limits.machine == MACHINE_NAME
+
+
+def test_bed_limits_keeps_the_min_corner(tmp_path):
+    """An offset bed is 220 mm across, not 230: the min corner is where the span starts."""
+    machine = tmp_path / "offset-bed.json"
+    machine.write_text(json.dumps({
+        "name": "Offset Bed",
+        "printable_area": ["10x10", "230x10", "230x230", "10x230"],
+        "printable_height": "300",
+    }))
+
+    limits = prof.bed_limits(machine)
+
+    assert limits.xmin == limits.ymin == 10.0
+    assert limits.size == (220.0, 220.0, 300.0)
+
+
+@pytest.mark.parametrize("fields, field", [
+    ({"name": "No Area", "printable_height": "300"}, "printable_area"),
+    ({"name": "Empty Area", "printable_area": [],
+      "printable_height": "300"}, "printable_area"),
+    ({"name": "Bad Area", "printable_area": ["0x0", "oops"],
+      "printable_height": "300"}, "printable_area"),
+    ({"name": "No Height",
+      "printable_area": ["0x0", "220x0", "220x220", "0x220"]}, "printable_height"),
+    ({"name": "Bad Height", "printable_area": ["0x0", "220x0", "220x220", "0x220"],
+      "printable_height": "tall"}, "printable_height"),
+])
+def test_bed_limits_refuses_missing_and_unparsable_fields(tmp_path, fields, field):
+    machine = tmp_path / "machine.json"
+    machine.write_text(json.dumps(fields))
+
+    with pytest.raises(prof.ProfileError) as excinfo:
+        prof.bed_limits(machine)
+
+    assert fields["name"] in str(excinfo.value)
+    assert field in str(excinfo.value)
+
+
+def test_new_options_default_the_right_way():
+    options = prof.read_options({})
+    assert options["auto_orient"] is True
+    assert options["shrink_to_fit"] is False
+
+    with pytest.raises(prof.ProfileError, match="auto_orient must be true or false"):
+        prof.validate_options({"auto_orient": "yes"})
+    with pytest.raises(prof.ProfileError, match="shrink_to_fit must be true or false"):
+        prof.validate_options({"shrink_to_fit": 1})
+
+    assert prof.validate_options({"auto_orient": False}) == {"auto_orient": False}
+
+
+def test_new_options_do_not_touch_the_derived_preset(datadir):
+    """Both are command-line switches, so no preset gains a field for them."""
+    process = datadir / prof.DEFAULT_PROFILE["process"]
+    prof.write_derived_process(process, datadir, dict(prof.DEFAULT_OPTIONS))
+    before = json.loads((datadir / prof.PORTAL_PROCESS_REL).read_text())
+
+    flipped = {**prof.DEFAULT_OPTIONS, "auto_orient": False, "shrink_to_fit": True}
+    prof.write_derived_process(process, datadir, flipped)
+    after = json.loads((datadir / prof.PORTAL_PROCESS_REL).read_text())
+
+    assert "auto_orient" not in after
+    assert "shrink_to_fit" not in after
+    assert set(after) == set(before)
+    assert prof.derived_state(process, datadir, flipped)["stale"] is False
+
+
 def test_profiles_module_carries_no_personal_strings():
     source = (ROOT / "app" / "profiles.py").read_text()
 

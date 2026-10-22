@@ -703,7 +703,8 @@ def test_upload_3mf_records_a_profile_snapshot(storage, api_client, switchable,
 
     assert read_job(jobs, jid)["profile_snapshot"] == {
         "machine": MACHINE_REL, "process": PROCESS_REL, "filament": FILAMENT_REL,
-        "options": {"supports": False, "brim": True, "hide_profiles": False},
+        "options": {"supports": False, "brim": True, "hide_profiles": False,
+                    "auto_orient": True, "shrink_to_fit": False},
     }
 
 
@@ -807,6 +808,216 @@ def test_run_slice_holds_the_derived_lock_across_the_launch(storage, switchable,
     assert not saver.is_alive()
     assert applied.is_set()               # released with the launch, not leaked
     assert read_job(jobs, jid)["status"] == "sliced"
+
+
+# ---------------------------------------------------------------- fitting the bed
+FIT_SNAPSHOT_OPTIONS = {"supports": False, "brim": True, "hide_profiles": False}
+
+
+def orientation(cmd: list[str]) -> str | None:
+    """The value after ``--orient``, or None when the flag is absent."""
+    return cmd[cmd.index("--orient") + 1] if "--orient" in cmd else None
+
+
+def scale_of(cmd: list[str]) -> str | None:
+    """The value after ``--scale``, or None when the flag is absent."""
+    return cmd[cmd.index("--scale") + 1] if "--scale" in cmd else None
+
+
+def queued_job(jobs: Path, blob: bytes, *, filename: str = "cube.stl",
+               slicer_input: str | None = None, options: dict | None = None,
+               jid: str = "decafbad1234") -> str:
+    """A queued job holding ``blob`` and a snapshot of the private datadir's presets."""
+    upload_dir = jobs / jid / "upload"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / (slicer_input or filename)).write_bytes(blob)
+    meta = {"id": jid, "status": "queued", "filename": filename,
+            "output_name": Path(filename).stem,
+            "profile_snapshot": {"machine": MACHINE_REL, "process": PROCESS_REL,
+                                 "filament": FILAMENT_REL,
+                                 "options": {**FIT_SNAPSHOT_OPTIONS, **(options or {})}}}
+    if slicer_input is not None:
+        meta["slicer_input"] = slicer_input
+    (jobs / jid / "job.json").write_text(json.dumps(meta))
+    return jid
+
+
+def scaled_cube(cube: bytes, factor: float) -> bytes:
+    """The 20 mm cube fixture with every vertex scaled: ``factor=15`` is 300 mm a side."""
+    lines = []
+    for line in cube.decode().splitlines():
+        parts = line.split()
+        if parts[:1] == ["vertex"]:
+            line = "      vertex " + " ".join(f"{float(v) * factor:g}" for v in parts[1:4])
+        lines.append(line)
+    return ("\n".join(lines) + "\n").encode()
+
+
+def record_slice(monkeypatch: pytest.MonkeyPatch, calls: list[list[str]]) -> None:
+    """Stand in for the CLI: record every argv and leave the gcode it would have written."""
+    def fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        (Path(kwargs["cwd"]) / "out" / "cube.gcode").write_text(
+            "; total filament used [g] = 1\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+
+def test_a_plain_job_adds_no_new_flags(storage, switchable, monkeypatch, cube_stl):
+    """Defaults — orient on, shrink off — and a model that fits: the argv keeps its shape."""
+    jobs, _sliced = storage
+    jid = queued_job(jobs, cube_stl)
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(jid)
+
+    cmd = calls[0]
+    assert orientation(cmd) == "1"
+    assert scale_of(cmd) is None
+    assert cmd[-1] == str(jobs / jid / "upload" / "cube.stl")
+    job = read_job(jobs, jid)
+    assert job["auto_orient"] is True
+    assert job["auto_orient_used"] is True
+    assert job["shrink_to_fit"] is False
+    assert job["fit_scale"] == 1.0
+    assert job["model_size"] == {"x": 20.0, "y": 20.0, "z": 20.0}
+
+
+def test_auto_orient_off_passes_no_orient_flag(storage, switchable, monkeypatch, cube_stl):
+    jobs, _sliced = storage
+    jid = queued_job(jobs, cube_stl, options={"auto_orient": False})
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(jid)
+
+    cmd = calls[0]
+    assert "--orient" not in cmd
+    assert "--scale" not in cmd
+    assert cmd[-1] == str(jobs / jid / "upload" / "cube.stl")
+    assert read_job(jobs, jid)["auto_orient_used"] is False
+
+
+def test_shrink_off_refuses_a_model_too_big_for_the_bed(storage, switchable, monkeypatch,
+                                                       cube_stl):
+    jobs, _sliced = storage
+    jid = queued_job(jobs, scaled_cube(cube_stl, 15))
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(jid)
+
+    assert calls == []                       # refused before the CLI is ever launched
+    job = read_job(jobs, jid)
+    assert job["status"] == "failed"
+    assert "300x300x300" in job["error"]
+    assert "220x220x250" in job["error"]
+
+
+def test_shrink_on_scales_and_forces_orient(storage, switchable, monkeypatch, cube_stl):
+    """A shrink forces orient: ``--scale`` without ``--orient 1`` does not slice at all."""
+    jobs, _sliced = storage
+    jid = queued_job(jobs, scaled_cube(cube_stl, 15),
+                     options={"shrink_to_fit": True, "auto_orient": False})
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(jid)
+
+    cmd = calls[0]
+    assert cmd[cmd.index("--orient"):] == [
+        "--orient", "1", "--scale", "0.68", "--outputdir",
+        str(jobs / jid / "out"), str(jobs / jid / "upload" / "cube.stl")]
+    job = read_job(jobs, jid)
+    assert job["fit_scale"] == 0.68
+    assert job["auto_orient"] is False
+    assert job["auto_orient_used"] is True
+
+
+@pytest.mark.parametrize("auto_orient, orient_flag", [(True, "1"), (False, None)])
+def test_shrink_on_a_model_that_fits_passes_no_scale(storage, switchable, monkeypatch,
+                                                     cube_stl, auto_orient, orient_flag):
+    jobs, _sliced = storage
+    jid = queued_job(jobs, cube_stl,
+                     options={"shrink_to_fit": True, "auto_orient": auto_orient})
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(jid)
+
+    cmd = calls[0]
+    assert scale_of(cmd) is None             # k == 1: no --scale 1 either
+    assert orientation(cmd) == orient_flag
+    assert read_job(jobs, jid)["fit_scale"] == 1.0
+
+
+def test_a_3mf_with_shrink_off_slices_as_before(storage, switchable, monkeypatch,
+                                               three_mf_bytes):
+    """An unmeasurable 3MF stays advisory: OrcaSlicer orients it without a bbox from us."""
+    jobs, _sliced = storage
+    jid = queued_job(jobs, three_mf_bytes(), filename="benchy.3mf",
+                     slicer_input="slice-benchy.3mf")
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(jid)
+
+    cmd = calls[0]
+    assert orientation(cmd) == "1"
+    assert scale_of(cmd) is None
+    assert cmd[-1] == str(jobs / jid / "upload" / "slice-benchy.3mf")
+    assert read_job(jobs, jid)["status"] == "sliced"
+
+
+def test_a_3mf_with_shrink_on_fails_with_both_escapes(storage, switchable, monkeypatch,
+                                                     three_mf_bytes):
+    jobs, _sliced = storage
+    jid = queued_job(jobs, three_mf_bytes(), filename="benchy.3mf",
+                     slicer_input="slice-benchy.3mf", options={"shrink_to_fit": True})
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(jid)
+
+    assert calls == []
+    job = read_job(jobs, jid)
+    assert job["status"] == "failed"
+    assert "3D/3dmodel.model" in job["error"]
+    assert "turn shrink to fit off" in job["error"]
+    assert "STL" in job["error"]
+    assert "import a preset" not in job["error"]        # a geometry problem, not a preset one
+
+
+def test_a_preset_without_printable_area_still_slices_when_shrink_is_off(
+        storage, switchable, monkeypatch, cube_stl):
+    """A preset predating ``printable_area`` cannot be measured; without shrink that is advisory."""
+    jobs, _sliced = storage
+    preset = switchable.datadir / MACHINE_REL
+    machine = json.loads(preset.read_text())
+    del machine["printable_area"]
+    preset.write_text(json.dumps(machine))
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(queued_job(jobs, cube_stl))
+
+    assert orientation(calls[0]) == "1"
+    assert read_job(jobs, "decafbad1234")["status"] == "sliced"
+
+    launched = len(calls)
+    jid = queued_job(jobs, cube_stl, jid="beefcafe1234", options={"shrink_to_fit": True})
+    main.run_slice(jid)
+
+    assert len(calls) == launched            # a shrink needs the bed, so it refuses
+    job = read_job(jobs, jid)
+    assert job["status"] == "failed"
+    assert "no printable_area" in job["error"]
+    assert "Generic Klipper 0.4 nozzle" in job["error"]
+    # a preset problem: the escapes name the preset, not the upload format
+    assert "import a preset with printable_area" in job["error"]
+    assert "export the model as STL" not in job["error"]
 
 
 def test_upload_zip_oversize_member_is_a_413_without_a_job_dir(storage, api_client,

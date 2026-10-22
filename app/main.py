@@ -48,6 +48,8 @@ from fastapi.responses import FileResponse, HTMLResponse
 
 import archives
 import config
+import fit
+import mesh
 import moonraker
 import printers
 import profiles as prof
@@ -680,6 +682,41 @@ def run_slice(jid: str) -> None:
 
     write_job(jid, status="slicing", error=None, started=time.time())
     paths, options = slice_profile(job)
+    # Measured before the lock: the file and the preset are read-only here, and the job has
+    # to record what it intends to do even when the slice itself hangs.
+    shrink = bool(options.get("shrink_to_fit"))
+    plan = None
+    try:
+        plan = fit.plan_fit(src, paths["machine"], shrink_to_fit=shrink)
+    except mesh.MeshError as exc:
+        if shrink:                                  # advisory when shrink is off
+            # the parser cannot know about the option, so the escapes live here
+            write_job(jid, status="failed",
+                      error=f"{exc} — turn shrink to fit off for this job, or export the "
+                            f"model as STL and upload that",
+                      auto_orient=bool(options.get("auto_orient")), shrink_to_fit=shrink)
+            return
+    except prof.ProfileError as exc:
+        if shrink:                                  # a preset problem: point at the preset, not at the upload format
+            write_job(jid, status="failed",
+                      error=f"{exc} — the selected printer profile cannot be used for shrink "
+                            f"to fit; import a preset with printable_area and printable_height, "
+                            f"or turn shrink to fit off for this job",
+                      auto_orient=bool(options.get("auto_orient")), shrink_to_fit=shrink)
+            return
+    except fit.FitError as exc:
+        write_job(jid, status="failed", error=str(exc),
+                  auto_orient=bool(options.get("auto_orient")), shrink_to_fit=shrink)
+        return
+    orient = bool(options.get("auto_orient")) or (plan is not None and plan.scale < 1.0)
+    write_job(jid, auto_orient=bool(options.get("auto_orient")), auto_orient_used=orient,
+              shrink_to_fit=shrink,
+              fit_scale=(plan.scale if plan is not None else None),
+              model_size=({"x": round(plan.bbox.size[0], 1), "y": round(plan.bbox.size[1], 1),
+                           "z": round(plan.bbox.size[2], 1)} if plan is not None else None),
+              bed_limits=({"x": round(plan.bed.xmax - plan.bed.xmin, 1),
+                           "y": round(plan.bed.ymax - plan.bed.ymin, 1),
+                           "z": round(plan.bed.zmax, 1)} if plan is not None else None))
     # Hand-built environment: the slicer runs headless and must not inherit the Moonraker
     # API key (or anything else) from this process.
     env = {
@@ -707,9 +744,12 @@ def run_slice(jid: str) -> None:
             "--load-settings", f"{paths['machine']};{process}",
             "--load-filaments", str(paths["filament"]),
             "--slice", "0",
-            "--outputdir", str(out),
-            str(src),
         ]
+        if orient:
+            cmd += ["--orient", "1"]
+        if plan is not None and plan.scale < 1.0:
+            cmd += ["--scale", f"{plan.scale:g}"]
+        cmd += ["--outputdir", str(out), str(src)]
         try:
             proc = subprocess.run(
                 cmd, cwd=str(d), env=env, capture_output=True, text=True,

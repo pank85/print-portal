@@ -27,6 +27,7 @@ import re
 import shutil
 import tempfile
 import zipfile
+from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 
 FOLDER_TYPE = {"printer": "machine", "machine": "machine",
@@ -49,11 +50,14 @@ DEFAULT_PROFILE = {
     "filament": "system/Custom/filament/generic-pla.json",
 }
 
-# The three persisted "basic options". These are the portal's own state, not a copy of any
-# preset: supports off, and a brim on because the CLI's own `brim_width` defaults to "5" when
-# nothing overrides it. `regenerate_derived` writes them into the derived process preset.
-OPTION_KEYS = ("supports", "brim", "hide_profiles")
-DEFAULT_OPTIONS = {"supports": False, "brim": True, "hide_profiles": False}
+# The persisted "basic options". These are the portal's own state, not a copy of any preset:
+# supports off, and a brim on because the CLI's own `brim_width` defaults to "5" when nothing
+# overrides it. `regenerate_derived` writes `supports`/`brim` into the derived process preset;
+# `hide_profiles` is a UI switch and `auto_orient`/`shrink_to_fit` are command-line switches,
+# so those three never reach a preset.
+OPTION_KEYS = ("supports", "brim", "hide_profiles", "auto_orient", "shrink_to_fit")
+DEFAULT_OPTIONS = {"supports": False, "brim": True, "hide_profiles": False,
+                   "auto_orient": True, "shrink_to_fit": False}
 
 # The derived process preset that carries the options into a slice. It lives inside the writable
 # datadir next to imported presets, and is hidden from the preset picker (`list_presets`).
@@ -282,6 +286,69 @@ def machine_slot(datadir: Path, override: str | None = None) -> Path | None:
             return f.relative_to(datadir)
 
     return None
+
+
+@dataclass(frozen=True, slots=True)
+class BedLimits:
+    """The printable box of one machine preset, in millimetres."""
+
+    xmin: float
+    ymin: float
+    xmax: float
+    ymax: float
+    zmax: float
+    machine: str
+
+    @property
+    def size(self) -> tuple[float, float, float]:
+        """(xmax-xmin, ymax-ymin, zmax) in millimetres."""
+        return (self.xmax - self.xmin, self.ymax - self.ymin, self.zmax)
+
+
+def bed_limits(machine: Path) -> BedLimits:
+    """Read the printable limits out of ONE machine preset file.
+
+    `inherits` is deliberately not resolved: the CLI loads only the file it is given, so an
+    inherited `printable_area` would not reach the slice and is reported as missing instead.
+    The min corner is kept — a bed authored `10x10`..`230x230` is a 220 mm span, not 230.
+    """
+    path = Path(machine)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError) as exc:
+        raise ProfileError(f"machine preset '{path.stem}' is not readable") from exc
+    if not isinstance(data, dict):
+        raise ProfileError(f"machine preset '{path.stem}' is not readable")
+
+    name = data.get("name")
+    name = name if isinstance(name, str) and name else path.stem
+
+    area = data.get("printable_area")
+    if area is None:
+        raise ProfileError(f"machine preset '{name}' has no printable_area")
+    xs: list[float] = []
+    ys: list[float] = []
+    try:
+        if not isinstance(area, list) or len(area) < 3:
+            raise ValueError
+        for corner in area:
+            x, y = str(corner).lower().split("x")
+            xs.append(float(x))
+            ys.append(float(y))
+    except (AttributeError, TypeError, ValueError):
+        raise ProfileError(
+            f"machine preset '{name}' has an unparsable printable_area") from None
+
+    height = data.get("printable_height")
+    if height is None:
+        raise ProfileError(f"machine preset '{name}' has no printable_height")
+    try:
+        zmax = float(str(height))
+    except (TypeError, ValueError):
+        raise ProfileError(
+            f"machine preset '{name}' has an unparsable printable_height") from None
+
+    return BedLimits(min(xs), min(ys), max(xs), max(ys), zmax, name)
 
 
 def clamp_area(area: list[str], bed: tuple[float, float]) -> list[str] | None:
@@ -595,6 +662,8 @@ def effective_process(process: Path, datadir: Path, options: dict[str, bool]) ->
     return {
         "supports": bool(options.get("supports")),
         "brim": brim,
+        "auto_orient": bool(options.get("auto_orient", DEFAULT_OPTIONS["auto_orient"])),
+        "shrink_to_fit": bool(options.get("shrink_to_fit", DEFAULT_OPTIONS["shrink_to_fit"])),
         "brim_width": fields["brim_width"] if brim else None,
         "machine": _effective_machine(Path(datadir), data),
         "process": _derived_name(process, data),
