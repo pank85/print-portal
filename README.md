@@ -67,7 +67,7 @@ Then open <http://localhost:8088>, upload an STL, and press **Print**.
 `.env.example` and `docker-compose.yml` in this repository are the real configuration files; the
 quickstart above is all you need to start.
 
-### Run the published image
+### Run the published image (Docker Compose)
 
 The image is also on Docker Hub, so you can run it without cloning anything:
 
@@ -80,16 +80,73 @@ sudo chown -R 1000:1000 data sliced   # the container runs as uid 1000
 docker compose -f docker-compose.hub.yml up -d
 ```
 
-Or with plain Docker:
+### Without Docker Compose
+
+Compose is convenient, not required. This is the whole thing with the plain `docker` CLI.
+
+**1. Prepare two host directories.** The container runs as uid 1000 and writes to both:
 
 ```bash
-docker run -d --name print-portal --restart unless-stopped \
-  -p 8088:8088 -v "$PWD/data:/data" -v "$PWD/sliced:/sliced" \
-  -e SLICED_DIR=/sliced -e PRINTER_URL=http://moonraker:7125 -e MOONRAKER_API_KEY=... \
-  --memory 2g pank85/print-portal:2.2.1
+mkdir -p "$HOME/print-portal/data" "$HOME/print-portal/sliced"
+sudo chown -R 1000:1000 "$HOME/print-portal"
 ```
 
-What you need to know before pulling it:
+**2. Run it.** Substitute your Moonraker URL and API key (or omit both and add the printer
+later in Settings → Printers):
+
+```bash
+docker run -d \
+  --name print-portal \
+  --restart unless-stopped \
+  -p 8088:8088 \
+  -v "$HOME/print-portal/data:/data" \
+  -v "$HOME/print-portal/sliced:/sliced" \
+  -e SLICED_DIR=/sliced \
+  -e PRINTER_URL=http://moonraker.local:7125 \
+  -e MOONRAKER_API_KEY=your-key-here \
+  --memory 2g \
+  --health-cmd 'python3 -c "import os,urllib.request,sys;sys.exit(0 if urllib.request.urlopen(\"http://127.0.0.1:8088/api/health\",timeout=4).status==200 else 1)"' \
+  --health-interval 30s --health-timeout 5s --health-retries 3 --health-start-period 25s \
+  pank85/print-portal:2.2.1
+```
+
+`-p 8088:8088` is host:container. Change the left side only (`-p 9080:8088`) if 8088 is taken —
+`PORT` inside the container must stay 8088 unless you also set `-e PORT=...`.
+
+**3. Check it came up**, then open <http://localhost:8088>:
+
+```bash
+docker ps --filter name=print-portal
+docker logs -f print-portal          # ctrl-c to stop following
+curl -s http://localhost:8088/api/health
+```
+
+**4. Import a preset bundle before slicing.** The image ships none, so the first slice answers
+`409 no_printer_profile` until you upload your `.orca_printer` through the profile card in the UI
+(see [First run](#first-run) for how to export it from OrcaSlicer).
+
+**5. Update to a new release.** The data lives in the host directories, so replacing the container
+loses nothing:
+
+```bash
+docker pull pank85/print-portal:2.2.1      # or the newer version you want
+docker rm -f print-portal                  # safe: data is on the host
+# then re-run the `docker run` command from step 2
+```
+
+There is no `docker compose` state to keep in sync, and no migration step: the app reads the
+datadir it finds.
+
+**6. Stop / remove:**
+
+```bash
+docker stop print-portal                   # keeps the container, keeps the data
+docker rm -f print-portal                  # deletes the container, keeps ./data and ./sliced
+```
+
+Deleting `./data` is a factory reset — presets, printers and job history all live there.
+
+### Before you pull it
 
 - **Tags.** `latest` follows the newest release; pin an explicit version (`pank85/print-portal:2.2.1`)
   if you want a fixed artifact. Available tags:
