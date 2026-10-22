@@ -25,7 +25,7 @@ import config
 import main
 import printers
 
-VIEW_KEYS = {"id", "name", "url", "api_key_masked", "has_api_key", "selected",
+VIEW_KEYS = {"id", "name", "url", "ui_url", "api_key_masked", "has_api_key", "selected",
              "source", "editable", "pairing_editable", "profiles", "created", "updated"}
 TEST_KEYS = {"ok", "state", "webhooks", "error", "url", "ms"}
 MACHINE_REL = "system/Custom/machine/generic-klipper-0.4.json"
@@ -93,15 +93,21 @@ def profile_file(tmp_path: Path, datadir: Path, monkeypatch: pytest.MonkeyPatch)
     return cfg.profile_file
 
 
-def seed_printer(api_key: str = "env-secret-key") -> printers.SeededPrinter:
+def seed_printer(api_key: str = "env-secret-key",
+                 ui_url: str = "") -> printers.SeededPrinter:
     return printers.SeededPrinter(id=printers.ENV_PRINTER_ID, name="Default (environment)",
-                                  url="http://env.invalid:7125", api_key=api_key)
+                                  url="http://env.invalid:7125", api_key=api_key,
+                                  ui_url=ui_url)
 
 
 def add_printer(client: TestClient, name: str = "Voron 2.4",
                 url: str = "http://voron.invalid:7125",
-                api_key: str = "k-0123456789abcdef"):
-    return client.post("/api/printers", json={"name": name, "url": url, "api_key": api_key})
+                api_key: str = "k-0123456789abcdef",
+                ui_url: str | None = None):
+    payload = {"name": name, "url": url, "api_key": api_key}
+    if ui_url is not None:                 # omitted on purpose by most tests
+        payload["ui_url"] = ui_url
+    return client.post("/api/printers", json=payload)
 
 
 def sliced_job(jid: str = "decafbad1234", output_name: str = "cube") -> None:
@@ -448,3 +454,152 @@ def test_corrupt_store_is_surfaced_as_a_warning(printer_store, api_client):
         "name": "Voron", "url": "http://voron.invalid:7125", "api_key": "k"})
     assert refused.status_code == 409
     assert printer_store.path.read_text() == "{not json"      # never overwritten
+
+
+# ---------------------------------------------------------------- embedded UI url
+def test_add_printer_reports_the_ui_url(printer_store, api_client):
+    response = add_printer(api_client, ui_url="http://voron.invalid/fluidd/")
+
+    assert response.status_code == 201, response.text
+    view = response.json()["printer"]
+    assert set(view) == VIEW_KEYS
+    assert view["ui_url"] == "http://voron.invalid/fluidd"          # one trailing slash dropped
+    assert printer_store.get(view["id"]).ui_url == "http://voron.invalid/fluidd"
+    assert json.loads(printer_store.path.read_text())[
+        "printers"][0]["ui_url"] == "http://voron.invalid/fluidd"
+
+    # a printer added without the key has no embedded UI, and says so
+    other = add_printer(api_client, "Core One", "http://core.invalid:7125").json()["printer"]
+    assert other["ui_url"] == ""
+
+
+@pytest.mark.parametrize("value, fragment", [
+    ("voron.invalid/fluidd", "ui_url must start with http:// or https://"),
+    ("http://user:pw@voron.invalid/", "ui_url must not embed credentials"),
+    ("http://voron.invalid/?a=1", "ui_url must not carry a query string"),
+    ("http://voron.invalid/#top", "ui_url must not carry a fragment"),
+])
+def test_a_bad_ui_url_is_400_and_names_the_field(printer_store, api_client, value, fragment):
+    refused = api_client.post("/api/printers", json={
+        "name": "Voron", "url": "http://voron.invalid:7125", "api_key": "k",
+        "ui_url": value})
+
+    assert refused.status_code == 400
+    assert fragment in refused.json()["detail"]
+    assert printer_store.all() == []                       # a refused create writes nothing
+
+    created = add_printer(api_client, ui_url="http://voron.invalid/fluidd").json()["printer"]
+    refused = api_client.patch(f"/api/printers/{created['id']}", json={"ui_url": value})
+
+    assert refused.status_code == 400
+    assert fragment in refused.json()["detail"]
+    assert printer_store.get(created["id"]).ui_url == "http://voron.invalid/fluidd"
+
+
+def test_patch_sets_keeps_and_clears_the_ui_url(printer_store, api_client):
+    created = add_printer(api_client, ui_url="http://voron.invalid/fluidd").json()["printer"]
+
+    renamed = api_client.patch(f"/api/printers/{created['id']}", json={"name": "Voron 0.2"})
+
+    assert renamed.status_code == 200
+    assert renamed.json()["printer"]["ui_url"] == "http://voron.invalid/fluidd"   # kept
+
+    changed = api_client.patch(f"/api/printers/{created['id']}",
+                               json={"ui_url": "https://voron.invalid/"})
+
+    assert changed.status_code == 200
+    assert changed.json()["printer"]["ui_url"] == "https://voron.invalid"
+
+    cleared = api_client.patch(f"/api/printers/{created['id']}", json={"ui_url": ""})
+
+    assert cleared.status_code == 200
+    assert cleared.json()["printer"]["ui_url"] == ""              # "" is the clear, not a 400
+    assert printer_store.get(created["id"]).ui_url == ""
+
+
+def test_ui_url_only_patch_is_not_an_empty_body(printer_store, api_client):
+    created = add_printer(api_client).json()["printer"]
+
+    response = api_client.patch(f"/api/printers/{created['id']}",
+                                json={"ui_url": "http://voron.invalid/fluidd"})
+
+    assert response.status_code == 200, response.text
+    assert response.json()["printer"]["ui_url"] == "http://voron.invalid/fluidd"
+
+
+def test_the_printer_payload_reports_the_stored_ui_url(printer_store, api_client, monkeypatch):
+    add_printer(api_client, ui_url="http://voron.invalid/fluidd")
+    monkeypatch.setattr(urllib.request, "urlopen", FakeWire())
+
+    body = api_client.get("/api/printer").json()
+
+    assert body["ui_url"] == "http://voron.invalid/fluidd"
+
+
+# ---------------------------------------------------------------- /api/ui (active printer)
+def test_ui_route_follows_the_active_printer(printer_store, api_client, monkeypatch):
+    """/api/ui answers for whichever printer a request would use, not for the deployment."""
+    monkeypatch.setattr(main, "SEED", seed_printer())
+    monkeypatch.setattr(main, "CONFIG", dataclasses.replace(
+        main.CONFIG, printer_ui_url="http://env.invalid/fluidd"))
+    first = add_printer(api_client, ui_url="http://voron.invalid/fluidd").json()["printer"]
+    second = add_printer(api_client, "Core One", "http://core.invalid:7125",
+                         ui_url="http://core.invalid/").json()["printer"]
+
+    assert api_client.get("/api/ui").json() == {"printer_ui_url": "http://voron.invalid/fluidd"}
+
+    printer_store.select(second["id"])
+    assert api_client.get("/api/ui").json() == {"printer_ui_url": "http://core.invalid"}
+
+    printer_store.select(first["id"])
+    api_client.patch(f"/api/printers/{first['id']}", json={"ui_url": ""})
+
+    # the active printer has no address of its own: the env value is the fallback
+    assert api_client.get("/api/ui").json() == {"printer_ui_url": "http://env.invalid/fluidd"}
+
+
+def test_ui_route_falls_back_to_the_env_value_for_an_unset_printer(
+        printer_store, api_client, monkeypatch):
+    monkeypatch.setattr(main, "SEED", seed_printer())
+    monkeypatch.setattr(main, "CONFIG", dataclasses.replace(
+        main.CONFIG, printer_ui_url="http://env.invalid/fluidd"))
+
+    assert api_client.get("/api/ui").json() == {"printer_ui_url": "http://env.invalid/fluidd"}
+
+    add_printer(api_client)              # a stored printer with no ui_url is now the active one
+    assert api_client.get("/api/ui").json() == {"printer_ui_url": "http://env.invalid/fluidd"}
+
+
+def test_the_env_printer_reports_its_ui_url(printer_store, api_client, monkeypatch):
+    """The env-seeded row carries the deployment's address, which is the documented fallback."""
+    monkeypatch.setattr(main, "SEED", seed_printer(ui_url="http://env.invalid/fluidd"))
+    monkeypatch.setattr(main, "CONFIG", dataclasses.replace(main.CONFIG, printer_ui_url=""))
+
+    row = api_client.get("/api/printers").json()["printers"][-1]
+
+    assert row["id"] == printers.ENV_PRINTER_ID
+    assert row["ui_url"] == "http://env.invalid/fluidd"
+    assert api_client.get("/api/ui").json() == {"printer_ui_url": "http://env.invalid/fluidd"}
+
+
+def test_the_env_printer_refuses_a_ui_url(printer_store, api_client, monkeypatch):
+    monkeypatch.setattr(main, "SEED", seed_printer())
+
+    refused = api_client.patch(f"/api/printers/{printers.ENV_PRINTER_ID}",
+                               json={"ui_url": "http://other.invalid/fluidd"})
+
+    assert refused.status_code == 409
+    assert refused.json()["detail"] == printers.READ_ONLY_ERROR
+
+
+def test_ui_route_answers_200_even_when_the_store_is_corrupt(
+        printer_store, api_client, monkeypatch):
+    monkeypatch.setattr(main, "SEED", seed_printer())
+    monkeypatch.setattr(main, "CONFIG", dataclasses.replace(
+        main.CONFIG, printer_ui_url="http://env.invalid/fluidd"))
+    printer_store.path.write_text("{not json")
+
+    response = api_client.get("/api/ui")
+
+    assert response.status_code == 200
+    assert response.json() == {"printer_ui_url": "http://env.invalid/fluidd"}

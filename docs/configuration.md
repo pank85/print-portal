@@ -28,7 +28,7 @@ environment; it is never printed or logged.
 | `PRINTERS_FILE` | `$DATA_DIR/printers.json` | printer store | `~` / `$VAR` expanded |
 | `SECRET_KEY_FILE` | `$DATA_DIR/secret.key` | Fernet key used to encrypt API keys in the store | `~` / `$VAR` expanded |
 | `ENV_PRINTER_NAME` | `Default (environment)` | display name of the environment printer | blank falls back to the default |
-| `PRINTER_UI_URL` | *(unset)* | Fluidd/Mainsail page framed by the **Printer** tab (served to the browser as `ui_url` on `GET /api/printer`) | blank = not configured; must start with `http://` or `https://`, name a host, and carry no credentials, query or fragment; trailing `/` stripped |
+| `PRINTER_UI_URL` | *(unset)* | fallback embedded Fluidd/Mainsail address. Each printer carries its own **Web UI URL** (`ui_url` in `printers.json`, set in Settings); this variable seeds the `env` printer and covers an empty field | blank = not configured; must start with `http://` or `https://`, name a host, and carry no credentials, query or fragment; trailing `/` stripped. The same rule validates the per-printer field (`normalise_ui_url`, `printers.py`), where a bad value is a `400 ui_url …` instead of a startup failure |
 
 `docker-compose.yml` also forwards `SLICED_DIR` (default `/sliced`, the second mount) and reads
 `PORT` for the published port.
@@ -49,10 +49,16 @@ The strict CLI `python -m config` fails closed without `MOONRAKER_API_KEY` (`Con
 
 ### `PRINTER_UI_URL` (embedded Fluidd/Mainsail)
 
-`parse_ui_url` (`config.py`) turns the variable into `Config.printer_ui_url`, which `main.py` publishes
-as `ui_url` on `GET /api/printer`. The page embeds it in an `<iframe>` in the **Printer** tab. The portal
-never fetches this URL itself, so validation is shape-only — the two failure modes are both the
-browser's, not the server's:
+The address of the embedded printer UI is a property of a **printer**, not of the deployment: Settings →
+**Web UI URL** (`ui_url` on the printer record, `printers.py`). It is published as `ui_url` on
+`GET /api/printer`, and `GET /api/ui` answers with the *active* printer's value. Switching printers
+re-frames the **Printer** tab with the new address.
+
+`PRINTER_UI_URL` is the fallback: it seeds the environment printer (`env` row) and is used when the
+active printer's field is empty. `parse_ui_url` (`config.py`) hands the variable to
+`printers.normalise_ui_url` — one implementation for both surfaces, so the env var and the form cannot
+drift apart. The portal never fetches this URL itself, so validation is shape-only — the two failure
+modes are both the browser's, not the server's:
 
 * the URL must be reachable **from the browser**, not from the container, so `http://127.0.0.1:80` from
 the host's point of view is wrong;
@@ -60,8 +66,10 @@ the host's point of view is wrong;
 `location.protocol` and shows the warning instead of a blank frame; serve the printer UI over HTTPS to
 embed it over TLS.
 
-A bad value fails loudly at startup, e.g. `PRINTER_UI_URL must start with http:// or https://`,
-`PRINTER_UI_URL must not embed credentials`, or `PRINTER_UI_URL must not carry a query string`.
+A bad env value fails loudly at startup, e.g. `PRINTER_UI_URL must start with http:// or https://`,
+`PRINTER_UI_URL must not embed credentials`, or `PRINTER_UI_URL must not carry a query string`. The
+same value typed into the Settings form is rejected with `400` and a detail naming `ui_url`
+(`ui_url must ...`); an empty field means "no embedded UI" and is valid.
 
 ## Build / image variables
 

@@ -85,7 +85,8 @@ SLICED.mkdir(parents=True, exist_ok=True)
 
 STORE = printers.load_printers(CONFIG.printers_file, CONFIG.secret_key_file)
 SEED = (printers.SeededPrinter(id=printers.ENV_PRINTER_ID, name=CONFIG.env_printer_name,
-                               url=CONFIG.env_printer_url, api_key=CONFIG.env_printer_api_key)
+                               url=CONFIG.env_printer_url, api_key=CONFIG.env_printer_api_key,
+                               ui_url=CONFIG.printer_ui_url)
         if CONFIG.env_printer_api_key else None)
 job_queue: "queue.Queue[str]" = queue.Queue()
 
@@ -112,6 +113,24 @@ def current_target() -> printers.PrintTarget:
     if target is None:
         raise HTTPException(503, NO_PRINTER)
     return target
+
+
+def active_ui_url() -> str:
+    """The embedded printer UI of the ACTIVE printer, with the env var as the fallback.
+
+    The address belongs to a printer, not to the deployment: switching printers in Settings
+    has to switch the page the **Printer** tab frames. ``PRINTER_UI_URL`` only fills in when
+    the active printer has no ``ui_url`` of its own — the env-seeded printer cannot store
+    one, and neither can a store that cannot be read.
+
+    Never raises: ``GET /api/ui`` answers 200 even when the store is unusable, because that
+    is exactly the state where the Printer tab must not claim no UI is configured.
+    """
+    try:
+        target = STORE.active(SEED)
+    except printers.PrinterStoreError:
+        target = None
+    return (target.ui_url if target is not None else "") or CONFIG.printer_ui_url
 
 
 def current_client() -> moonraker.MoonrakerClient:
@@ -167,10 +186,11 @@ def printer_target(printer_id: str) -> printers.PrintTarget:
     """Resolve one printer by id (env seed included) for the test-connection endpoint."""
     if printer_id == printers.ENV_PRINTER_ID and SEED is not None:
         return printers.PrintTarget(id=SEED.id, name=SEED.name, url=SEED.url,
-                                    api_key=SEED.api_key, source="env")
+                                    api_key=SEED.api_key, source="env", ui_url=SEED.ui_url)
     stored = printer_call(STORE.get, printer_id)
     return printers.PrintTarget(id=stored.id, name=stored.name, url=stored.url,
-                                api_key=printer_call(STORE.api_key, stored), source="store")
+                                api_key=printer_call(STORE.api_key, stored), source="store",
+                                ui_url=stored.ui_url)
 
 
 # ---------------------------------------------------------------- active presets
@@ -871,13 +891,14 @@ def api_health():
 
 @app.get("/api/ui")
 def api_ui():
-    """Deployment UI config for the embedded printer page.
+    """Embedded printer UI of the active printer, for the framed **Printer** tab.
 
     Deliberately its own always-200 route: the printer state call answers 503/500 when no
     printer is configured or the printer is offline, which is exactly when the Printer tab
-    would otherwise claim PRINTER_UI_URL is unset while it is set.
+    would otherwise claim there is no embedded UI while there is one. The address is the
+    active printer's, with ``PRINTER_UI_URL`` only as the fallback.
     """
-    return {"printer_ui_url": CONFIG.printer_ui_url}
+    return {"printer_ui_url": active_ui_url()}
 
 
 @app.get("/api/printer")
@@ -886,8 +907,8 @@ def api_printer():
     info = current_client().printer_state()
     info["host"] = target.url
     info["printer"] = {"id": target.id, "name": target.name, "source": target.source}
-    # the browser frames this URL; empty means "no embedded printer UI" (PRINTER_UI_URL unset)
-    info["ui_url"] = CONFIG.printer_ui_url
+    # the browser frames this URL; empty means "no embedded printer UI" for this printer
+    info["ui_url"] = target.ui_url or CONFIG.printer_ui_url
     return info
 
 
@@ -905,7 +926,7 @@ def api_add_printer(body: dict):
     profiles = pairing_from_body(body.get("profiles")) if "profiles" in body else None
     resolve_pairing(profiles)  # before the row exists: a refused pair must add no printer
     printer = printer_call(STORE.add, body.get("name"), body.get("url"), body.get("api_key"),
-                           profiles=profiles)
+                           profiles=profiles, ui_url=body.get("ui_url", ""))
     # ``add`` makes the first printer of an empty store the selection, so this row may have
     # just become the active one; its pairing then has to reach profile.json the way an
     # edit of the active printer's pairing does. ``apply_pairing_to_active`` is the one
@@ -918,12 +939,13 @@ def api_add_printer(body: dict):
 def patch_env_printer(body: dict) -> dict:
     """Pair the env seed — the one part of that row the operator owns.
 
-    Its name, URL and API key stay deployment-owned, so a body carrying any of them is the
+    Its name, URL, API key and embedded-UI address stay deployment-owned (``PRINTER_URL``,
+    ``MOONRAKER_API_KEY``, ``PRINTER_UI_URL``), so a body carrying any of them is the
     same read-only refusal that deleting the row gets: one condition, one status code
     (``printer_call`` maps ``PrinterReadOnly`` onto 409).
     """
     require_env_printer(printers.ENV_PRINTER_ID)
-    if any(field in body for field in ("name", "url", "api_key")):
+    if any(field in body for field in ("name", "url", "api_key", "ui_url")):
         raise printers.PrinterReadOnly(printers.READ_ONLY_ERROR)
     if "profiles" not in body:
         raise printers.PrinterError("nothing to update")
@@ -941,6 +963,9 @@ def api_update_printer(pid: str, body: dict):
         return printer_call(patch_env_printer, body)
     fields = {"name": body.get("name"), "url": body.get("url"),
               "api_key": body.get("api_key")}
+    if "ui_url" in body:
+        # an omitted `ui_url` keeps the stored address; "" clears the embedded UI
+        fields["ui_url"] = body["ui_url"]
     if "profiles" in body:
         # an omitted `profiles` keeps the stored pairing; a supplied one replaces it
         fields["profiles"] = pairing_from_body(body["profiles"])

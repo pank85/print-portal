@@ -26,7 +26,7 @@ PROCESS_REL = prof.DEFAULT_PROFILE["process"]
 FILAMENT_REL = prof.DEFAULT_PROFILE["filament"]
 OTHER_MACHINE_REL = "system/Custom/machine/generic-klipper.json"
 PAIRING = {"machine": MACHINE_REL, "process": PROCESS_REL}
-VIEW_KEYS = {"id", "name", "url", "api_key_masked", "has_api_key", "selected",
+VIEW_KEYS = {"id", "name", "url", "ui_url", "api_key_masked", "has_api_key", "selected",
              "source", "editable", "pairing_editable", "profiles", "created", "updated"}
 
 
