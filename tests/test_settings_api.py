@@ -11,6 +11,7 @@ slicing worker. Prerecorded printer answers come from ``FakeWire`` (a fake
 """
 from __future__ import annotations
 
+import dataclasses
 import json
 import urllib.error
 import urllib.parse
@@ -25,8 +26,9 @@ import main
 import printers
 
 VIEW_KEYS = {"id", "name", "url", "api_key_masked", "has_api_key", "selected",
-             "source", "editable", "profiles", "created", "updated"}
+             "source", "editable", "pairing_editable", "profiles", "created", "updated"}
 TEST_KEYS = {"ok", "state", "webhooks", "error", "url", "ms"}
+MACHINE_REL = "system/Custom/machine/generic-klipper-0.4.json"
 STATUS = {"webhooks": {"state": "ready"}, "print_stats": {"state": "standby"}}
 
 
@@ -82,6 +84,15 @@ def api_client(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> TestClient:
     return TestClient(main.app)
 
 
+@pytest.fixture
+def profile_file(tmp_path: Path, datadir: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A per-test ``profile.json`` plus datadir copy, so no test writes into DATA_DIR."""
+    cfg = dataclasses.replace(main.CONFIG, orca_datadir=datadir,
+                              profile_file=tmp_path / "profile.json")
+    monkeypatch.setattr(main, "CONFIG", cfg)
+    return cfg.profile_file
+
+
 def seed_printer(api_key: str = "env-secret-key") -> printers.SeededPrinter:
     return printers.SeededPrinter(id=printers.ENV_PRINTER_ID, name="Default (environment)",
                                   url="http://env.invalid:7125", api_key=api_key)
@@ -121,6 +132,8 @@ def test_list_printers_is_empty_with_only_the_env_seed(
     assert view["id"] == printers.ENV_PRINTER_ID
     assert view["source"] == "env"
     assert view["editable"] is False
+    assert view["pairing_editable"] is True   # the pairing is a preference, the rest is not
+    assert view["profiles"] == {"machine": None, "process": None}
     assert view["selected"] is True       # the seed is what a request would use
     assert view["created"] is None and view["updated"] is None
     assert view["api_key_masked"] == printers.MASK + "-key"
@@ -139,6 +152,7 @@ def test_add_printer_returns_a_masked_view(printer_store, api_client):
     assert view["url"] == "http://voron.invalid:7125"
     assert view["source"] == "store"
     assert view["editable"] is True
+    assert view["pairing_editable"] is True
     assert view["has_api_key"] is True
     assert view["selected"] is True                    # first printer becomes the selection
     assert view["api_key_masked"] == printers.MASK + "cdef"
@@ -361,20 +375,43 @@ def test_unknown_printer_is_404(printer_store, api_client, method, path):
     assert response.status_code == 404
 
 
-def test_env_printer_cannot_be_edited_or_deleted(printer_store, api_client, monkeypatch):
+def test_env_printer_refuses_credentials_but_pairs_and_cannot_be_deleted(
+        printer_store, api_client, profile_file, monkeypatch):
+    """The env row's name/url/key stay deployment-owned; its pairing is editable."""
     monkeypatch.setattr(main, "SEED", seed_printer())
 
     listing = api_client.get("/api/printers").json()
     assert [view["id"] for view in listing["printers"]] == [printers.ENV_PRINTER_ID]
     assert listing["env_seed"] is True
 
-    patched = api_client.patch(f"/api/printers/{printers.ENV_PRINTER_ID}",
-                               json={"name": "renamed"})
+    for field, value in (("name", "renamed"), ("url", "http://other.invalid:7125"),
+                         ("api_key", "k-fedcba9876543210")):
+        refused = api_client.patch(f"/api/printers/{printers.ENV_PRINTER_ID}",
+                                   json={field: value})
+        assert refused.status_code == 409, (field, refused.text)   # same code as delete
+        assert refused.json()["detail"] == printers.READ_ONLY_ERROR
     deleted = api_client.delete(f"/api/printers/{printers.ENV_PRINTER_ID}")
-
-    assert patched.status_code == 409
     assert deleted.status_code == 409
-    assert "read-only" in patched.json()["detail"]
+    assert "read-only" in deleted.json()["detail"]
+
+    # a store printer becomes active, so pairing the seed below writes no profile.json
+    add_printer(api_client)
+    paired = api_client.patch(f"/api/printers/{printers.ENV_PRINTER_ID}",
+                              json={"profiles": {"machine": MACHINE_REL}})
+
+    assert paired.status_code == 200, paired.text
+    assert not profile_file.exists()               # the inactive seed changes no profile
+    assert paired.json()["printer"]["profiles"] == {"machine": MACHINE_REL,
+                                                    "process": None}
+    assert paired.json()["printer"]["editable"] is False
+    assert paired.json()["printer"]["pairing_editable"] is True
+    row = api_client.get("/api/printers").json()["printers"][-1]
+    assert row["id"] == printers.ENV_PRINTER_ID
+    assert row["profiles"] == {"machine": MACHINE_REL, "process": None}
+    assert row["name"] == seed_printer().name      # the credential change never landed
+    reloaded = printers.load_printers(printer_store.path)
+    assert reloaded.views(seed_printer())[-1]["profiles"] == {"machine": MACHINE_REL,
+                                                              "process": None}
 
 
 def test_health_is_503_without_any_printer(printer_store, api_client):

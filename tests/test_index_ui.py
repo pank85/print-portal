@@ -265,6 +265,138 @@ def test_printer_form_offers_inherit_and_pairing_options(page):
     assert "presetName(" in function_body(page, "renderPrinters")
 
 
+def test_the_env_printer_gets_a_profiles_row_action(page):
+    """The env-seeded row is the one that is pairing-editable but not editable.
+
+    It owns the machine/process pairing, so it needs an action of its own: on a
+    single-printer deployment it is the only row, and without this button the two selects
+    in the form below it are unreachable. The gate is pinned as the expression, not as a
+    substring, because ``pairing_editable`` also appears in the row's other lookups — and
+    an editable row keeps its pairing inside Edit, so it must not get a second button.
+    """
+    render = function_body(page, "renderPrinters")
+    assert "const pairingBtn = p.pairing_editable && !p.editable ? `" in render
+
+    button = slice_between(render, "const pairingBtn =", '` : "";')
+    assert 'data-act="pairing"' in button
+    assert 'data-ref="${esc(p.id)}"' in button
+    assert '<button type="button" class="btn" data-act="pairing"' in button
+    assert '<svg class="icon"' in button           # same icon row as its neighbours
+    assert "\n        Profiles\n" in button
+
+    # the button reaches the markup, and the editable-gated pair is left as it was
+    assert "${edit}${pairingBtn}${remove}" in render
+    assert "const edit = p.editable ? `" in render
+    assert "const remove = p.editable ? `" in render
+    edit = slice_between(render, "const edit = p.editable ?", '` : "";')
+    assert 'data-act="pairing"' not in edit, "an editable row pairs through Edit"
+
+
+def test_edit_pairing_locks_the_credentials_and_relabels_the_form(page):
+    """Pairing-only mode must not offer a rename: PATCH /api/printers/env 400s on
+    name/url/api_key, so those inputs are locked and the two selects are the whole form."""
+    body = function_body(page, "editPairing")
+    assert "if (!p || !p.pairing_editable) return;" in body
+    assert "pairingOnly = id;" in body
+    for sel in ("#pfName", "#pfUrl", "#pfKey", "#btnRevealKey"):
+        assert f'$("{sel}").disabled = true' in body, sel
+
+    # the presets come from the shared loader — a second fetch here would be a duplicate
+    assert 'await populatePairing(pairing.machine || "", pairing)' in body
+    assert "fetch(" not in body and "fetchPresets" not in body
+
+    assert '"#formTitle").textContent = `Profiles — ${p.name}`' in body
+    assert '"#btnPrinterSave").textContent = "Save profiles"' in body
+    assert '"#btnPrinterCancel").hidden = false' in body
+
+
+def test_leaving_pairing_only_mode_unlocks_the_credentials(page):
+    """Profiles then Edit, without a submit or a Cancel in between.
+
+    Both entry points write the same form, so the one that is not pairing-only has to
+    clear the flag and unlock the inputs ``editPairing`` locked — otherwise the next
+    submit patches the wrong printer from disabled fields.
+    """
+    edit = function_body(page, "editPrinter")
+    assert "pairingOnly = null;" in edit
+    for sel in ("#pfName", "#pfUrl", "#pfKey", "#btnRevealKey"):
+        assert f'$("{sel}").disabled = false' in edit, sel
+    assert '$("#formTitle").textContent = "Edit printer"' in edit
+
+
+def test_submitting_the_pairing_patches_only_the_profiles(page):
+    """PATCH /api/printers/<env id> with ``{profiles: …}`` and nothing else."""
+    assert "let pairingOnly = null;" in page
+    body = function_body(page, "submitPrinter")
+    branch = slice_between(body, "if (pairingOnly) {", "\n    return;")
+
+    assert "/api/printers/${pairingOnly}" in branch
+    assert 'method: "PATCH"' in branch
+    assert ('body: JSON.stringify({profiles: {machine: $("#pfMachine").value || null, '
+            'process: $("#pfProcess").value || null}})') in branch
+    # nothing the env endpoint rejects travels in this body
+    assert "name:" not in branch
+    assert "url:" not in branch
+    assert "api_key" not in branch
+
+    assert '"Profiles updated"' in branch
+    for call in ("resetPrinterForm();", "await loadPrinters();", "refreshPrinter();"):
+        assert call in branch, call
+
+    # the save rewrote profile.json, so the dashboard has to reload it after the printer
+    # list: otherwise #selMachine keeps the previous machine and the next process save
+    # posts it back to /api/profile/select, silently reverting the pairing just saved
+    load = "await loadProfile().catch(() => {});"
+    assert load in branch, "the pairing branch must refresh the profile card"
+    assert (branch.index("await loadPrinters();") < branch.index("refreshPrinter();")
+            < branch.index(load)), "loadProfile() must run after loadPrinters/refreshPrinter"
+
+    # the create/edit path stays where it was, behind this branch
+    assert "const editing = Boolean(editingId);" in body
+    assert 'method: editing ? "PATCH" : "POST"' in body
+    assert 'toast(editing ? "Printer updated" : "Printer added")' in body
+
+
+def test_submitting_the_printer_form_refreshes_the_profile_card(page):
+    """The create/edit branch repoints a printer's pairing too, so it reloads the card.
+
+    Editing the active printer's machine/process writes profile.json just like the
+    pairing branch does; without the reload #selMachine keeps the old machine and the
+    next process save posts it back to /api/profile/select.
+    """
+    body = function_body(page, "submitPrinter")
+    store = body[body.index("const editing = Boolean(editingId);"):]
+
+    load = "await loadProfile().catch(() => {});"
+    assert load in store, "the printer-form save branch must refresh the profile card"
+    assert (store.index("await loadPrinters();") < store.index("refreshPrinter();")
+            < store.index(load)), "loadProfile() must run after loadPrinters/refreshPrinter"
+    # the reload stays inside the try, on the success side of the error toast
+    assert store.index("toast(editing ? \"Printer updated\"") < store.index(load) < store.index("catch (e) {")
+
+
+def test_resetting_the_printer_form_leaves_pairing_only_mode(page):
+    """Cancel and every successful submit land here, so the plain form has to come back."""
+    body = function_body(page, "resetPrinterForm")
+    assert "pairingOnly = null;" in body
+    for sel in ("#pfName", "#pfUrl", "#pfKey", "#btnRevealKey"):
+        assert f'$("{sel}").disabled = false' in body, sel
+    assert '$("#formTitle").textContent = "Add printer"' in body
+    assert '$("#btnPrinterSave").textContent = "Add printer"' in body
+    # the process list still snaps back to the unfiltered one
+    assert 'populatePairing("", null)' in body
+
+
+def test_the_printer_list_delegates_the_pairing_action(page):
+    handler = slice_between(page, '$("#printerList").addEventListener("click",', "\n  });")
+    assert 'act === "pairing"' in handler
+    assert "editPairing(ref)" in handler
+    for other in ('act === "use"', 'act === "test"', 'act === "edit"', 'act === "delete"'):
+        assert other in handler, other
+    # defined above the wiring that binds it
+    assert page.index("async function editPairing(") < page.index("function boot()")
+
+
 # ---------------------------------------------------------------- upload
 def test_upload_accepts_zip_and_reports_the_archive_member(page):
     assert 'accept=".stl,.3mf,.obj,.zip"' in page

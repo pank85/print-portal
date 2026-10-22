@@ -940,6 +940,8 @@ async function refresh() {
 /* ---------------- settings: printers ---------------- */
 let printers = [];
 let editingId = null;
+/* the id of the printer the form is editing in pairing-only mode, or null */
+let pairingOnly = null;
 const KEY_HINT_DEFAULT = "Sent to the printer as X-Api-Key and stored encrypted.";
 
 async function loadPrinters() {
@@ -991,6 +993,15 @@ function renderPrinters(data) {
              stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m6 6 1 14h10l1-14"/></svg>
         Delete
       </button>` : "";
+    /* the env-seeded printer cannot be renamed or deleted, but its machine/process pairing
+       can still be chosen: without this action the two selects are unreachable on a
+       single-printer deployment, where that printer is the only row */
+    const pairingBtn = p.pairing_editable && !p.editable ? `
+      <button type="button" class="btn" data-act="pairing" data-ref="${esc(p.id)}">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+             stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M4 7h10"/><path d="M18 7h2"/><circle cx="16" cy="7" r="2"/><path d="M4 17h4"/><path d="M12 17h8"/><circle cx="10" cy="17" r="2"/></svg>
+        Profiles
+      </button>` : "";
     const pairing = p.profiles || {};
     const paired = ["machine", "process"]
       .filter(slot => pairing[slot])
@@ -1011,7 +1022,7 @@ function renderPrinters(data) {
                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
           Test
         </button>
-        ${edit}${remove}
+        ${edit}${pairingBtn}${remove}
       </div>
     </li>`;
   }).join("");
@@ -1044,6 +1055,11 @@ async function editPrinter(id) {
   const p = printers.find(x => x.id === id);
   if (!p || !p.editable) return;
   editingId = id;
+  pairingOnly = null;
+  $("#pfName").disabled = false;
+  $("#pfUrl").disabled = false;
+  $("#pfKey").disabled = false;
+  $("#btnRevealKey").disabled = false;
   const pairing = p.profiles || {};
   await populatePairing(pairing.machine || "", pairing).catch(() => {});
   $("#pfName").value = p.name || "";
@@ -1060,9 +1076,42 @@ async function editPrinter(id) {
   $("#pfName").focus();
 }
 
+/* Open the printer form for the machine/process pairing alone: the env-seeded printer
+   accepts no name, URL or key, so those fields are shown but locked (submitPrinter sends
+   the two profile refs and nothing else) and the presets come from populatePairing. */
+async function editPairing(id) {
+  const p = printers.find(x => x.id === id);
+  if (!p || !p.pairing_editable) return;
+  pairingOnly = id;
+  editingId = null;
+  $("#pfName").disabled = true;
+  $("#pfUrl").disabled = true;
+  $("#pfKey").disabled = true;
+  $("#btnRevealKey").disabled = true;
+  const pairing = p.profiles || {};
+  await populatePairing(pairing.machine || "", pairing).catch(() => {});
+  $("#pfName").value = p.name || "";
+  $("#pfUrl").value = p.url || "";
+  $("#pfKey").value = "";
+  $("#pfKey").type = "password";
+  $("#btnRevealKey").setAttribute("aria-pressed", "false");
+  $("#btnRevealKey").textContent = "Show";
+  $("#pfKeyHint").textContent = "The environment fixes this printer's name, URL and key.";
+  $("#formTitle").textContent = `Profiles — ${p.name}`;
+  $("#btnPrinterSave").textContent = "Save profiles";
+  $("#btnPrinterCancel").hidden = false;
+  $("#formError").hidden = true;
+  $("#pfMachine").focus();
+}
+
 function resetPrinterForm() {
   editingId = null;
+  pairingOnly = null;
   $("#printerForm").reset();
+  $("#pfName").disabled = false;
+  $("#pfUrl").disabled = false;
+  $("#pfKey").disabled = false;
+  $("#btnRevealKey").disabled = false;
   $("#pfKey").type = "password";
   $("#btnRevealKey").setAttribute("aria-pressed", "false");
   $("#btnRevealKey").textContent = "Show";
@@ -1079,6 +1128,39 @@ async function submitPrinter(ev) {
   const btn = $("#btnPrinterSave"), err = $("#formError");
   if (btn.disabled) return;
   err.hidden = true;
+  if (pairingOnly) {
+    /* the env printer takes the pairing alone: no name, URL or key in this body */
+    btn.disabled = true;
+    btn.setAttribute("aria-busy", "true");
+    btn.textContent = "Saving…";
+    try {
+      const r = await fetch(`/api/printers/${pairingOnly}`, {
+        method: "PATCH",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({profiles: {machine: $("#pfMachine").value || null, process: $("#pfProcess").value || null}}),
+      });
+      const data = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(data.detail || r.statusText);
+      toast("Profiles updated");
+      resetPrinterForm();
+      await loadPrinters();
+      refreshPrinter();
+      /* the PATCH rewrote profile.json, so the dashboard card and #selMachine/#selProcess
+         have to follow it: leaving the old machine selected would let the next process
+         save post it back to /api/profile/select and silently undo this pairing */
+      await loadProfile().catch(() => {});
+    } catch (e) {
+      err.textContent = e.message;
+      err.hidden = false;
+      err.focus();
+      toast("Profiles not saved: " + e.message, 6000);
+    } finally {
+      btn.disabled = false;
+      btn.removeAttribute("aria-busy");
+      btn.textContent = pairingOnly ? "Save profiles" : "Add printer";
+    }
+    return;
+  }
   const body = {
     name: $("#pfName").value.trim(),
     url: $("#pfUrl").value.trim(),
@@ -1103,6 +1185,9 @@ async function submitPrinter(ev) {
     resetPrinterForm();
     await loadPrinters();
     refreshPrinter();
+    /* same as the pairing branch: an edit may have repointed the active printer's
+       pairing, and the dashboard has to show the pairing the server now holds */
+    await loadProfile().catch(() => {});
   } catch (e) {
     err.textContent = e.message;
     err.hidden = false;
@@ -1269,6 +1354,7 @@ function boot() {
     if (act === "use") selectPrinter(ref);
     else if (act === "test") testPrinter(ref);
     else if (act === "edit") editPrinter(ref);
+    else if (act === "pairing") editPairing(ref);
     else if (act === "delete") deletePrinter(ref, name || ref);
   });
 

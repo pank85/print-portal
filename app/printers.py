@@ -58,7 +58,7 @@ class PrinterNotFound(PrinterError):
 
 
 class PrinterReadOnly(PrinterError):
-    """The environment printer cannot be edited from the UI (HTTP 409)."""
+    """The environment printer's credentials cannot be edited from the UI (HTTP 409)."""
 
 
 class PrinterStoreError(RuntimeError):
@@ -296,40 +296,58 @@ def _parse_printer(entry: object, version: int) -> Printer | None:
     return Printer(**fields, profiles=profiles)
 
 
-def _parse_document(data: object) -> tuple[list[Printer], str | None, str | None]:
-    """Return ``(printers, selected_id, error)`` for a decoded ``printers.json``.
+def _parse_env_profiles(data: dict, version: int) -> dict[str, str] | None:
+    """The optional ``env_profiles`` pairing, or ``None`` when it is absent or unusable.
+
+    Unlike a stored printer's pairing, a malformed ``env_profiles`` is not a corrupt
+    document: it is one user preference, and reading it has to stay read-safe rather than
+    blank the whole Settings page (and block every write) over it.
+    """
+    if version < 2:
+        return None
+    try:
+        return normalise_profiles(data.get("env_profiles"))
+    except PrinterError:
+        return None
+
+
+def _parse_document(
+        data: object) -> tuple[list[Printer], str | None, dict[str, str] | None, str | None]:
+    """Return ``(printers, selected_id, env_profiles, error)`` for a decoded ``printers.json``.
 
     Versions 1 and 2 load; a version 1 document reads with ``profiles=None`` and is only
     rewritten as version 2 by the next mutation, so reading never migrates the file.
     """
     if not isinstance(data, dict):
-        return [], None, "printers.json must contain a JSON object"
+        return [], None, None, "printers.json must contain a JSON object"
     version = data.get("version")
     if isinstance(version, bool) or not isinstance(version, int):
-        return [], None, f"printers.json has no integer version (found {version!r})"
+        return [], None, None, f"printers.json has no integer version (found {version!r})"
     if version > PRINTERS_VERSION:
-        return [], None, f"printers.json version {version} is newer than this build"
+        return [], None, None, f"printers.json version {version} is newer than this build"
     if version not in (1, PRINTERS_VERSION):
-        return [], None, (f"printers.json version {version} is not supported "
-                          f"(this build writes version {PRINTERS_VERSION})")
+        return [], None, None, (f"printers.json version {version} is not supported "
+                                f"(this build writes version {PRINTERS_VERSION})")
     selected = data.get("selected_id")
     if selected == "":
         selected = None
     if selected is not None and not isinstance(selected, str):
-        return [], None, "printers.json selected_id must be a string or null"
+        return [], None, None, "printers.json selected_id must be a string or null"
     entries = data.get("printers", [])
     if not isinstance(entries, list):
-        return [], None, "printers.json printers must be a list"
+        return [], None, None, "printers.json printers must be a list"
     printers = []
     for entry in entries:
         try:
             printer = _parse_printer(entry, version)
         except PrinterError as exc:
-            return [], None, f"printers.json contains an invalid profile pairing: {exc}"
+            return [], None, None, ("printers.json contains an invalid profile pairing: "
+                                    f"{exc}")
         if printer is None:
-            return [], None, "printers.json contains a printer record with missing fields"
+            return [], None, None, (
+                "printers.json contains a printer record with missing fields")
         printers.append(printer)
-    return printers, selected, None
+    return printers, selected, _parse_env_profiles(data, version), None
 
 
 # ---------------------------------------------------------------- store
@@ -350,6 +368,7 @@ class PrinterStore:
         self._lock = threading.RLock()
         self._printers: list[Printer] = []
         self._selected_id: str | None = None
+        self._env_profiles: dict[str, str] | None = None
         self._key = bytes(key)
         try:
             Fernet(self._key)
@@ -379,6 +398,7 @@ class PrinterStore:
             self.corrupt = None
             self._printers = []
             self._selected_id = None
+            self._env_profiles = None
             return
         except OSError as exc:
             self.corrupt = f"printers.json cannot be read: {exc.strerror or exc}"
@@ -389,12 +409,13 @@ class PrinterStore:
             self.corrupt = ("printers.json is not valid JSON: fix or remove it in the data "
                             "directory (it is never overwritten while unreadable)")
             return
-        printers, selected, error = _parse_document(data)
+        printers, selected, env_profiles, error = _parse_document(data)
         if error is not None:
             self.corrupt = error
             return
         self._printers = printers
         self._selected_id = selected
+        self._env_profiles = env_profiles
         self.corrupt = None
 
     def _require_writable(self) -> None:
@@ -406,6 +427,7 @@ class PrinterStore:
         _atomic_write(self.path, {
             "version": PRINTERS_VERSION,
             "selected_id": self._selected_id,
+            "env_profiles": self._env_profiles,
             "printers": [asdict(printer) for printer in self._printers],
         })
 
@@ -454,11 +476,13 @@ class PrinterStore:
             return decrypt_secret(printer.api_key_enc, self._key)
 
     def views(self, seed: SeededPrinter | None = None) -> list[dict]:
-        """The browser-safe shape: store printers first, then the read-only env seed.
+        """The browser-safe shape: store printers first, then the env seed.
 
         ``selected`` marks the row ``active()`` resolves to, not the raw stored
         ``selected_id``: a missing, env, or stale selection still points at whichever
         printer a request would use, so the UI's active chip never disappears.
+        ``editable`` gates the deployment-owned fields, ``pairing_editable`` the
+        machine/process pairing — which the operator owns on the env row too.
         """
         with self._lock:
             self._read()
@@ -476,6 +500,7 @@ class PrinterStore:
                     "selected": printer.id == selected,
                     "source": "store",
                     "editable": True,
+                    "pairing_editable": True,
                     "profiles": self._pairing(printer),
                     "created": printer.created,
                     "updated": printer.updated,
@@ -490,7 +515,8 @@ class PrinterStore:
                     "selected": selected == ENV_PRINTER_ID,
                     "source": "env",
                     "editable": False,
-                    "profiles": {slot: None for slot in PROFILE_SLOTS},
+                    "pairing_editable": True,
+                    "profiles": _pairing_shape(self._env_profiles),
                     "created": None,
                     "updated": None,
                 })
@@ -536,9 +562,7 @@ class PrinterStore:
                            source="store")
 
     def _pairing(self, printer: Printer) -> dict[str, str | None]:
-        """The pairing shape the UI edits: every slot present, ``None`` = inherit."""
-        stored = printer.profiles or {}
-        return {slot: stored.get(slot) for slot in PROFILE_SLOTS}
+        return _pairing_shape(printer.profiles)
 
     def _masked(self, printer: Printer) -> str:
         """Bullets only when the token does not match this key file, never a failure."""
@@ -634,6 +658,47 @@ class PrinterStore:
                 return
             self._selected_id = printer_id
             self._write()
+
+    def set_env_pairing(self, profiles: object) -> dict[str, str | None]:
+        """Store the env seed's machine/process pairing and return it as viewed.
+
+        Only the pairing is writable: the seed's name, URL and API key come from the
+        deployment, so ``update()`` keeps refusing the env id. ``profiles`` follows the
+        same replace-not-merge rule as ``update(profiles=...)``; the stored pairing comes
+        back in the every-slot shape ``views()`` reports, ``None`` meaning "inherit".
+        """
+        pairing = normalise_profiles(profiles)
+        with self._lock:
+            self._read()
+            self._require_writable()
+            self._env_profiles = pairing
+            self._write()
+        return _pairing_shape(pairing)
+
+    def merge_env_pairing(self, slots: object) -> dict[str, str | None]:
+        """Update the supplied slots of the env pairing in one locked read-modify-write.
+
+        The dashboard write-back touches one slot at a time on top of what is already
+        stored, so a separate read followed by ``set_env_pairing()`` let a concurrent
+        ``PATCH`` of that row land between the two and be overwritten with the copy the
+        reader had already seen. Here the read, the merge and the write share one critical
+        section, as in ``update()``; slots the caller leaves out keep their stored value.
+        A corrupt document is refused, never repaired over.
+        """
+        pairing = normalise_profiles(slots) or {}
+        with self._lock:
+            self._read()
+            self._require_writable()
+            merged = {**(self._env_profiles or {}), **pairing}
+            self._env_profiles = merged or None
+            self._write()
+            return _pairing_shape(self._env_profiles)
+
+
+def _pairing_shape(stored: dict[str, str] | None) -> dict[str, str | None]:
+    """The pairing shape the UI edits: every slot present, ``None`` = inherit."""
+    stored = stored or {}
+    return {slot: stored.get(slot) for slot in PROFILE_SLOTS}
 
 
 def _seed_target(seed: SeededPrinter) -> PrintTarget:
