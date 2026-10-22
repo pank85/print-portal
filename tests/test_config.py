@@ -242,7 +242,7 @@ def test_env_example_lists_only_known_variables():
         "PRINTER_URL", "MOONRAKER_API_KEY", "MOONRAKER_ROOT", "PORT", "DATA_DIR",
         "ORCA_BIN", "ORCA_DATADIR", "MAX_UPLOAD_MB", "KEEP_JOBS", "SLICE_TIMEOUT",
         "BED_SIZE", "MACHINE_SLOT", "SLICED_DIR", "PRINTERS_FILE", "SECRET_KEY_FILE",
-        "ENV_PRINTER_NAME",
+        "ENV_PRINTER_NAME", "PRINTER_UI_URL",
     }
     env_path = ROOT / ".env.example"
     keys = []
@@ -272,6 +272,63 @@ def test_env_example_lists_only_known_variables():
         env["PRINTER_URL"] = "http://printer.local:7125"
     config.load_config(env, printer_seed_required=False)
     print("PARSED_KEYS:", keys)
+
+
+# ---------------------------------------------------------------- PRINTER_UI_URL
+def test_printer_ui_url_is_unset_by_default(env):
+    assert config.load_config(env).printer_ui_url == ""
+
+
+@pytest.mark.parametrize("value", ["", "  ", "\n"])
+def test_blank_printer_ui_url_is_treated_as_unset(env, value):
+    # a blank line in .env must not turn into a frame pointing at "": no UI, not a broken one
+    cfg = config.load_config({**env, "PRINTER_UI_URL": value})
+    assert cfg.printer_ui_url == ""
+
+
+def test_printer_ui_url_keeps_a_bare_origin_and_strips_the_trailing_slash(env):
+    cfg = config.load_config({**env, "PRINTER_UI_URL": "http://printer.local/"})
+    assert cfg.printer_ui_url == "http://printer.local"
+
+
+@pytest.mark.parametrize(
+    "value, expected",
+    [
+        ("http://printer.local", "http://printer.local"),
+        ("http://printer.local:8080/fluidd", "http://printer.local:8080/fluidd"),
+        ("https://portal.example/mainsail", "https://portal.example/mainsail"),
+    ],
+)
+def test_printer_ui_url_accepts_a_path_and_a_port(env, value, expected):
+    cfg = config.load_config({**env, "PRINTER_UI_URL": value})
+    assert cfg.printer_ui_url == expected
+
+
+@pytest.mark.parametrize(
+    "value, message",
+    [
+        ("printer.local", "PRINTER_UI_URL must start with http:// or https://"),
+        ("ftp://printer.local", "PRINTER_UI_URL must start with http:// or https://"),
+        ("HTTPS://printer.local", "PRINTER_UI_URL must start with http:// or https://"),
+        ("http://", "PRINTER_UI_URL must name a host"),
+        ("http:///fluidd", "PRINTER_UI_URL must name a host"),
+        ("http://user:secret@printer.local", "PRINTER_UI_URL must not embed credentials"),
+        ("http://printer.local/?token=x", "PRINTER_UI_URL must not carry a query string"),
+        ("http://printer.local/#/jobs", "PRINTER_UI_URL must not carry a fragment"),
+        ("http://printer.local:notaport", "PRINTER_UI_URL is not a usable URL"),
+    ],
+)
+def test_printer_ui_url_fails_loudly_when_malformed(env, value, message):
+    # fail-closed at startup: a silently dropped frame is a blank tab nobody can diagnose
+    with pytest.raises(config.ConfigError) as excinfo:
+        config.load_config({**env, "PRINTER_UI_URL": value})
+    assert message in str(excinfo.value)
+
+
+def test_env_example_ignores_a_commented_printer_ui_url():
+    # the var ships commented out, so a copy of .env.example stays frameless
+    text = (ROOT / ".env.example").read_text()
+    assert "# PRINTER_UI_URL=http://printer.local/" in text
 
 
 def test_compose_ships_the_sliced_mount_and_env():

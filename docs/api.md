@@ -36,7 +36,7 @@ configured is therefore *unhealthy* — see [troubleshooting.md](troubleshooting
 
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
-| GET | `/api/printer` | live snapshot of the selected printer: state, file, progress, temps, homed axes; adds `host` and `printer{id,name,source}` | 503 no printer · 500 when Moonraker fails (a `MoonrakerError` is not caught on this route) |
+| GET | `/api/printer` | live snapshot of the selected printer: state, file, progress, temps, homed axes; adds `host`, `printer{id,name,source}` and `ui_url` (the `PRINTER_UI_URL` the Printer tab frames; empty when unset) | 503 no printer · 500 when Moonraker fails (a `MoonrakerError` is not caught on this route) |
 
 ## Printer store
 

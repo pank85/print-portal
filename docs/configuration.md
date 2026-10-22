@@ -28,6 +28,7 @@ environment; it is never printed or logged.
 | `PRINTERS_FILE` | `$DATA_DIR/printers.json` | printer store | `~` / `$VAR` expanded |
 | `SECRET_KEY_FILE` | `$DATA_DIR/secret.key` | Fernet key used to encrypt API keys in the store | `~` / `$VAR` expanded |
 | `ENV_PRINTER_NAME` | `Default (environment)` | display name of the environment printer | blank falls back to the default |
+| `PRINTER_UI_URL` | *(unset)* | Fluidd/Mainsail page framed by the **Printer** tab (served to the browser as `ui_url` on `GET /api/printer`) | blank = not configured; must start with `http://` or `https://`, name a host, and carry no credentials, query or fragment; trailing `/` stripped |
 
 `docker-compose.yml` also forwards `SLICED_DIR` (default `/sliced`, the second mount) and reads
 `PORT` for the published port.
@@ -45,6 +46,22 @@ The strict CLI `python -m config` fails closed without `MOONRAKER_API_KEY` (`Con
 `python -m config --allow-unconfigured` is what the container entrypoint runs, and it prints
 `print-portal: no PRINTER_URL/MOONRAKER_API_KEY set; manage printers in Settings` to stderr
 (`config.py:205-224`, `docker/entrypoint.sh:26`).
+
+### `PRINTER_UI_URL` (embedded Fluidd/Mainsail)
+
+`parse_ui_url` (`config.py`) turns the variable into `Config.printer_ui_url`, which `main.py` publishes
+as `ui_url` on `GET /api/printer`. The page embeds it in an `<iframe>` in the **Printer** tab. The portal
+never fetches this URL itself, so validation is shape-only — the two failure modes are both the
+browser's, not the server's:
+
+* the URL must be reachable **from the browser**, not from the container, so `http://127.0.0.1:80` from
+the host's point of view is wrong;
+* an `http://` UI inside an `https://` portal is blocked as **mixed content**. The tab detects this from
+`location.protocol` and shows the warning instead of a blank frame; serve the printer UI over HTTPS to
+embed it over TLS.
+
+A bad value fails loudly at startup, e.g. `PRINTER_UI_URL must start with http:// or https://`,
+`PRINTER_UI_URL must not embed credentials`, or `PRINTER_UI_URL must not carry a query string`.
 
 ## Build / image variables
 

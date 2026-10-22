@@ -875,6 +875,8 @@ def api_printer():
     info = current_client().printer_state()
     info["host"] = target.url
     info["printer"] = {"id": target.id, "name": target.name, "source": target.source}
+    # the browser frames this URL; empty means "no embedded printer UI" (PRINTER_UI_URL unset)
+    info["ui_url"] = CONFIG.printer_ui_url
     return info
 
 
