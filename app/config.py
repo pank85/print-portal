@@ -20,7 +20,7 @@ from pathlib import Path
 
 import printers
 
-VERSION = "2.3.0"  # single source of truth; .gitlab-ci.yml APP_VERSION must match
+VERSION = "2.4.0"  # single source of truth; .gitlab-ci.yml APP_VERSION must match
 
 DEFAULTS: dict[str, str] = {
     "PRINTER_URL": "http://127.0.0.1:7125",

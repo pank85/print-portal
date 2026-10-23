@@ -1417,7 +1417,7 @@ def test_the_preview_colours_the_supports_and_budgets_one_frame(page):
     """The fins are the reason the dialog exists, so they are the only saturated colour."""
     assert 'supports: [34, 197, 94]' in page
     assert 'part: [148, 163, 184]' in page
-    assert "const PREVIEW_TRIANGLE_BUDGET = 120000;" in page
+    assert "const PREVIEW_TRIANGLE_BUDGET = 200000;" in page
     draw = function_body(page, "drawPreview")
     assert "let budget = PREVIEW_TRIANGLE_BUDGET;" in draw
     assert "previewHidden.has(id)" in draw             # a toggled-off object is skipped, not drawn

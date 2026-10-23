@@ -1192,5 +1192,6 @@ def test_run_slice_slices_the_finned_3mf(storage, switchable, monkeypatch):
 
     # the finned copy is the slicer input; the untouched upload is left alone
     assert seen["cmd"][-1] == str(jobs / jid / "upload" / "fins-cube.3mf")
+    assert "--orient" not in seen["cmd"]
     assert read_job(jobs, jid)["status"] == "sliced"
     assert (jobs / jid / "upload" / "cube.stl").read_text() == "solid cube\n"
