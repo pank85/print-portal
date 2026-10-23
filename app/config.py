@@ -31,6 +31,7 @@ DEFAULTS: dict[str, str] = {
     "MAX_UPLOAD_MB": "150",
     "KEEP_JOBS": "25",
     "SLICE_TIMEOUT": "900",
+    "SUPPORT_FINS_TIMEOUT": "300",
     "BED_SIZE": "220x220",
     "ENV_PRINTER_NAME": "Default (environment)",
     "PRINTER_UI_URL": "",
@@ -65,6 +66,7 @@ class Config:
     max_upload_bytes: int       # MAX_UPLOAD_MB * 1024 * 1024
     keep_jobs: int
     slice_timeout: int
+    support_fins_timeout: float  # SUPPORT_FINS_TIMEOUT: seconds one support-fins run may take
     bed_size: tuple[float, float]
     machine_slot: str | None    # raw MACHINE_SLOT, or None when unset/blank
     # new (T2): UI-managed printers + mountable sliced output
@@ -135,6 +137,17 @@ def _positive_int(name: str, value: str) -> int:
         raise ConfigError(f"{name} must be a positive integer (got {value!r})") from None
     if number <= 0:
         raise ConfigError(f"{name} must be a positive integer (got {value!r})")
+    return number
+
+
+def _positive_float(name: str, value: str) -> float:
+    """A finite, strictly positive float (``nan``/``inf``/``0``/garbage all fail)."""
+    try:
+        number = float(value.strip())
+    except ValueError:
+        raise ConfigError(f"{name} must be a positive number (got {value!r})") from None
+    if not 0 < number < math.inf:
+        raise ConfigError(f"{name} must be a positive number (got {value!r})")
     return number
 
 
@@ -211,6 +224,8 @@ def load_config(env: Mapping[str, str] | None = None, *, printer_seed_required: 
         max_upload_bytes=_positive_int("MAX_UPLOAD_MB", _value(source, "MAX_UPLOAD_MB")) * MIB,
         keep_jobs=_positive_int("KEEP_JOBS", _value(source, "KEEP_JOBS")),
         slice_timeout=_positive_int("SLICE_TIMEOUT", _value(source, "SLICE_TIMEOUT")),
+        support_fins_timeout=_positive_float(
+            "SUPPORT_FINS_TIMEOUT", _value(source, "SUPPORT_FINS_TIMEOUT")),
         bed_size=parse_bed_size(_value(source, "BED_SIZE")),
         # a blank MACHINE_SLOT means "no override", so imports fall back to the
         # datadir default machine preset

@@ -1287,3 +1287,258 @@ def test_switching_the_active_printer_reframes_the_tab(page):
     assert "const frame = mount.firstElementChild;" in render
     assert "if (frame) { frame.src = uiUrl; return; }" in render   # repoint, never re-clone
     assert render.index("const frame = mount.firstElementChild;") < render.index("cloneNode")
+
+
+# ---------------------------------------------------------------- support fins: upload
+def test_the_upload_card_offers_the_fins_checkbox_off_by_default(page):
+    card = upload_card(page)
+    start = card.rindex("<input", 0, card.index('id="supportFins"'))
+    tag = card[start:card.index(">", start)]
+
+    assert 'id="supportFins"' in tag
+    assert 'name="support_fins"' in tag
+    assert 'type="checkbox"' in tag
+    assert 'value="true"' in tag
+    assert "checked" not in tag                       # forced landing, opt-in feature
+    assert "Add designed-in support fins" in card and "(off by default)" in card
+    # the hint says what it costs: the upload is finned locally, the original is untouched
+    assert "leaves the original file untouched" in card
+
+
+def test_the_fins_flag_is_sent_only_when_the_box_is_ticked(page):
+    body = function_body(page, "upload")
+
+    assert 'const fins = !!$("#supportFins")?.checked;' in body
+    assert 'if (fins) fd.append("support_fins", "true");' in body
+    assert body.index('const fins = !!$("#supportFins")?.checked;') < \
+        body.index('fd.append("support_fins", "true")')
+    # a finning upload takes long enough to deserve its own wording before the bar moves
+    assert "Adding support fins: ${file.name}" in body
+
+
+def test_a_staged_upload_opens_the_preview_instead_of_queueing(page):
+    """The fins decision point is the dialog, so upload() must stop before the queue.
+
+    A mutation that drops the branch (or that calls /slice from here) turns the preview into a
+    decoration: the model would be queued before the operator ever saw the fins.
+    """
+    body = function_body(page, "upload")
+    branch = slice_between(body, 'if (j.status === "awaiting_confirm") {', "return;")
+
+    assert "setUploadWait(null)" in branch            # keep the slicer bar for the real queue
+    assert "setUploadLatest(j)" in branch
+    assert "openPreview(j.id)" in branch
+    assert "/slice" not in body                       # nothing is queued from an upload
+    # and it is checked before the queued path takes over
+    assert body.index('if (j.status === "awaiting_confirm")') < \
+        body.index('setUploadWait({status: "queued"')
+
+
+# ---------------------------------------------------------------- support fins: dialog
+def preview_dialog(page: str) -> str:
+    return slice_between(page, '<dialog id="previewDlg"', "</dialog>")
+
+
+def test_the_preview_dialog_is_a_labelled_modal_with_a_fallback(page):
+    dlg = preview_dialog(page)
+
+    assert 'class="dialog"' in dlg
+    assert 'aria-labelledby="previewTitle"' in dlg
+    assert 'aria-describedby="previewHint"' in dlg
+    assert '<h2 id="previewTitle">Support fins preview</h2>' in dlg
+    assert 'id="previewHint"' in dlg and 'class="hint"' in dlg
+
+    canvas = dlg[dlg.rindex("<canvas", 0, dlg.index('id="previewCanvas"')):]
+    canvas = canvas[:canvas.index(">")]
+    assert 'role="img"' in canvas                     # no pixels without a description
+    assert 'tabindex="0"' in canvas                   # keyboard orbit needs focus
+    assert "Drag to rotate" in canvas and "arrow keys to rotate" in canvas
+
+    assert '<p id="previewFallback" hidden></p>' in dlg   # the no-canvas path, inert until used
+    assert 'role="group" aria-label="Objects in the preview"' in dlg
+    assert 'id="previewError" class="err" role="alert" hidden' in dlg
+
+
+def test_the_dialog_actions_put_the_decision_last(page):
+    dlg = preview_dialog(page)
+    order = ['id="previewDiscard"', 'id="previewClose"', 'id="previewConfirm"']
+
+    assert [dlg.index(needle) for needle in order] == sorted(dlg.index(n) for n in order)
+    for needle, label in zip(order, ("Discard", "Keep for later", "Slice it")):
+        start = dlg.rindex("<button", 0, dlg.index(needle))
+        tag = dlg[start:dlg.index(">", start)]
+        assert 'type="button"' in tag, needle          # inside a dialog: never a submit
+        assert label in dlg[dlg.index(needle):dlg.index("</button>", dlg.index(needle))]
+    confirm = dlg[dlg.rindex("<button", 0, dlg.index('id="previewConfirm"')):]
+    assert "btn-primary" in confirm[:confirm.index(">")]
+
+
+def test_the_dialog_fits_a_phone_and_keeps_the_decision_visible(page):
+    """A 3-D canvas needs the screen; the three actions must not scroll away from it."""
+    css = slice_between(page, "#previewDlg{", ".preview-key{")
+    assert "max-width:96vw" in css
+    assert "max-height:92vh" in css
+    assert "height:min(60vh,520px)" in css
+    assert "touch-action:none" in page                 # a drag on the canvas is not a page scroll
+    assert "position:sticky; bottom:0" in page
+    mobile = slice_between(page, "@media (max-width:640px){", ".preview-actions .btn{")
+    assert "height:100dvh" in mobile                   # the phone layout is the whole screen
+    assert ".preview-actions .btn{ flex:1 1 100%; }" in page
+
+
+def test_the_legend_is_one_real_toggle_per_drawable_object(page):
+    chrome = function_body(page, "renderPreviewChrome")
+
+    assert "legend.replaceChildren();" in chrome       # rewritten per payload, not appended to
+    assert 'document.createElement("button")' in chrome
+    assert "key.type = \"button\";" in chrome
+    assert "key.dataset.previewObject = previewObjectId(o);" in chrome
+    assert 'key.setAttribute("aria-pressed", "true");' in chrome
+    # an object with no triangles is not offered: an empty toggle would hide nothing
+    assert "if (!Array.isArray(o.triangles) || o.triangles.length < 3) continue;" in chrome
+    assert "key.textContent = `${previewObjectName(o)} · ${count}`;" in chrome
+
+    toggle = function_body(page, "previewToggle")
+    assert 'ev.target.closest("[data-preview-object]")' in toggle
+    assert "previewHidden.add(id)" in toggle and "previewHidden.delete(id)" in toggle
+    assert 'key.setAttribute("aria-pressed", previewHidden.has(id) ? "false" : "true");' in toggle
+
+
+def test_the_stats_line_names_the_fins_the_objects_and_the_size(page):
+    chrome = function_body(page, "renderPreviewChrome")
+
+    assert 'fins.finTriangles ? `${fins.finTriangles} fin triangles` : "no fin geometry"' in chrome
+    assert '`${objects.length} object${objects.length === 1 ? "" : "s"}`' in chrome
+    assert 'summary.push(`${size.map(fmtMm).join("×")} mm`);' in chrome
+    assert 'stats.textContent = summary.join(" · ");' in chrome
+
+
+def test_the_preview_colours_the_supports_and_budgets_one_frame(page):
+    """The fins are the reason the dialog exists, so they are the only saturated colour."""
+    assert 'supports: [34, 197, 94]' in page
+    assert 'part: [148, 163, 184]' in page
+    assert "const PREVIEW_TRIANGLE_BUDGET = 120000;" in page
+    draw = function_body(page, "drawPreview")
+    assert "let budget = PREVIEW_TRIANGLE_BUDGET;" in draw
+    assert "previewHidden.has(id)" in draw             # a toggled-off object is skipped, not drawn
+
+
+def test_the_view_repaints_on_interaction_only(page):
+    """"Nothing animates while the dialog sits open" is the promise; a rAF loop would break it."""
+    schedule = function_body(page, "schedulePreview")
+
+    assert "if (previewFrame) return;" in schedule     # one frame per burst
+    assert "requestAnimationFrame(() => { previewFrame = 0; drawPreview(); })" in schedule
+    assert "prefersReducedMotion()" in schedule         # drawn synchronously, no frame to cancel
+    assert "setInterval" not in page.split("support-fins preview")[1][:12000]
+    # the close path cancels a pending frame instead of letting it paint a torn-down scene
+    assert "cancelAnimationFrame(previewFrame)" in function_body(page, "initPreview")
+
+
+# ---------------------------------------------------------------- support fins: flow
+def test_a_preview_failure_still_leaves_the_job_queueable(page):
+    err = function_body(page, "showPreviewError")
+
+    assert "The job is still staged" in err
+    assert '$("#previewConfirm").disabled = false;' in err   # Slice it survives a dead preview
+    assert '$("#previewCanvas").hidden = true;' in function_body(page, "previewFallbackText")
+
+    open_ = function_body(page, "openPreview")
+    assert 'fetch(`/api/jobs/${encodeURIComponent(id)}/preview`)' in open_
+    assert "if (!r.ok) throw new Error(p.detail || r.statusText" in open_
+    assert "showPreviewError(e.message)" in open_            # no unhandled rejection in the dialog
+
+
+def test_slice_it_queues_exactly_once_and_hands_the_card_back(page):
+    body = function_body(page, "confirmSlice")
+
+    assert 'fetch(`/api/jobs/${encodeURIComponent(id)}/slice`, { method: "POST" })' in body
+    assert 'if (btn.dataset.busy === "true") return;' in body   # a double click queues once
+    assert "btn.disabled = true;" in body
+    # close, then repaint the card from the response, so the wait bar is right before the poll
+    assert body.index("closePreview();") < body.index("setUploadWait(job)")
+    assert "setUploadLatest(job)" in body
+    assert 'toast(j.queue_position ? `Queued for slice (#${j.queue_position})`' in body
+    assert '"Could not queue the slice: " + e.message' in body
+
+
+def test_closing_keeps_the_job_and_discarding_asks_first(page):
+    close = function_body(page, "closePreview")
+    assert "previewJob = null;" in close
+    assert "fetch(" not in close                        # Escape must not delete anything
+    assert 'if (typeof dlg.close === "function")' in close
+
+    discard = function_body(page, "discardPreview")
+    assert 'await ask("Discard this staged job?"' in discard
+    assert "if (!ok) return;" in discard
+    assert "method: \"DELETE\"" in discard
+    assert "refresh();" in discard
+
+
+def test_the_last_job_block_previews_a_staged_job_instead_of_slicing_it(page):
+    """M10: the "Latest" shortcut must open the dialog, not queue the job.
+
+    The button is static markup (the poll only re-aims it), and it is routed through the row
+    handler's `preview` arm, so there is exactly one preview implementation and one fetch.
+    """
+    card = upload_card(page)
+    tag = card[card.rindex("<button", 0, card.index('id="uploadLatestPreview"')):]
+    tag = tag[:tag.index(">")]
+    assert 'data-act="preview"' in tag
+    assert "hidden" in tag                              # only a staged job shows it
+    assert "aria-label=" in tag
+    assert "Preview fins" in card[card.index('id="uploadLatestPreview"'):]
+
+    latest = function_body(page, "setUploadLatest")
+    assert 'const staged = job.status === "awaiting_confirm" && !job.error;' in latest
+    assert "preview.hidden = !staged;" in latest
+    assert 'preview.dataset.ref = staged ? job.id : "";' in latest
+    assert "preview.setAttribute(\"aria-label\", `Preview the support fins on ${name}`);" in latest
+
+    handler = function_body(page, "onJobAction")
+    assert 'btn.dataset.act === "preview"' in handler
+    assert "openPreview(btn.dataset.ref)" in handler
+    assert '$("#uploadLatest").addEventListener("click", onJobAction);' in page
+    assert page.count("/preview`") == 1                 # one dialog, one request path
+
+
+def test_a_staged_row_offers_both_preview_and_slice_it(page):
+    row = function_body(page, "renderJobRow")
+    staged = slice_between(row, "const staged =", ': "";')
+
+    assert 'data-act="preview"' in staged
+    assert 'data-act="slice"' in staged
+    assert staged.index('data-act="preview"') < staged.index('data-act="slice"')
+    assert "Preview fins" in staged and "Slice it" in staged
+    # a failed or finished job gets neither: neither can be reviewed or queued any more
+    assert 'j.status === "awaiting_confirm" && !j.error' in row
+
+
+def test_the_preview_wires_every_input_and_tears_down_on_close(page):
+    init = function_body(page, "initPreview")
+
+    for listener in ('canvas.addEventListener("pointerdown", previewOrbit)',
+                     'canvas.addEventListener("pointermove", previewOrbit)',
+                     'canvas.addEventListener("pointerup", previewOrbit)',
+                     'canvas.addEventListener("pointercancel", previewOrbit)',
+                     'canvas.addEventListener("wheel", previewZoom, { passive: false })',
+                     'canvas.addEventListener("keydown", previewKey)',
+                     '$("#previewLegend").addEventListener("click", previewToggle)',
+                     '$("#previewConfirm").addEventListener("click", () => confirmSlice())',
+                     '$("#previewClose").addEventListener("click", closePreview)',
+                     '$("#previewDiscard").addEventListener("click", discardPreview)'):
+        assert listener in init, listener
+    assert 'dlg.addEventListener("close", () => {' in init
+    assert "previewScene = null;" in init               # Escape and the native close land here
+    assert "if (previewScene) schedulePreview();" in init   # a resize never paints a dead scene
+    assert "initPreview();" in page
+
+    orbit = function_body(page, "previewOrbit")
+    assert "canvas.setPointerCapture(ev.pointerId)" in orbit
+    assert 'if (ev.button) return;' in orbit            # right-drag is not an orbit
+    assert "previewView.pitch = Math.max(-1.45, Math.min(1.45" in orbit   # no flipping over
+    keys = function_body(page, "previewKey")
+    assert 'key === "ArrowLeft"' in keys and 'key === "0" || key === "Home"' in keys
+    assert "ev.preventDefault();" in keys
+    zoom = function_body(page, "previewZoom")
+    assert "ev.preventDefault();" in zoom and "Math.max(0.35, Math.min(4," in zoom

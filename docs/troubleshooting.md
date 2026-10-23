@@ -202,6 +202,24 @@ Two possible bodies:
 Archive failures carry `ArchiveError.status`: a hostile or truncated zip is `400`, too many members is
 `413` (`app/archives.py`).
 
+## Support fins (opt-in, fins branch only)
+
+Four failure modes on the finned path. The first three happen inside `POST /api/upload` with
+`support_fins=true`, which is also the request that runs the CLI.
+
+| Message | Status | Cause and fix |
+|---|---|---|
+| `support fins failed: <cli text>` | 400 | The bundled CLI exited non-zero and `<cli text>` is its own last line. Exit `1` = *this file cannot be finned* (e.g. `support-fins: /etc/hostname: reads .stl, .3mf and .obj only`), exit `2` = *bad arguments*, both mapped to 400 (`app/supportfins.py`). The job directory is removed before the response, so nothing is left on disk — fix the model and upload again. |
+| `support fins failed: support fins timed out after <n>s` | 400 | The run exceeded `SUPPORT_FINS_TIMEOUT` (default `300`). Fin runs are serialised on one lock, so the wait can also be the upload queued behind a slower one. Raise the variable for very large meshes, or slice without fins. |
+| `support fins failed: node runtime is not available` | 400 | The image has no `node` on `PATH` (or it vanished mid-run). `GET /api/support-fins` reports it up front — `{available:false, reason:"node runtime is not available"}`, the other reason being `support-fins CLI is missing from the image` — and the UI does not offer the checkbox. Rebuild the image: `node --version` and the `--fins-only` smoke step run at build time (`Dockerfile`, `scripts/smoke_test.py`). |
+| `preview unavailable: <reason>` | 409 | `GET /api/jobs/{jid}/preview` could not read the finned 3MF. The caps are 200 000 triangles and 12 MiB of input (`app/preview.py:42,45`); a job without `support_fins`/`fins` answers `preview unavailable: this job has no support fins`. Slicing is unaffected — the dialog still offers **Slice it**. |
+
+**Zero fins is not a failure.** A shallow overhang legitimately yields `finTriangles: 0` with exit `0`
+(`tests/fixtures/cube.stl` does), and the job is staged as usual with `report` explaining why
+(`1 overhang is too shallow for a fin this way up (tilt the part steeper)`). Use
+`tests/fixtures/overhang.stl` — 7 overhang regions, 3916 fin triangles, 24 tines — when you need fins to
+actually appear.
+
 ## "My model is bigger than my bed"
 
 With `shrink_to_fit` off — the default — the model is measured before the CLI runs and refused with

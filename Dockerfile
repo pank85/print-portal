@@ -50,6 +50,14 @@ RUN set -eu; \
 
 COPY --from=orca /opt/orca /opt/orca
 
+# node: runtime for the bundled support-fins CLI (app/support_fins.mjs). Pinned by digest, like the
+# OrcaSlicer AppImage above. The digest is the multi-arch index digest for node:22.23.4-bookworm
+# (amd64 manifest sha256:de636e50060a9908cf40a20a50d027ed74a99b2e31d2635f3b13e9e4e5e97e74);
+# re-resolve after a tag bump with `docker buildx imagetools inspect node:<tag>`.
+COPY --from=node:22.23.4-bookworm@sha256:63538dfe497cc29dfafdda25ada09b46db68a3f4cc205abf1f5d6bf0913f3384 /usr/local/bin/node /usr/local/bin/node
+# A bad pin fails here rather than at the first finned upload.
+RUN node --version
+
 COPY requirements.txt /tmp/requirements.txt
 RUN python3 -m venv /opt/venv && \
     /opt/venv/bin/pip install --no-cache-dir -r /tmp/requirements.txt && \
@@ -68,12 +76,16 @@ COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 COPY scripts/smoke_test.py /opt/smoke_test.py
 COPY tests/fixtures/cube.stl /opt/smoke/cube.stl
+COPY tests/fixtures/overhang.stl /opt/smoke/overhang.stl
 COPY tests/fixtures/portal-import.orca_printer /opt/smoke/bundle.orca_printer
 
 WORKDIR /app
 USER app
 
 RUN set -eu; mkdir -p /tmp/smoke; python3 /opt/smoke_test.py --orca /opt/orca/bin/orca-slicer --datadir /opt/orca-datadir --stl /opt/smoke/cube.stl --workdir /tmp/smoke --app-dir /app --bundle /opt/smoke/bundle.orca_printer; rm -rf /tmp/smoke
+# Fins smoke: proof that node + the bundled CLI actually grow fins and that the 3MF the preview
+# dialog reads is well formed. Needs no OrcaSlicer, so it also runs outside the image.
+RUN set -eu; mkdir -p /tmp/smoke-fins; python3 /opt/smoke_test.py --fins-only --app-dir /app --stl /opt/smoke/overhang.stl --workdir /tmp/smoke-fins; rm -rf /tmp/smoke-fins
 
 VOLUME ["/data"]
 EXPOSE 8088

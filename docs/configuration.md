@@ -22,6 +22,7 @@ environment; it is never printed or logged.
 | `MAX_UPLOAD_MB` | `150` | upload cap in MiB; also bounds an unpacked archive member | positive integer |
 | `KEEP_JOBS` | `25` | finished job directories retained before the oldest are pruned | positive integer |
 | `SLICE_TIMEOUT` | `900` | seconds before a slice is killed | positive integer |
+| `SUPPORT_FINS_TIMEOUT` | `300` | seconds one support-fins run may take (`node app/support_fins.mjs …`). Fin runs are serialised, so a second finned upload waits for the first | positive number; fractions allowed. `0`, negatives, `nan`, `inf` and garbage are startup errors (`_positive_float`, `config.py:143`) |
 | `BED_SIZE` | `220x220` | bed size used to clamp an imported machine's `printable_area` | `WxH`, both finite and > 0 |
 | `MACHINE_SLOT` | *(unset)* | optional override of the machine preset the slicer loads: a path inside the datadir | blank = "no override"; a bad override is an error in both states. With no override and no machine preset in the datadir: **A** raises `ProfileError` (`no machine preset found in <datadir> (set MACHINE_SLOT)`), **B** resolves to `None` → `409 no_printer_profile` on actions |
 | `SLICED_DIR` | `$DATA_DIR/sliced` | mountable output directory for finished gcode | `~` / `$VAR` expanded |

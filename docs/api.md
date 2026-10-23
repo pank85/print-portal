@@ -1,7 +1,7 @@
 # API
 
-Every route registered by `app/main.py` (`@app.…` decorators). There are exactly 21, and the route
-**set** is identical in both states:
+Every route registered by `app/main.py` (`@app.…` decorators). The inventory below was captured when
+there were exactly 21 and the route **set** was identical in both states:
 
 * **A** = `develop` @ `dc92ca1` (this worktree, `main.py` 1208 lines);
 * **B** = the uncommitted `ergo/20261022T123034Z-import-name` branch, read from a read-only snapshot
@@ -9,7 +9,10 @@ Every route registered by `app/main.py` (`@app.…` decorators). There are exact
 
 Line numbers quoted below are from B unless marked otherwise. Only the preset routes and
 `POST /api/upload` behave differently — see [Presets](#presets). Everything else is unchanged between
-the two states.
+the two states. The support-fins work adds three routes on top of that set (`POST
+/api/jobs/{jid}/slice`, `GET /api/jobs/{jid}/preview`, `GET /api/support-fins` — § [Support
+fins](#support-fins)), so a current `grep -c '^@app\.' app/main.py` says 29 rather than 21 — every one of
+them is listed below (the `{kind}/{rel:path}` preset routes appear once each, without the `:path`).
 
 Error bodies are FastAPI's `{"detail": …}`. In state B, the no-printer condition raises a detail object
 (absent in state A, which has no empty-datadir state):
@@ -65,9 +68,9 @@ A pairing is a complete statement about a printer, not a patch: a slot the body 
 
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
-| POST | `/api/upload` | multipart `file` (`.stl` `.3mf` `.obj` `.zip`) + optional `output_name` → queue a slice | 200 `{id,status:"queued",queue_position}` · 400 unsupported suffix / invalid `output_name` · **409 `no_printer_profile`** · 413 larger than `MAX_UPLOAD_MB` (from `Content-Length` or the streaming count) · archives: `ArchiveError.status`, 400 or 413 |
+| POST | `/api/upload` | multipart `file` (`.stl` `.3mf` `.obj` `.zip`) + optional `output_name`, optional `support_fins=true` → queue a slice, or stage a finned job | 200 `{id,status:"queued",queue_position}` · 200 `{id,status:"awaiting_confirm",fins:{report,stats},original}` when `support_fins` is set (nothing queued) · 400 `support fins failed: <cli text>` (job dir removed) · 400 unsupported suffix / invalid `output_name` · **409 `no_printer_profile`** · 413 larger than `MAX_UPLOAD_MB` (from `Content-Length` or the streaming count) · archives: `ArchiveError.status`, 400 or 413 |
 | GET | `/api/jobs` | job list, newest first (every `job.json` that parses) | 200 |
-| GET | `/api/jobs/{jid}` | one job: status, stats, error, `threemf`, `archive` | 200 · 404 (`jid` must be 12 lowercase hex) |
+| GET | `/api/jobs/{jid}` | one job: status, stats, error, `threemf`, `archive`, and for a finned job `original`, `fins`, `support_fins` | 200 · 404 (`jid` must be 12 lowercase hex) |
 | GET | `/api/jobs/{jid}/gcode` | download the sliced gcode | 200 file · 409 `not sliced yet` · 404 |
 | POST | `/api/jobs/{jid}/print` | upload to Moonraker and start the print | 200 `{started:true,remote_file}` · 409 `job is '<status>', not sliced` / `not sliced yet` / `klipper not ready: <state>` / `printer busy: state=<state>` · Moonraker error status (502/503/409) |
 | DELETE | `/api/jobs/{jid}` | remove the job dir and its sliced output | 200 `{deleted}` |
@@ -81,6 +84,27 @@ A job object (`GET /api/jobs`, `GET /api/jobs/{jid}` and the SSE stream) also ca
 decisions: `auto_orient`, `auto_orient_used` (true when orient actually ran, e.g. because a shrink
 forced it), `shrink_to_fit`, `fit_scale` (`1.0` when nothing was scaled, `null` when the model could
 not be measured), plus `model_size` and `bed_limits` as `{x,y,z}` spans in millimetres.
+
+## Support fins
+
+Opt-in designed-in supports, off by default. `POST /api/upload` with `support_fins=true` runs the
+bundled CLI inside the request, then **stages** the job instead of queueing it: `status` is
+`awaiting_confirm` and the body is `{id, status, fins: {report, stats}, original}` (no `queue_position`).
+The status list is therefore `queued` · `slicing` · `awaiting_confirm` · `sliced` · `failed`;
+`awaiting_confirm` is deliberately **not** an active status (it can be deleted like a
+finished job) but `prune()` keeps it, so an open preview dialog is never collected.
+
+| Method | Path | Purpose | Notable statuses |
+|---|---|---|---|
+| POST | `/api/jobs/{jid}/slice` | enter the queue for a staged job — the preview dialog's *Slice it* | 200 `{id,status:"queued",queue_position}` · 404 · 409 `job is '<status>', not awaiting confirmation` (a double click is a 409, not a second queue entry: the check and the enqueue share one lock) |
+| GET | `/api/jobs/{jid}/preview` | geometry for the pre-slice preview: `{job, unit, bbox, objects:[{id,name,role,vertices,triangles,count}], fins, original}` | 200 · 404 · 409 `preview unavailable: this job has no support fins` · 409 `preview unavailable: <reason>` (unreadable 3MF, over the triangle/byte cap — see `app/preview.py`: `MAX_TRIANGLES` 200 000, `MAX_BYTES` 12 MiB) |
+| GET | `/api/support-fins` | capability probe for the upload checkbox | 200 always: `{available, reason, timeout, max_triangles}`; `reason` is `""` when available, else `support-fins CLI is missing from the image` / `node runtime is not available` |
+
+A finned job's `filename` is the CLI's own output (`fins-<stem>.3mf`), `model_bytes` its size,
+`original` the upload it came from, and `fins` the parsed `--json` line (`report` + `stats`). Because
+the CLI's 3MF carries no OrcaSlicer identity metadata, the 3MF is prepared *before* finning and the
+rewritten copy is then discarded: such a job has **no** `slicer_input`, and its `threemf` record has
+`rewrite: "discarded"` plus a note saying so.
 
 ## Presets
 

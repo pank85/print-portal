@@ -10,6 +10,7 @@ from __future__ import annotations
 import dataclasses
 import io
 import json
+import queue
 import threading
 import zipfile
 from pathlib import Path
@@ -694,6 +695,40 @@ def test_upload_3mf_writes_an_identity_rewritten_slicer_input(storage, api_clien
     assert (jobs / jid / "upload" / "benchy.3mf").read_bytes() == blob   # original untouched
 
 
+def test_finning_happens_before_prepare_and_drops_the_rewritten_copy(
+        storage, api_client, switchable, monkeypatch, three_mf_bytes):
+    """The CLI's 3MF carries no slicer metadata, so it must be finned *before* prepare.
+
+    Preparing the finned copy could never name a printer/process, and keeping the copy
+    would leave a ``slice-*.3mf`` that ``run_slice`` prefers over the finned file.
+    """
+    jobs, _sliced = storage
+    add_printer(api_client, "Generic Klipper 0.4 nozzle")
+    seen: dict = {}
+
+    def fake_fin_model(src: Path, dest: Path, timeout: float | None = None) -> dict:
+        seen["src"] = Path(src)
+        Path(dest).write_bytes(b"PK\x03\x04finned")
+        return {"finTriangles": 0}
+
+    monkeypatch.setattr(main.supportfins, "fin_model", fake_fin_model)
+
+    response = api_client.post(
+        "/api/upload", data={"support_fins": "true"},
+        files={"file": ("benchy.3mf", three_mf_bytes(), "model/3mf")})
+
+    assert response.status_code == 200, response.text
+    jid = response.json()["id"]
+    assert seen["src"].name == "benchy.3mf"        # the untouched upload, not a prepared copy
+    job = read_job(jobs, jid)
+    assert job["filename"] == "fins-benchy.3mf"
+    assert job["threemf"]["rewrite"] == "discarded"
+    assert any("support fins rebuilt the 3MF" in note for note in job["threemf"]["notes"])
+    assert "slicer_input" not in job               # nothing stale for run_slice to prefer
+    assert sorted(p.name for p in (jobs / jid / "upload").iterdir()) == [
+        "benchy.3mf", "fins-benchy.3mf"]
+
+
 def test_upload_3mf_records_a_profile_snapshot(storage, api_client, switchable,
                                                three_mf_bytes):
     jobs, _sliced = storage
@@ -990,6 +1025,36 @@ def test_a_3mf_with_shrink_on_fails_with_both_escapes(storage, switchable, monke
     assert "import a preset" not in job["error"]        # a geometry problem, not a preset one
 
 
+def test_run_slice_refuses_a_finned_job_needing_shrink(storage, switchable, monkeypatch, cube_stl):
+    jobs, _sliced = storage
+    jid = "beefcafe1234"
+    upload_dir = jobs / jid / "upload"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "cube.stl").write_bytes(scaled_cube(cube_stl, 15))
+    (jobs / jid / "job.json").write_text(json.dumps({
+        "id": jid, "status": "queued", "filename": "cube.stl",
+        "output_name": "cube", "support_fins": True,
+        "profile_snapshot": {"machine": MACHINE_REL, "process": PROCESS_REL,
+                             "filament": FILAMENT_REL,
+                             "options": {"auto_orient": True, "shrink_to_fit": True,
+                                         "supports": False, "brim": False,
+                                         "hide_profiles": False}},
+    }))
+    calls: list[list[str]] = []
+    record_slice(monkeypatch, calls)
+
+    main.run_slice(jid)
+
+    assert calls == []
+    job = read_job(jobs, jid)
+    assert job["status"] == "failed"
+    assert job["auto_orient_used"] is False
+    assert "cannot be auto-oriented safely" in job["error"]
+    assert "Disable shrink to fit" in job["error"]
+    assert "scale the model" in job["error"]
+    assert "manually" in job["error"]
+
+
 def test_a_preset_without_printable_area_still_slices_when_shrink_is_off(
         storage, switchable, monkeypatch, cube_stl):
     """A preset predating ``printable_area`` cannot be measured; without shrink that is advisory."""
@@ -1031,3 +1096,101 @@ def test_upload_zip_oversize_member_is_a_413_without_a_job_dir(storage, api_clie
     assert response.status_code == 413
     assert "expands to more than" in response.json()["detail"]
     assert list(jobs.iterdir()) == []
+
+
+# ---------------------------------------------------------------- staged (support fins) jobs
+@pytest.fixture
+def queue_watch(monkeypatch: pytest.MonkeyPatch) -> "queue.Queue[str]":
+    """A private ``main.job_queue`` so these ids never reach the shared worker."""
+    watched: "queue.Queue[str]" = queue.Queue()
+    monkeypatch.setattr(main, "job_queue", watched)
+    return watched
+
+
+def staged_job(jobs: Path, jid: str = "fadedcab1234") -> str:
+    """A job the fins pipeline left in ``awaiting_confirm``, as ``api_upload`` writes it."""
+    upload_dir = jobs / jid / "upload"
+    upload_dir.mkdir(parents=True)
+    (upload_dir / "cube.stl").write_text("solid cube\n")
+    (upload_dir / "fins-cube.3mf").write_bytes(b"PK\x03\x04finned")
+    (jobs / jid / "job.json").write_text(json.dumps({
+        "id": jid, "status": "awaiting_confirm", "filename": "fins-cube.3mf",
+        "output_name": "cube", "original": "cube.stl", "support_fins": True,
+        "fins": {"report": "r", "stats": {"finTriangles": 12}},
+        "profile_snapshot": {"machine": MACHINE_REL, "process": PROCESS_REL,
+                             "filament": FILAMENT_REL,
+                             "options": {"supports": False, "brim": False,
+                                         "hide_profiles": False}},
+    }))
+    return jid
+
+
+def test_a_fins_upload_is_staged_not_queued(storage, api_client, queue_watch, monkeypatch,
+                                            cube_stl):
+    jobs, _sliced = storage
+
+    def fake_fin_model(src: Path, dest: Path, timeout: float | None = None) -> dict:
+        Path(dest).write_bytes(cube_stl)
+        return {"report": "r", "stats": {"finTriangles": 12}}
+
+    monkeypatch.setattr(main.supportfins, "fin_model", fake_fin_model)
+
+    response = api_client.post("/api/upload", data={"support_fins": "true"},
+                               files={"file": ("cube.stl", cube_stl, "model/stl")})
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert body["status"] == "awaiting_confirm"
+    assert "queue_position" not in body      # staged: the dialog's *Slice it* is the entry
+    assert queue_watch.empty()
+    assert read_job(jobs, body["id"])["status"] == "awaiting_confirm"
+
+
+def test_confirming_a_staged_job_queues_it_exactly_once(storage, api_client, queue_watch):
+    jobs, _sliced = storage
+    jid = staged_job(jobs)
+
+    first = api_client.post(f"/api/jobs/{jid}/slice")
+
+    assert first.status_code == 200, first.text
+    assert first.json() == {"id": jid, "status": "queued", "queue_position": 1}
+    assert queue_watch.qsize() == 1
+    assert read_job(jobs, jid)["status"] == "queued"
+
+    again = api_client.post(f"/api/jobs/{jid}/slice")
+
+    assert again.status_code == 409
+    assert "not awaiting confirmation" in again.json()["detail"]
+    assert queue_watch.qsize() == 1          # a double click is not a second slice
+
+
+def test_confirm_refuses_a_job_that_was_never_staged(storage, api_client, queue_watch):
+    jobs, _sliced = storage
+    make_job(jobs, "aaaabbbb0002", "queued")
+
+    response = api_client.post("/api/jobs/aaaabbbb0002/slice")
+
+    assert response.status_code == 409
+    assert "job is 'queued', not awaiting confirmation" in response.json()["detail"]
+    assert queue_watch.empty()
+
+
+def test_run_slice_slices_the_finned_3mf(storage, switchable, monkeypatch):
+    jobs, _sliced = storage
+    jid = staged_job(jobs)
+    seen: dict = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["cmd"] = cmd
+        (Path(kwargs["cwd"]) / "out" / "cube.gcode").write_text(
+            "; total filament used [g] = 1\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+
+    main.run_slice(jid)
+
+    # the finned copy is the slicer input; the untouched upload is left alone
+    assert seen["cmd"][-1] == str(jobs / jid / "upload" / "fins-cube.3mf")
+    assert read_job(jobs, jid)["status"] == "sliced"
+    assert (jobs / jid / "upload" / "cube.stl").read_text() == "solid cube\n"
