@@ -24,6 +24,8 @@ from fastapi import HTTPException
 import config
 import main
 import moonraker
+import preview
+import supportfins
 
 
 class StubPrinter:
@@ -200,10 +202,12 @@ def test_prune_keeps_active_jobs_and_survives_a_corrupt_job_json(jobs_dir, monke
     corrupt.mkdir()
     (corrupt / "job.json").write_text("{not json")
     os.utime(corrupt, (now - 1000, now - 1000))
+    staged = job_with_status(jobs_dir, "aaaaaaaaaa04", "awaiting_confirm", now - 950)
 
     main.prune()
 
     assert queued.is_dir() and slicing.is_dir()             # never pruned, however old
+    assert staged.is_dir()                                  # staged waits for the operator
     assert not corrupt.is_dir()                             # unreadable job.json is prunable
     assert [d for d in finished if d.is_dir()] == finished[:5]
     assert [d for d in finished[5:] if d.is_dir()] == []
@@ -531,3 +535,194 @@ def test_ui_route_answers_without_a_printer_at_all(client, monkeypatch):
 
 def test_ui_route_reports_empty_when_unset(client):
     assert client.get("/api/ui").json() == {"printer_ui_url": main.CONFIG.printer_ui_url}
+
+
+# ---------------------------------------------------------------- support fins staging
+_FINS_MODEL = (
+    '<?xml version="1.0" encoding="UTF-8"?>'
+    '<model unit="millimeter" '
+    'xmlns="http://schemas.microsoft.com/3dmanufacturing/core/2015/02">'
+    '<resources>'
+    '<object id="1" type="model" name="cube"><mesh>'
+    '<vertices><vertex x="0" y="0" z="0"/><vertex x="10" y="0" z="0"/>'
+    '<vertex x="0" y="10" z="0"/></vertices>'
+    '<triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>'
+    '<object id="2" type="model" name="overhang fin"><mesh>'
+    '<vertices><vertex x="0" y="0" z="0"/><vertex x="4" y="0" z="0"/>'
+    '<vertex x="0" y="4" z="0"/></vertices>'
+    '<triangles><triangle v1="0" v2="1" v3="2"/></triangles></mesh></object>'
+    '</resources>'
+    '<build><item objectid="1"/><item objectid="2"/></build></model>')
+
+
+def finned_3mf_bytes() -> bytes:
+    """What app/support_fins.mjs writes: a 3MF whose supports object is named for the role."""
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w") as archive:
+        archive.writestr("3D/3dmodel.model", _FINS_MODEL)
+    return buffer.getvalue()
+
+
+@pytest.fixture
+def fake_fins(monkeypatch):
+    """Replace the node CLI with a recorder that writes a previewable 3MF."""
+    calls: list[tuple[Path, Path, float | None]] = []
+
+    def fin_model(src, dest, timeout=None):
+        calls.append((Path(src), Path(dest), timeout))
+        Path(dest).parent.mkdir(parents=True, exist_ok=True)
+        Path(dest).write_bytes(finned_3mf_bytes())
+        return {"report": "1 fin wall, 2 tines", "stats": {"overhangRegions": 1, "finTriangles": 1,
+                "braces": 1, "tines": 2}}
+
+    monkeypatch.setattr(supportfins, "fin_model", fin_model)
+    return calls
+
+
+def stage(client, cube_stl) -> str:
+    """Upload with the fins checkbox and return the staged job id."""
+    response = client.post("/api/upload", data={"support_fins": "true"},
+                           files={"file": ("cube.stl", cube_stl, "model/stl")})
+    assert response.status_code == 200, response.text
+    return response.json()["id"]
+
+
+def test_upload_with_fins_stages_the_job_instead_of_queuing_it(client, jobs_dir, cube_stl,
+                                                              fake_fins):
+    response = client.post("/api/upload", data={"support_fins": "true"},
+                           files={"file": ("cube.stl", cube_stl, "model/stl")})
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "awaiting_confirm"     # the dialog's "Slice it" queues it
+    assert "queue_position" not in body
+    assert body["original"] == "cube.stl"
+    assert body["fins"]["stats"]["tines"] == 2
+
+    jid = body["id"]
+    job = read_job_file(jobs_dir, jid)
+    assert job["status"] == "awaiting_confirm"
+    assert job["support_fins"] is True
+    assert job["original"] == "cube.stl"
+    assert job["filename"] == "fins-cube.3mf"       # the finned 3MF is the slicer input
+    assert (jobs_dir / jid / "upload" / "fins-cube.3mf").read_bytes() == finned_3mf_bytes()
+    assert fake_fins[0][2] == main.CONFIG.support_fins_timeout
+    assert not (jobs_dir / jid / "out").exists()    # nothing was sliced yet
+
+
+def test_the_fins_cli_receives_the_uploaded_model_and_the_timeout(client, cube_stl, fake_fins):
+    stage(client, cube_stl)
+
+    src, dest, timeout = fake_fins[0]
+    assert src.name == "cube.stl"
+    assert dest.name == "fins-cube.3mf"
+    assert dest.parent == src.parent                 # the finned copy stays in the upload dir
+    assert timeout == main.CONFIG.support_fins_timeout
+
+
+def test_a_fins_failure_is_a_400_and_leaves_no_job_behind(client, jobs_dir, cube_stl,
+                                                          monkeypatch):
+    def explode(src, dest, timeout=None):
+        raise supportfins.SupportFinsError("node exited 1: no overhangs")
+
+    monkeypatch.setattr(supportfins, "fin_model", explode)
+
+    response = client.post("/api/upload", data={"support_fins": "true"},
+                           files={"file": ("cube.stl", cube_stl, "model/stl")})
+
+    assert response.status_code == 400
+    assert response.json()["detail"] == "support fins failed: node exited 1: no overhangs"
+    assert list(jobs_dir.iterdir()) == []            # the half-made job dir was removed
+
+
+def test_preview_of_a_staged_job_returns_the_scene(client, monkeypatch, cube_stl, fake_fins):
+    jid = stage(client, cube_stl)
+    monkeypatch.setattr(main, "JOBS", main.JOBS)     # the job dir is the fixture's
+
+    response = client.get(f"/api/jobs/{jid}/preview")
+
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] == jid
+    assert body["unit"] == "millimeter"
+    assert {obj["role"] for obj in body["objects"]} == {"part", "supports"}
+    assert body["original"] == "cube.stl"
+    assert body["fins"]["stats"]["tines"] == 2
+    assert body["bbox"]["size"] == [10.0, 10.0, 0.0]
+
+
+def test_preview_of_a_queued_job_is_a_409(client, cube_stl):
+    jid = client.post(
+        "/api/upload", files={"file": ("cube.stl", cube_stl, "model/stl")}).json()["id"]
+
+    response = client.get(f"/api/jobs/{jid}/preview")
+
+    assert response.status_code == 409
+    assert "has no support fins" in response.json()["detail"]
+
+
+def test_preview_names_an_unreadable_finned_model(client, jobs_dir, cube_stl, fake_fins):
+    jid = stage(client, cube_stl)
+    (jobs_dir / jid / "upload" / "fins-cube.3mf").write_bytes(b"not a zip")
+
+    response = client.get(f"/api/jobs/{jid}/preview")
+
+    assert response.status_code == 409
+    assert response.json()["detail"].startswith("preview unavailable: ")
+    assert "is not a readable 3MF archive" in response.json()["detail"]
+
+
+def test_preview_of_an_unknown_job_is_404(client):
+    assert client.get("/api/jobs/aaaaaaaaaaaa/preview").status_code == 404
+
+
+def test_confirm_slice_queues_a_staged_job_exactly_once(client, jobs_dir, cube_stl, fake_fins):
+    jid = stage(client, cube_stl)
+
+    first = client.post(f"/api/jobs/{jid}/slice")
+    second = client.post(f"/api/jobs/{jid}/slice")
+
+    assert first.status_code == 200
+    assert first.json()["status"] == "queued"
+    assert first.json()["queue_position"] >= 1
+    assert read_job_file(jobs_dir, jid)["status"] == "queued"
+    assert second.status_code == 409                # a double click is not a second entry
+    assert "not awaiting confirmation" in second.json()["detail"]
+
+
+def test_confirm_slice_refuses_a_job_that_was_never_staged(client, cube_stl):
+    jid = client.post(
+        "/api/upload", files={"file": ("cube.stl", cube_stl, "model/stl")}).json()["id"]
+
+    response = client.post(f"/api/jobs/{jid}/slice")
+
+    assert response.status_code == 409
+    assert "job is 'queued'" in response.json()["detail"]
+
+
+def test_delete_all_still_removes_an_abandoned_staged_job(client, jobs_dir, cube_stl, fake_fins):
+    """The bulk cleanup is the escape hatch for a dialog the operator abandoned.
+
+    `main.py:70-76` keeps `awaiting_confirm` out of ACTIVE_STATUSES on purpose: only
+    prune() spares a staged job, so "delete finished" can still clear one.
+    """
+    jid = stage(client, cube_stl)
+
+    body = client.delete("/api/jobs").json()
+
+    assert body["deleted_ids"] == [jid]
+    assert body["skipped_ids"] == []
+    assert not (jobs_dir / jid).exists()
+
+
+def test_the_support_fins_endpoint_reports_the_caps(client, monkeypatch):
+    monkeypatch.setattr(supportfins, "available", lambda: False)
+    monkeypatch.setattr(supportfins, "unavailable_reason",
+                        lambda: "node runtime is not available")
+
+    assert client.get("/api/support-fins").json() == {
+        "available": False,
+        "reason": "node runtime is not available",
+        "timeout": main.CONFIG.support_fins_timeout,
+        "max_triangles": preview.MAX_TRIANGLES,
+    }

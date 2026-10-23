@@ -84,8 +84,9 @@ mkdir -p data sliced && sudo chown -R 1000:1000 data sliced
 docker compose -f docker-compose.hub.yml up -d
 ```
 
-Requires Docker Compose **≥ 2.24**. The image is **amd64 only** and ~1 GB, because it contains
-OrcaSlicer and its runtime. Your data lives in `./data` and `./sliced`; deleting `./data` is a factory
+Requires Docker Compose **≥ 2.24**. The image is **amd64 only** and ~1.1 GB, because it contains
+OrcaSlicer, its runtime and a node runtime for the optional fins step. Your data lives in `./data` and
+`./sliced`; deleting `./data` is a factory
 reset. Plain `docker run`, upgrades and rollback: [docs/deployment.md](docs/deployment.md).
 
 ## First run
@@ -119,6 +120,7 @@ Every variable has a working default, and a printer can arrive entirely through 
 | `MAX_UPLOAD_MB` | `150` | upload cap, also per unpacked archive member |
 | `KEEP_JOBS` | `25` | job directories kept before the oldest are pruned |
 | `SLICE_TIMEOUT` | `900` | seconds before a slice is killed |
+| `SUPPORT_FINS_TIMEOUT` | `300` | seconds one support-fins run may take (runs are serialised) |
 | `BED_SIZE` | `220x220` | clamps imported machine presets |
 | `PORT` | `8088` | web UI port inside the container |
 
@@ -126,9 +128,10 @@ Every variable, the datadir layout and the seeding rules: [docs/configuration.md
 
 ## API
 
-`GET /api/health` · `/api/printer` · `/api/ui` · `/api/jobs` · `/api/printers` · `/api/profile`
-(with `POST /api/upload`, `POST /api/jobs/{id}/print`, printer CRUD and selection, profile
-import/select). Full surface with status codes and error bodies: [docs/api.md](docs/api.md).
+`GET /api/health` · `/api/printer` · `/api/ui` · `/api/jobs` · `/api/support-fins` · `/api/printers`
+· `/api/profile` (with `POST /api/upload`, `POST /api/jobs/{id}/slice`, `GET /api/jobs/{id}/preview`,
+`POST /api/jobs/{id}/print`, printer CRUD and selection, profile import/select). Full surface with
+status codes and error bodies: [docs/api.md](docs/api.md).
 
 ## Troubleshooting
 
@@ -160,6 +163,55 @@ Every failure mode with the exact message it produces: [docs/troubleshooting.md]
 | [deployment.md](docs/deployment.md) · [runbook.md](docs/runbook.md) | install, upgrade, rollback, verifying a deploy |
 | [presets.md](docs/presets.md) · [orcaslicer-presets.md](docs/orcaslicer-presets.md) | how presets are imported and loaded |
 | [troubleshooting.md](docs/troubleshooting.md) | failure modes and their real messages |
+
+## Optional support fins
+
+Opt-in (default OFF) in the upload form: tick **Add designed-in support fins** and the portal runs the
+bundled [support-fins](#acknowledgements) CLI locally on the upload, then slices the finned 3MF instead
+of the original. STL, 3MF and OBJ are accepted (a ZIP is unpacked first) and the output is always a 3MF;
+the original upload stays on disk. `GET /api/support-fins` reports whether the runtime is present, and
+the checkbox is offered only when it is.
+
+A finned upload is staged, not queued:
+
+- The CLI runs during the upload, so the job comes back `awaiting_confirm` instead of `queued`. Nothing
+  enters the queue until you confirm.
+- The dialog shows what the CLI did (`"14 walls, 24 tines"`, overhang regions, fin/tine/brace counts)
+  and a **local** 3D preview of the finned 3MF: drag to orbit, wheel to zoom, arrows when the canvas is
+  focused, chips to show/hide the part and the supports. No geometry, no upload and no font ever leaves
+  the container.
+- **Slice it** queues the job (`POST /api/jobs/{id}/slice`), **Close** leaves it staged (the job row's
+  **Review** button reopens the dialog), **Discard** deletes it.
+- A CLI failure is a `400 support fins failed: <cli text>` and the job directory is removed, so a broken
+  upload leaves nothing behind.
+
+Limits worth knowing before you tick the box:
+
+- **A 3MF project's own slicer settings are dropped.** The upload is re-identified against the selected
+  printer/process first, then finned, but the CLI's 3MF carries no OrcaSlicer identity metadata — so the
+  rewritten copy is discarded rather than sliced with presets that no longer match. The job row records
+  it.
+- **One part per upload.** The portal exposes no per-object or per-plate selection, so multi-part
+  projects are not supported for finning.
+- **Orientation is preserved** — no rotation is applied, the part is finned the way it lies (the finned mesh is not auto-oriented; the upstream CLI recentres it in XY, e.g. x=[0,76] becomes x=[-38,38], without rotating). Shrink-to-fit is refused for finned jobs because OrcaSlicer requires --orient for --scale. A shallow
+  overhang can legitimately yield **zero fins** (`cube.stl` does); that is still a success.
+- **The node runtime costs ~123 MB of image** (`node:22.23.4-bookworm`, digest-pinned and smoke-tested at
+  build time), which is why the image is ~1.1 GB.
+- **Serialised and bounded**: one fin run at a time, each capped by `SUPPORT_FINS_TIMEOUT` (300 s), so a
+  second finned upload waits for the first.
+- **The preview is bounded** to 200 000 triangles and 12 MiB of input. Past that the dialog reports
+  `preview unavailable: …` and still offers **Slice it**.
+- **A staged job is protected from age pruning** (absent from ACTIVE_STATUSES but in PRUNE_KEEP_STATUSES) and can be deleted
+  individually or by **Delete finished**; it simply never enters the queue until you confirm.
+
+## Acknowledgements
+
+Support fins (optional designed-in breakaway supports) are based on the **Support Fins** project by
+Matthew Trahan (gittrahan) — <https://github.com/gittrahan/support-fins> — licensed under the MIT
+License. The bundled CLI (`app/support_fins.mjs`) is unmodified upstream build output; its provenance
+(version, sha256, how it was built), the MIT copyright notice and the Apache-2.0 terms of the bundled
+`manifold-3d` are in [`app/SUPPORT_FINS_NOTICE.txt`](app/SUPPORT_FINS_NOTICE.txt). See the upstream
+repository for the original implementation and documentation.
 
 ## License
 

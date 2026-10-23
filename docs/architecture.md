@@ -19,6 +19,8 @@ pipeline below is the same in both; the seed contents and the preset behaviour a
 | `app/printers.py` | Printer store (`printers.json` + Fernet-encrypted keys), the env seed row, pairing validation. |
 | `app/moonraker.py` | Moonraker HTTP client; maps transport/HTTP failures onto `MoonrakerError` subclasses carrying `http_status` (`moonraker.py:46-69`). |
 | `app/threemf.py` | Reads a 3MF's embedded printer/process identity and rewrites a job-local copy that names local presets. |
+| `app/supportfins.py` | Wraps the bundled `app/support_fins.mjs`: `available()`/`unavailable_reason()`, and `fin_model()` — one `node` run with `--json`, bounded by `SUPPORT_FINS_TIMEOUT`, serialised by `_RUN_LOCK`, failures as `SupportFinsError`/`SupportFinsUnavailable`. |
+| `app/preview.py` | Reads a job's 3MF/STL/OBJ geometry for the pre-slice preview (`read_scene`), one object per leaf with `role: "part"` or `"supports"`, capped by `MAX_TRIANGLES` (200 000) and `MAX_BYTES` (12 MiB). No network, no UI. |
 | `app/archives.py` | Picks one model out of an uploaded `.zip`, fail-closed on hostile members. |
 | `app/gcode.py` | Parses the slicer's gcode header for grams/time/layers (`MAX_HEAD_BYTES = 2_000_000`). |
 | `app/index.html` | The whole UI, inline CSS/JS. Served by `GET /`. |
@@ -61,7 +63,8 @@ sequenceDiagram
    in the job dir, the extracted member is what gets sliced.
 3. A `.3mf` goes through `prepare_3mf` (`main.py:914`): match the file's printer/process against local
    presets, select the matching printer, and rewrite the identity into `upload/slice-<stem>.3mf`.
-4. `job.json` is written with `status: "queued"`, the upload name, `profile_snapshot` and — when
+4. `job.json` is written with `status: "queued"` (or `"awaiting_confirm"` when support fins are on —
+   see *Staged jobs* below), the upload name, `profile_snapshot` and — when
    relevant — `archive`, `threemf`, `slicer_input`. The id is then queued.
 5. The worker thread (`worker`, `main.py:692`) pops the id and runs `run_slice` (`main.py:615`).
 6. `run_slice` sets `status: "slicing"`, resolves the presets (`slice_profile` trusts a job snapshot
@@ -101,6 +104,22 @@ stateDiagram-v2
 `ACTIVE_STATUSES = ("queued", "slicing")` (`main.py:65`). Nothing in the UI, and no route, rewrites a
 terminal state. `prune()` keeps the `KEEP_JOBS` newest finished job directories and never removes an
 active one (`main.py:710-722`).
+
+### Staged jobs (support fins)
+
+`POST /api/upload` with `support_fins=true` is the one upload that does not end in `queued`: the CLI
+runs inside the request (`supportfins.fin_model`, serialised on `_RUN_LOCK`) and the job is written as
+`awaiting_confirm`, not enqueued. `POST /api/jobs/{jid}/slice` performs the only
+`awaiting_confirm → queued` transition, under `STAGE_LOCK`, so a double click is a 409 rather than a
+second queue entry. The 3MF is prepared (`prepare_3mf`) *before* finning, because the CLI's output
+carries no OrcaSlicer identity metadata; the rewritten copy is then deleted, so a finned job has
+`slicer_input: None` and `threemf["rewrite"] == "discarded"` with an explanatory note.
+
+Because `awaiting_confirm` is absent from `ACTIVE_STATUSES`, such a job lists and deletes like a
+finished one but is excluded from age pruning via PRUNE_KEEP_STATUSES, while
+it under an open preview dialog. The worker never sees it, so `run_slice` needed no change.
+`GET /api/jobs/{jid}/preview` serves its geometry through `preview.read_scene` (stdlib `zipfile` +
+`ElementTree`), which is also why the preview cannot drift from the file that will be sliced.
 
 ### Concurrency
 

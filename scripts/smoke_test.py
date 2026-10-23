@@ -4,6 +4,12 @@
 The seeded datadir ships no preset, so the machine/process/filament the CLI is given come
 from importing ``--bundle`` through the same ``profiles.import_into`` the app uses.
 
+``--fins-only`` instead exercises the opt-in support-fins path: node + ``app/support_fins.mjs``
+run through ``supportfins.fin_model``, and the 3MF they write is read back with
+``preview.read_scene`` the way ``GET /api/jobs/{id}/preview`` does. It needs no OrcaSlicer, so
+it also runs on a dev host. Use a fixture that actually grows fins (``overhang.stl``);
+``cube.stl`` is shallow enough that the CLI legitimately returns zero fins.
+
 Exits 0 and prints a single line starting ``smoke: ok`` on success; exits 1 with
 diagnostics on any failure. Runnable as uid 1000.
 """
@@ -37,16 +43,71 @@ def fail(msg: str, proc: subprocess.CompletedProcess | None = None) -> None:
     raise SystemExit(1)
 
 
+def fins_fail(msg: str) -> None:
+    print(msg, file=sys.stderr)
+    print("hint: support fins need node on PATH and app/support_fins.mjs beside app/supportfins.py",
+          file=sys.stderr)
+    raise SystemExit(1)
+
+
+def check_fins(stl: Path, workdir: Path, app_dir: str) -> None:
+    """Run the bundled CLI once and check the finned 3MF the preview dialog would read."""
+    if not stl.is_file():
+        fins_fail(f"smoke: fins input missing: {stl}")
+    sys.path.insert(0, app_dir)
+    try:
+        import preview
+        import supportfins
+    except Exception as e:
+        fins_fail(f"smoke: cannot import supportfins/preview: {e}")
+
+    reason = supportfins.unavailable_reason()
+    if reason:
+        fins_fail(f"smoke: support fins unavailable: {reason}")
+
+    outdir = workdir / "fins"
+    outdir.mkdir(parents=True, exist_ok=True)
+    dest = outdir / f"{stl.stem}-fins.3mf"
+    try:
+        result = supportfins.fin_model(stl, dest)
+    except supportfins.SupportFinsError as e:
+        fins_fail(f"smoke: support fins failed: {e}")
+    if not dest.is_file() or dest.stat().st_size == 0:
+        fins_fail(f"smoke: support fins wrote no 3MF at {dest}")
+
+    try:
+        scene = preview.read_scene(dest)
+    except preview.PreviewError as e:
+        fins_fail(f"smoke: finned 3MF is not readable: {e}")
+    supports = [o for o in scene.get("objects", [])
+                if o.get("role") == "supports" and o.get("triangles")]
+    if not supports:
+        fins_fail(f"smoke: no support geometry in {dest.name}: {result.get('stats')}")
+
+    stats = result.get("stats") or {}
+    print(f"smoke: ok {dest.name} objects={len(scene['objects'])} supports={len(supports)} "
+          f"finTriangles={stats.get('finTriangles')} tines={stats.get('tines')} "
+          f"report={result.get('report')!r}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--orca", required=True)
-    ap.add_argument("--datadir", required=True)
-    ap.add_argument("--stl", required=True)
+    ap.add_argument("--orca", help="orca-slicer binary (slice step only)")
+    ap.add_argument("--datadir", help="seed datadir to copy (slice step only)")
+    ap.add_argument("--stl", required=True, help="model to slice, or the fins fixture")
     ap.add_argument("--workdir", required=True)
     ap.add_argument("--app-dir", default="/app")
     ap.add_argument("--bundle", default="/opt/smoke/bundle.orca_printer")
     ap.add_argument("--bed", default="220x220")
+    ap.add_argument("--fins-only", action="store_true",
+                    help="only the support-fins step (needs node, not OrcaSlicer)")
     args = ap.parse_args()
+
+    if args.fins_only:
+        check_fins(Path(args.stl), Path(args.workdir), args.app_dir)
+        return
+    if not args.orca or not args.datadir:
+        ap.error("--orca and --datadir are required unless --fins-only is given")
     bed = tuple(float(part) for part in args.bed.lower().split("x"))
 
     workdir = Path(args.workdir)

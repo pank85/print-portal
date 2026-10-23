@@ -146,6 +146,8 @@ ul{ padding:0; list-style:none; }
 .chip-sliced{ color:var(--color-accent); border-color:#22C55E66; }
 .chip-printed{ background:var(--color-primary); color:var(--color-on-primary); border-color:var(--color-border-strong); }
 .chip-failed{ background:var(--color-destructive); color:var(--color-on-destructive); border-color:var(--color-destructive); }
+/* staged: the model exists and the fins are drawn, but nothing has been queued yet */
+.chip-awaiting_confirm{ color:var(--color-warning); border-color:#F59E0B66; }
 
 /* ---------- layout ---------- */
 main{ max-width:1200px; margin-inline:auto; padding:var(--space-4) var(--space-4) var(--space-8); }
@@ -403,6 +405,60 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 .dialog-actions{ display:flex; flex-wrap:wrap; justify-content:flex-end; gap:var(--space-2); margin-top:var(--space-6); }
 @media (max-width:400px){ .dialog-actions .btn{ flex:1 1 100%; } }
 
+/* ---------- support-fins preview ----------
+   The 3-D view is painted on demand — a drag, a wheel, a key or a legend toggle — and then
+   stops. There is no rAF loop and no idle spin, so the reduced-motion block below has nothing
+   to cancel; only the drag itself changes pixels. */
+#previewDlg{ width:min(960px,96vw); max-width:96vw; max-height:92vh; overflow:auto; padding:var(--space-4); }
+#previewDlg h2{ margin-bottom:var(--space-1); }
+#previewDlg .hint{ margin-top:var(--space-1); }
+.preview-stage{
+  position:relative; display:grid; place-items:center; margin-top:var(--space-3); overflow:hidden;
+  height:min(60vh,520px); min-height:240px;
+  background:radial-gradient(circle at 50% 35%, #27324A 0%, var(--color-background) 72%);
+  border:1px solid var(--color-border); border-radius:var(--radius-sm);
+}
+#previewCanvas{ display:block; width:100%; height:100%; touch-action:none; cursor:grab; }
+#previewCanvas:active{ cursor:grabbing; }
+#previewCanvas[hidden]{ display:none; }
+#previewFallback{ max-width:46ch; padding:var(--space-4); text-align:center; color:var(--color-muted-foreground); }
+#previewFallback[hidden]{ display:none; }
+#previewStats{ margin-top:var(--space-2); font-size:var(--text-xs); font-variant-numeric:tabular-nums; }
+.preview-legend{ display:flex; flex-wrap:wrap; gap:var(--space-2); margin-top:var(--space-2); }
+.preview-legend:empty{ display:none; }
+/* a legend entry is a real toggle button, not a decorative chip: aria-pressed carries the state */
+.preview-key{
+  display:inline-flex; align-items:center; gap:var(--space-2);
+  min-height:var(--target-min); padding:2px var(--space-3);
+  background:var(--color-muted); color:var(--color-foreground);
+  border:1px solid var(--color-border-strong); border-radius:var(--radius-pill);
+  font-family:var(--font-mono); font-size:var(--text-xs);
+  touch-action:manipulation;
+}
+.preview-key::before{
+  content:""; width:10px; height:10px; flex:0 0 auto; border-radius:50%;
+  background:var(--preview-swatch, var(--color-muted-foreground));
+  box-shadow:0 0 0 1px #00000055 inset;
+}
+/* a toggled-off object keeps its entry, so it reads as dimmed rather than gone */
+.preview-key[aria-pressed="false"]{ color:var(--color-muted-foreground); opacity:.6; }
+.preview-key[aria-pressed="false"]::before{ background:transparent; border:1px dashed var(--color-muted-foreground); }
+#previewError{ margin-top:var(--space-2); color:var(--color-destructive-text); }
+#previewError[hidden]{ display:none; }
+/* the decision stays reachable while a long model list scrolls under it */
+.preview-actions{
+  position:sticky; bottom:0; z-index:1;
+  margin-top:var(--space-3); padding-top:var(--space-3); background:var(--color-card);
+}
+@media (max-width:640px){
+  #previewDlg{
+    width:100vw; max-width:100vw; height:100dvh; max-height:100dvh;
+    margin:0; padding:var(--space-3); border:0; border-radius:0;
+  }
+  .preview-stage{ height:45vh; min-height:200px; margin-inline:calc(-1 * var(--space-3)); border-radius:0; }
+  .preview-actions .btn{ flex:1 1 100%; }
+}
+
 #toast{
   position:fixed; left:50%; bottom:var(--space-6); z-index:50; transform:translateX(-50%) translateY(8px);
   max-width:min(560px,calc(100vw - 32px)); padding:var(--space-3) var(--space-4);
@@ -528,6 +584,10 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
           <p class="hint" id="outputNameHint">Saved as <span class="mono">&lt;name&gt;.gcode</span> — letters, digits, spaces, dot, dash, underscore. Empty uses the model name.</p>
         </div>
         <label for="file" class="sr-only">Model file to slice</label>
+        <div class="field">
+          <label><input id="supportFins" name="support_fins" type="checkbox" value="true"> Add designed-in support fins (off by default)</label>
+          <p class="hint">Runs the bundled support-fins CLI locally on the upload; leaves the original file untouched.</p>
+        </div>
         <input id="file" type="file" accept=".stl,.3mf,.obj,.zip" hidden>
         <div id="drop" role="button" tabindex="0" aria-disabled="false">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -557,6 +617,12 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
               Gcode
             </a>
+            <button type="button" class="btn" id="uploadLatestPreview"
+                    data-act="preview" aria-label="Preview the support fins" hidden>
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
+              Preview fins
+            </button>
             <button type="button" class="btn btn-danger" id="uploadLatestDelete"
                     data-act="delete" aria-label="Delete the last job">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -750,6 +816,24 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
   <div class="dialog-actions">
     <button type="button" class="btn" id="dlgCancel">Cancel</button>
     <button type="button" class="btn btn-danger" id="dlgOk">Delete</button>
+  </div>
+</dialog>
+
+<dialog id="previewDlg" class="dialog" aria-labelledby="previewTitle" aria-describedby="previewHint">
+  <h2 id="previewTitle">Support fins preview</h2>
+  <p id="previewHint" class="hint">Drag to orbit, scroll to zoom, arrow keys when the view has focus.</p>
+  <div class="preview-stage">
+    <canvas id="previewCanvas" tabindex="0" role="img"
+            aria-label="3-D preview of the finned model. Drag to rotate, scroll to zoom, arrow keys to rotate."></canvas>
+    <p id="previewFallback" hidden></p>
+  </div>
+  <p id="previewStats" class="mono"></p>
+  <div id="previewLegend" class="preview-legend" role="group" aria-label="Objects in the preview"></div>
+  <p id="previewError" class="err" role="alert" hidden></p>
+  <div class="dialog-actions preview-actions">
+    <button type="button" class="btn btn-danger" id="previewDiscard">Discard</button>
+    <button type="button" class="btn" id="previewClose">Keep for later</button>
+    <button type="button" class="btn btn-primary" id="previewConfirm">Slice it</button>
   </div>
 </dialog>
 
@@ -1240,7 +1324,10 @@ async function upload(file) {
   fd.append("file", file);
   const name = ($("#outputName").value || "").trim();
   if (name) fd.append("output_name", name);
-  toast(`Uploading: ${file.name}`);
+  const fins = !!$("#supportFins")?.checked;
+  if (fins) fd.append("support_fins", "true");
+  /* the fins run happens on the server before anything is queued, so say what is happening */
+  toast(fins ? `Adding support fins: ${file.name}` : `Uploading: ${file.name}`);
   setUploadProgress(0, file.size);
   try {
     const j = await new Promise((resolve, reject) => {
@@ -1261,14 +1348,6 @@ async function upload(file) {
     /* The job exists now: the same box becomes the indeterminate slice wait, and the poll
        (refresh → setUploadWait) takes over from here. */
     transferPhase = false;
-    setUploadWait({status: "queued", filename: file.name});
-    setUploadLatest({id: j.id, status: "queued", filename: file.name});
-    if (j.archive) {
-      const total = Math.max(1, (j.archive.candidates || []).length);
-      toast(`Slicing ${j.archive.member} (1 of ${total} model files)`, 5000);
-    } else {
-      toast("Queued for slice");
-    }
     if (j.threemf) {
       /* the 3MF switch rewrote profile.json and possibly the selected printer, so both
          cards are stale by now */
@@ -1279,6 +1358,22 @@ async function upload(file) {
         const printerName = printer ? printer.name : (j.threemf.printer ? String(j.threemf.printer) : "—");
         toast(`Profile switched to ${printerName} / ${presetName("process", j.threemf.process) || "—"}`, 6000);
       }
+    }
+    /* With fins the job stops here: the model is staged, nothing is queued, and the preview is
+       the decision point. Slicing resumes from #previewConfirm or a row's Slice it button. */
+    if (j.status === "awaiting_confirm") {
+      setUploadWait(null);
+      setUploadLatest(j);
+      openPreview(j.id);
+      return;
+    }
+    setUploadWait({status: "queued", filename: file.name});
+    setUploadLatest({id: j.id, status: "queued", filename: file.name});
+    if (j.archive) {
+      const total = Math.max(1, (j.archive.candidates || []).length);
+      toast(`Slicing ${j.archive.member} (1 of ${total} model files)`, 5000);
+    } else {
+      toast("Queued for slice");
     }
     refresh();
   } catch (e) {
@@ -1337,6 +1432,8 @@ function onJobAction(ev) {
   if (!btn) return;
   if (btn.dataset.act === "print") printJob(btn.dataset.ref);
   else if (btn.dataset.act === "delete") del(btn.dataset.ref);
+  else if (btn.dataset.act === "preview") openPreview(btn.dataset.ref);
+  else if (btn.dataset.act === "slice") confirmSlice(btn.dataset.ref);
 }
 
 /* The upload card is not re-rendered by the poll, so its element is updated in place
@@ -1369,6 +1466,15 @@ function jobPrintable(j) {
 
 /* `withWait` is off for the card: #uploadWait, directly above the block, already paints the live
    slice state (and takes over for the transfer bar), so the body must not sweep a second time. */
+function finsSummary(j) {
+  const s = (j.fins && j.fins.stats) || {};
+  const parts = [];
+  if (s.finTriangles) parts.push(`${s.finTriangles} tri`);
+  if (s.braces) parts.push(`${s.braces} walls`);
+  if (s.tines) parts.push(`${s.tines} tines`);
+  return parts.join(" · ") || "added";
+}
+
 function renderJobBody(j, withWait = true) {
   const s = j.stats || {};
   const out = j.output_name ? `<span class="mono" title="sliced as">→ ${esc(j.output_name)}.gcode</span>` : "";
@@ -1399,6 +1505,8 @@ function renderJobBody(j, withWait = true) {
       <span class="mono">${fmtBytes(j.upload_bytes)}</span>
       <span>${fmtDate(j.created)}</span>
       ${out}
+      ${j.support_fins ? `<span title="${esc((j.fins && j.fins.report) || "designed-in support fins")}">fins: ${esc(finsSummary(j))}</span>` : ""}
+      ${j.original && j.original !== j.filename ? `<span class="mono" title="uploaded as">from ${esc(j.original)}</span>` : ""}
       ${j.remote_file ? `<span class="mono" title="on printer">on printer: ${esc(j.remote_file)}</span>` : ""}
     </p>
     ${waitBlock}
@@ -1419,9 +1527,18 @@ function renderJobRow(j) {
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
             Gcode
           </a>` : "";
+  /* a staged job has nothing to print yet, but it can still be reviewed or queued from here */
+  const staged = j.status === "awaiting_confirm" && !j.error ? `
+          <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">
+            Preview fins
+          </button>
+          <button type="button" class="btn btn-primary" data-act="slice" data-ref="${esc(j.id)}">
+            Slice it
+          </button>` : "";
   return `<article class="job">
         <div>${renderJobBody(j)}</div>
         <div class="job-actions">
+          ${staged}
           ${actions}
           <button type="button" class="btn btn-danger" data-act="delete" data-ref="${esc(j.id)}">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -1431,7 +1548,6 @@ function renderJobRow(j) {
         </div>
       </article>`;
 }
-
 /* The Slice card's "Last job" block reads the poll's first row, so a reload mid-slice lands here
    too. Only the text body is rewritten; the three actions are static elements that are shown or
    hidden and re-pointed, because re-parsing them on every poll would throw away the keyboard
@@ -1439,6 +1555,7 @@ function renderJobRow(j) {
 function setUploadLatest(job) {
   const box = $("#uploadLatest"), body = $("#uploadLatestBody"),
         print = $("#uploadLatestPrint"), gcode = $("#uploadLatestGcode"),
+        preview = $("#uploadLatestPreview"),
         remove = $("#uploadLatestDelete");
   if (!job) { box.hidden = true; return; }
   box.hidden = false;
@@ -1451,6 +1568,11 @@ function setUploadLatest(job) {
   gcode.hidden = !printable;
   gcode.href = printable ? `/api/jobs/${job.id}/gcode` : "#";
   gcode.setAttribute("aria-label", `Download ${name} as gcode`);
+  /* staged jobs are previewable up to the moment they queue; the poll re-aims this static button */
+  const staged = job.status === "awaiting_confirm" && !job.error;
+  preview.hidden = !staged;
+  preview.dataset.ref = staged ? job.id : "";
+  preview.setAttribute("aria-label", `Preview the support fins on ${name}`);
   remove.dataset.ref = job.id;
   remove.setAttribute("aria-label", `Delete ${name}`);
 }
@@ -1477,6 +1599,393 @@ async function refresh() {
     setUploadWait(null);
     setUploadLatest(null);
   }
+}
+
+/* ---------------- support-fins preview ----------------
+   The dialog shows the model the slicer would receive, before anything is queued. The server
+   hands over raw vertices and triangles and everything below is drawing, orbiting and toggling:
+   no asset, no library. A repaint happens for an interaction only (one coalesced frame per
+   burst, drawn synchronously under prefers-reduced-motion), so nothing animates while the
+   dialog sits open. */
+const PREVIEW_COLOUR = {
+  part: [148, 163, 184],        // --color-muted-foreground: the model itself stays neutral
+  other: [100, 116, 139],
+  supports: [34, 197, 94],      // --color-accent: the fins are the point
+};
+const PREVIEW_TRIANGLE_BUDGET = 120000;   // one drag frame stays sane on a big mesh
+const PREVIEW_KEY_STEP = 0.12;
+let previewJob = null;          // {id, filename, ...} of the staged job
+let previewScene = null;        // the last GET /preview payload
+let previewHidden = new Set();  // object ids the legend has toggled off
+let previewDrag = null;         // {id, x, y} while a pointer is down
+let previewFrame = 0;           // one-shot coalescing, never a loop
+let previewView = { yaw: -0.6, pitch: -0.45, zoom: 1 };
+
+function prefersReducedMotion() {
+  return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
+}
+function fmtMm(v) {
+  const n = Number(v);
+  return Number.isFinite(n) ? String(Math.round(n * 10) / 10) : "?";
+}
+function previewBaseColour(role) {
+  return PREVIEW_COLOUR[role] || PREVIEW_COLOUR.other;
+}
+function previewTint(base, light) {
+  const f = 0.35 + 0.65 * Math.max(0, Math.min(1, light));
+  return `rgb(${Math.round(base[0] * f)}, ${Math.round(base[1] * f)}, ${Math.round(base[2] * f)})`;
+}
+function previewObjectId(o) { return String(o.id); }
+function previewObjectName(o) { return String(o.name || o.id || o.role || "object"); }
+
+/* stats and legend are written once per payload, never per frame */
+function renderPreviewChrome(p) {
+  const stats = $("#previewStats"), legend = $("#previewLegend");
+  const objects = Array.isArray(p.objects) ? p.objects : [];
+  const size = (p.bbox && Array.isArray(p.bbox.size)) ? p.bbox.size : [];
+  const fins = (p.fins && p.fins.stats) || {};
+  const summary = [fins.finTriangles ? `${fins.finTriangles} fin triangles` : "no fin geometry"];
+  summary.push(`${objects.length} object${objects.length === 1 ? "" : "s"}`);
+  if (size.length === 3) summary.push(`${size.map(fmtMm).join("×")} mm`);
+  stats.textContent = summary.join(" · ");
+  legend.replaceChildren();
+  for (const o of objects) {
+    if (!Array.isArray(o.triangles) || o.triangles.length < 3) continue;
+    const key = document.createElement("button");
+    key.type = "button";
+    key.className = "preview-key";
+    key.dataset.previewObject = previewObjectId(o);
+    key.setAttribute("aria-pressed", "true");
+    key.style.setProperty("--preview-swatch", previewTint(previewBaseColour(o.role), 1));
+    const count = o.count || Math.floor(o.triangles.length / 3);
+    key.textContent = `${previewObjectName(o)} · ${count}`;
+    legend.appendChild(key);
+  }
+}
+
+function previewFallbackText(note) {
+  $("#previewCanvas").hidden = true;
+  const fallback = $("#previewFallback");
+  fallback.textContent = note;
+  fallback.hidden = false;
+}
+
+/* a preview failure is not a slicing failure: the staged job stays queueable */
+function showPreviewError(message) {
+  const err = $("#previewError");
+  err.textContent = `Could not load the preview: ${message}. The job is still staged — Slice it queues the model as uploaded.`;
+  err.hidden = false;
+  $("#previewHint").textContent = "The model could not be drawn here; nothing was lost.";
+  previewFallbackText("No preview available. Slice it queues the finned model exactly as it was uploaded.");
+  $("#previewConfirm").disabled = false;
+}
+
+function drawPreview() {
+  if (!previewScene) return;
+  const canvas = $("#previewCanvas");
+  const ctx = canvas.getContext ? canvas.getContext("2d") : null;
+  if (!ctx) {
+    previewFallbackText("This browser cannot draw the model. Slice it queues it as uploaded.");
+    return;
+  }
+  /* DPR-aware: the backing store is device pixels, the drawing stays in CSS pixels */
+  const rect = canvas.getBoundingClientRect();
+  const width = Math.max(1, Math.round(rect.width));
+  const height = Math.max(1, Math.round(rect.height));
+  const dpr = Math.min(2, window.devicePixelRatio || 1);
+  if (canvas.width !== Math.round(width * dpr) || canvas.height !== Math.round(height * dpr)) {
+    canvas.width = Math.round(width * dpr);
+    canvas.height = Math.round(height * dpr);
+  }
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, width, height);
+
+  const bbox = previewScene.bbox || {};
+  const size = Array.isArray(bbox.size) ? bbox.size : [0, 0, 0];
+  const min = Array.isArray(bbox.min) ? bbox.min : [0, 0, 0];
+  const centre = [min[0] + size[0] / 2, min[1] + size[1] / 2, min[2] + size[2] / 2];
+  const cosY = Math.cos(previewView.yaw), sinY = Math.sin(previewView.yaw);
+  const cosP = Math.cos(previewView.pitch), sinP = Math.sin(previewView.pitch);
+
+  const objects = Array.isArray(previewScene.objects) ? previewScene.objects : [];
+  const rotated = new Map();    // object id → rotated vertices, or null when not drawable
+  let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+  for (const o of objects) {
+    const id = previewObjectId(o);
+    const verts = o.vertices || [];
+    if (previewHidden.has(id) || !Array.isArray(o.triangles) || o.triangles.length < 3) {
+      rotated.set(id, null);
+      continue;
+    }
+    const out = new Float64Array(verts.length);
+    for (let i = 0; i + 2 < verts.length; i += 3) {
+      const x = verts[i] - centre[0], y = verts[i + 1] - centre[1], z = verts[i + 2] - centre[2];
+      const x1 = x * cosY + z * sinY;          // yaw about Y
+      const z1 = z * cosY - x * sinY;
+      const y2 = y * cosP - z1 * sinP;         // then pitch about X
+      out[i] = x1; out[i + 1] = y2; out[i + 2] = y * sinP + z1 * cosP;
+      if (x1 < minX) minX = x1;
+      if (x1 > maxX) maxX = x1;
+      if (y2 < minY) minY = y2;
+      if (y2 > maxY) maxY = y2;
+    }
+    rotated.set(id, out);
+  }
+  if (!Number.isFinite(minX) || maxX - minX <= 0 || maxY - minY <= 0) {
+    previewFallbackText("This model has no drawable surfaces. Slice it queues it as uploaded.");
+    return;
+  }
+  /* fit the whole body once, then let zoom scale that fit */
+  const scale = Math.min((width * 0.86) / (maxX - minX), (height * 0.86) / (maxY - minY)) * previewView.zoom;
+  const midX = (minX + maxX) / 2, midY = (minY + maxY) / 2;
+  const toX = x => width / 2 + (x - midX) * scale;
+  const toY = y => height / 2 - (y - midY) * scale;
+  const light = [-0.35, 0.55, -0.78];          // one fixed lamp, in camera space
+  const ordered = [...objects].sort((a, b) => (a.role === "supports" ? 0 : 1) - (b.role === "supports" ? 0 : 1));
+  const totalTriangles = ordered.reduce((n, o) => n + Math.floor((o.triangles || []).length / 3), 0);
+  const tris = [];
+  let budget = PREVIEW_TRIANGLE_BUDGET;
+  let drawn = 0;
+  for (const o of ordered) {
+    const out = rotated.get(previewObjectId(o));
+    if (!out) continue;
+    const idx = o.triangles || [];
+    const base = previewBaseColour(o.role);
+    for (let i = 0; i + 2 < idx.length && budget > 0; i += 3, budget--) {
+      drawn++;
+      const a = idx[i] * 3, b = idx[i + 1] * 3, c = idx[i + 2] * 3;
+      if (a + 2 >= out.length || b + 2 >= out.length || c + 2 >= out.length) continue;
+      const ux = out[b] - out[a], uy = out[b + 1] - out[a + 1], uz = out[b + 2] - out[a + 2];
+      const vx = out[c] - out[a], vy = out[c + 1] - out[a + 1], vz = out[c + 2] - out[a + 2];
+      const nx = uy * vz - uz * vy, ny = uz * vx - ux * vz, nz = ux * vy - uy * vx;
+      const len = Math.hypot(nx, ny, nz) || 1;
+      /* two-sided: a fin is thin, so a back face is lit like a front face instead of going black */
+      const lambert = Math.abs((nx * light[0] + ny * light[1] + nz * light[2]) / len);
+      tris.push([
+        (out[a + 2] + out[b + 2] + out[c + 2]) / 3,
+        toX(out[a]), toY(out[a + 1]), toX(out[b]), toY(out[b + 1]), toX(out[c]), toY(out[c + 1]),
+        previewTint(base, 0.2 + 0.8 * lambert),
+      ]);
+    }
+  }
+  const dropped = Math.max(0, totalTriangles - drawn);
+  if (dropped > 0) {
+    const stats = $("#previewStats");
+    if (stats && stats.textContent) stats.textContent += ` · truncated ${dropped} triangles`;
+  }
+  tris.sort((p, q) => p[0] - q[0]);            // far to near: painter's algorithm
+  ctx.lineWidth = 0.7;
+  ctx.lineJoin = "round";
+  for (const t of tris) {
+    ctx.beginPath();
+    ctx.moveTo(t[1], t[2]); ctx.lineTo(t[3], t[4]); ctx.lineTo(t[5], t[6]); ctx.closePath();
+    ctx.fillStyle = t[7]; ctx.strokeStyle = t[7];
+    ctx.fill(); ctx.stroke();                  // stroking the same fill closes anti-alias seams
+  }
+}
+
+/* one frame per burst; under reduced motion the frame is drawn immediately instead */
+function schedulePreview() {
+  if (prefersReducedMotion() || typeof requestAnimationFrame !== "function") { drawPreview(); return; }
+  if (previewFrame) return;
+  previewFrame = requestAnimationFrame(() => { previewFrame = 0; drawPreview(); });
+}
+
+function previewOrbit(ev) {
+  const canvas = $("#previewCanvas");
+  if (!canvas || !previewScene) return;
+  if (ev.type === "pointerdown") {
+    if (ev.button) return;                     // primary button, touch or pen only
+    previewDrag = { id: ev.pointerId, x: ev.clientX, y: ev.clientY };
+    if (canvas.setPointerCapture) canvas.setPointerCapture(ev.pointerId);
+    ev.preventDefault();
+    return;
+  }
+  if (ev.type === "pointerup" || ev.type === "pointercancel") {
+    if (previewDrag && previewDrag.id === ev.pointerId) {
+      if (canvas.hasPointerCapture && canvas.hasPointerCapture(ev.pointerId)) {
+        canvas.releasePointerCapture(ev.pointerId);
+      }
+      previewDrag = null;
+    }
+    return;
+  }
+  if (ev.type !== "pointermove" || !previewDrag || previewDrag.id !== ev.pointerId) return;
+  const dx = ev.clientX - previewDrag.x, dy = ev.clientY - previewDrag.y;
+  previewDrag.x = ev.clientX; previewDrag.y = ev.clientY;
+  /* yaw and pitch both move: a spherical orbit, so a vertical drag tilts the model instead of
+     sliding it up and down the screen */
+  previewView.yaw += dx * 0.01;
+  previewView.pitch = Math.max(-1.45, Math.min(1.45, previewView.pitch + dy * 0.01));
+  schedulePreview();
+}
+
+function previewZoom(ev) {
+  if (!previewScene) return;
+  ev.preventDefault();
+  previewView.zoom = Math.max(0.35, Math.min(4, previewView.zoom * (ev.deltaY > 0 ? 0.9 : 1.1)));
+  schedulePreview();
+}
+
+function previewKey(ev) {
+  if (!previewScene) return;
+  const key = ev.key;
+  if (key === "ArrowLeft") previewView.yaw -= PREVIEW_KEY_STEP;
+  else if (key === "ArrowRight") previewView.yaw += PREVIEW_KEY_STEP;
+  else if (key === "ArrowUp") previewView.pitch = Math.max(-1.45, previewView.pitch - PREVIEW_KEY_STEP);
+  else if (key === "ArrowDown") previewView.pitch = Math.min(1.45, previewView.pitch + PREVIEW_KEY_STEP);
+  else if (key === "+" || key === "=") previewView.zoom = Math.min(4, previewView.zoom * 1.15);
+  else if (key === "-" || key === "_") previewView.zoom = Math.max(0.35, previewView.zoom / 1.15);
+  else if (key === "0" || key === "Home") previewView = { yaw: -0.6, pitch: -0.45, zoom: 1 };
+  else return;
+  ev.preventDefault();
+  schedulePreview();
+}
+
+function previewToggle(ev) {
+  const key = ev.target.closest("[data-preview-object]");
+  if (!key) return;
+  const id = key.dataset.previewObject;
+  if (previewHidden.has(id)) previewHidden.delete(id);
+  else previewHidden.add(id);
+  key.setAttribute("aria-pressed", previewHidden.has(id) ? "false" : "true");
+  schedulePreview();
+}
+
+async function openPreview(id) {
+  if (!id) return;
+  const dlg = $("#previewDlg"), canvas = $("#previewCanvas"), err = $("#previewError"),
+        legend = $("#previewLegend"), stats = $("#previewStats"), fallback = $("#previewFallback");
+  previewJob = { id };
+  previewScene = null;
+  previewDrag = null;
+  previewHidden = new Set();
+  previewView = { yaw: -0.6, pitch: -0.45, zoom: 1 };
+  err.hidden = true; err.textContent = "";
+  legend.replaceChildren();
+  stats.textContent = "";
+  fallback.hidden = true; fallback.textContent = "";
+  canvas.hidden = false;
+  $("#previewConfirm").disabled = false;
+  $("#previewHint").textContent = "Loading the finned model…";
+  /* showModal first: only then does the canvas have a box to measure */
+  if (typeof dlg.showModal === "function") { if (!dlg.open) dlg.showModal(); }
+  else dlg.setAttribute("open", "");
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/preview`);
+    const p = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(p.detail || r.statusText || "preview unavailable");
+    previewJob = Object.assign({ id }, p.job || {});
+    previewScene = p;
+    $("#previewHint").textContent = window.PointerEvent
+      ? "Drag to orbit, scroll to zoom, arrow keys when the view has focus. Click a name to hide or show that object."
+      : "Arrow keys orbit, + and − zoom. Click a name to hide or show that object.";
+    renderPreviewChrome(p);
+    drawPreview();
+    canvas.focus();
+  } catch (e) {
+    showPreviewError(e.message);
+  }
+}
+
+function closePreview() {
+  const dlg = $("#previewDlg");
+  previewDrag = null;
+  previewScene = null;
+  previewJob = null;
+  previewHidden = new Set();
+  if (typeof dlg.close === "function") { if (dlg.open) dlg.close(); }
+  else dlg.removeAttribute("open");
+}
+
+/* Discard deletes the staged job; Keep for later just closes and leaves it in the list */
+async function discardPreview() {
+  const job = previewJob;
+  if (!job) return;
+  const ok = await ask("Discard this staged job?", "Deletes the upload and the finned model. Nothing was sent to the slicer.", "Discard");
+  if (!ok) return;
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`, { method: "DELETE" });
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.detail || r.statusText);
+    }
+    closePreview();
+    toast("Staged job discarded");
+  } catch (e) {
+    toast("Delete failed: " + e.message, 6000);
+  }
+  refresh();
+}
+
+async function confirmSlice(jobId) {
+  const id = jobId || (previewJob && previewJob.id);
+  if (!id) return;
+  const btn = $("#previewConfirm");
+  if (btn.dataset.busy === "true") return;    // a double click must not queue twice
+  btn.dataset.busy = "true";
+  btn.disabled = true;
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/slice`, { method: "POST" });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || r.statusText || "could not queue the slice");
+    const job = Object.assign({ id, status: "queued" }, previewJob || {}, j);
+    closePreview();
+    /* the card switches from the staged controls to the slice bar right away, before the poll */
+    setUploadWait(job);
+    setUploadLatest(job);
+    toast(j.queue_position ? `Queued for slice (#${j.queue_position})` : "Queued for slice");
+    await refresh();
+  } catch (e) {
+    const err = $("#previewError");
+    err.textContent = "Could not queue the slice: " + e.message;
+    err.hidden = false;
+    toast("Not sliced: " + e.message, 6000);
+  } finally {
+    btn.dataset.busy = "";
+    btn.disabled = false;
+  }
+}
+
+async function initSupportFins() {
+  try {
+    const r = await fetch("/api/support-fins");
+    if (!r.ok) return;
+    const j = await r.json();
+    const cb = $("#supportFins");
+    if (cb && !j.available) {
+      cb.disabled = true;
+      cb.checked = false;
+      const hint = cb.parentElement && cb.parentElement.querySelector(".hint");
+      if (hint) hint.textContent = j.reason || "support fins unavailable";
+    }
+  } catch (e) { /* leave enabled by default */ }
+}
+
+function initPreview() {
+  const canvas = $("#previewCanvas"), dlg = $("#previewDlg");
+  $("#previewConfirm").addEventListener("click", () => confirmSlice());
+  $("#previewClose").addEventListener("click", closePreview);
+  $("#previewDiscard").addEventListener("click", discardPreview);
+  $("#previewLegend").addEventListener("click", previewToggle);
+  canvas.addEventListener("pointerdown", previewOrbit);
+  canvas.addEventListener("pointermove", previewOrbit);
+  canvas.addEventListener("pointerup", previewOrbit);
+  canvas.addEventListener("pointercancel", previewOrbit);
+  canvas.addEventListener("wheel", previewZoom, { passive: false });
+  canvas.addEventListener("keydown", previewKey);
+  /* Escape and the native close both land here: the staged job survives, only the dialog goes */
+  dlg.addEventListener("close", () => {
+    if (previewFrame && typeof cancelAnimationFrame === "function") {
+      cancelAnimationFrame(previewFrame);
+      previewFrame = 0;
+    }
+    previewDrag = null;
+    previewScene = null;
+    previewJob = null;
+    previewHidden = new Set();
+  });
+  window.addEventListener("resize", () => { if (previewScene) schedulePreview(); });
 }
 
 /* ---------------- settings: printers ---------------- */
@@ -1847,6 +2356,8 @@ function boot() {
   /* the card's static actions go through the same delegated handler as the rows: one printJob(id),
      one confirm dialog, one toast */
   $("#uploadLatest").addEventListener("click", onJobAction);
+  initPreview();
+  initSupportFins();
 
   $("#profFile").addEventListener("change", async ev => {
     const f = ev.target.files[0]; if (!f) return;
