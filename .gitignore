@@ -11,3 +11,5 @@ __pycache__/
 orca-datadir/
 *.bak
 .ergo/
+
+.ai/

@@ -35,6 +35,7 @@ def test_only_the_api_key_is_required(env):
     assert cfg.max_upload_bytes == 150 * 1024 * 1024
     assert cfg.keep_jobs == 25
     assert cfg.slice_timeout == 900
+    assert cfg.support_fins_timeout == 300.0
     assert cfg.bed_size == (220.0, 220.0)
     assert cfg.machine_slot is None
 
@@ -51,6 +52,7 @@ def test_every_variable_can_be_overridden(env):
         "MAX_UPLOAD_MB": "3",
         "KEEP_JOBS": "7",
         "SLICE_TIMEOUT": "42",
+        "SUPPORT_FINS_TIMEOUT": "45",
         "BED_SIZE": "300x250",
         "MACHINE_SLOT": "system/Custom/machine/other.json",
     })
@@ -70,6 +72,7 @@ def test_every_variable_can_be_overridden(env):
     assert cfg.max_upload_bytes == 3 * 1024 * 1024
     assert cfg.keep_jobs == 7
     assert cfg.slice_timeout == 42
+    assert cfg.support_fins_timeout == 45.0
     assert cfg.bed_size == (300.0, 250.0)
     assert cfg.machine_slot == "system/Custom/machine/other.json"
 
@@ -136,6 +139,22 @@ def test_non_positive_numbers_raise(env, name, value):
 
     with pytest.raises(config.ConfigError, match=f"{name} must be a positive integer"):
         config.load_config(env)
+
+
+@pytest.mark.parametrize("value", ["0", "-1", "soon", "", "nan", "inf"])
+def test_a_non_positive_support_fins_timeout_raises(env, value):
+    """``_positive_float`` rejects zero, negatives, garbage and the non-finite floats."""
+    env["SUPPORT_FINS_TIMEOUT"] = value
+
+    with pytest.raises(config.ConfigError,
+                       match="SUPPORT_FINS_TIMEOUT must be a positive number"):
+        config.load_config(env)
+
+
+def test_a_fractional_support_fins_timeout_is_kept(env):
+    env["SUPPORT_FINS_TIMEOUT"] = "2.5"
+
+    assert config.load_config(env).support_fins_timeout == 2.5
 
 
 def _run_config_module(
@@ -241,7 +260,7 @@ def test_env_example_lists_only_known_variables():
     known = {
         "PRINTER_URL", "MOONRAKER_API_KEY", "MOONRAKER_ROOT", "PORT", "DATA_DIR",
         "ORCA_BIN", "ORCA_DATADIR", "MAX_UPLOAD_MB", "KEEP_JOBS", "SLICE_TIMEOUT",
-        "BED_SIZE", "MACHINE_SLOT", "SLICED_DIR", "PRINTERS_FILE", "SECRET_KEY_FILE",
+        "SUPPORT_FINS_TIMEOUT", "BED_SIZE", "MACHINE_SLOT", "SLICED_DIR", "PRINTERS_FILE", "SECRET_KEY_FILE",
         "ENV_PRINTER_NAME", "PRINTER_UI_URL",
     }
     env_path = ROOT / ".env.example"

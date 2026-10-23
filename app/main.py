@@ -30,6 +30,7 @@ Endpoints
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import queue
@@ -51,8 +52,10 @@ import config
 import fit
 import mesh
 import moonraker
+import preview
 import printers
 import profiles as prof
+import supportfins
 import threemf
 from gcode import parse_gcode_stats
 
@@ -65,6 +68,11 @@ PROFILE_BUNDLE_MAX = prof.BUNDLE_MAX_BYTES
 PROFILE_BUNDLE_SUFFIXES = (".orca_printer", ".json", ".zip")
 JOB_ID_RE = re.compile(r"[0-9a-f]{12}")
 ACTIVE_STATUSES = ("queued", "slicing")
+# `awaiting_confirm` is deliberately absent from ACTIVE_STATUSES: a staged job can still be
+# deleted, individually or by "delete finished", exactly like a finished one. prune() has
+# its own list however, so a staged job is not garbage-collected while its preview dialog
+# may still be open.
+PRUNE_KEEP_STATUSES = ACTIVE_STATUSES + ("awaiting_confirm",)
 OUTPUT_NAME_MAX = 60
 OUTPUT_NAME_ALLOWED_RE = re.compile(r"[A-Za-z0-9 ._-]+")
 OUTPUT_NAME_SEPARATORS = "output_name must be a plain file name without path separators"
@@ -89,6 +97,11 @@ SEED = (printers.SeededPrinter(id=printers.ENV_PRINTER_ID, name=CONFIG.env_print
                                ui_url=CONFIG.printer_ui_url)
         if CONFIG.env_printer_api_key else None)
 job_queue: "queue.Queue[str]" = queue.Queue()
+
+# A staged job enters the queue exactly once: the status check in /api/jobs/{jid}/slice and
+# the `put` that follows it run under this lock, so two "Slice it" clicks cannot both pass
+# the check and queue the same job twice.
+STAGE_LOCK = threading.Lock()
 
 # The derived process preset is shared state: `run_slice` writes it and launches the slicer
 # with it, `regenerate_derived` rewrites it from the options. Held across that whole span so
@@ -728,8 +741,12 @@ def run_slice(jid: str) -> None:
         write_job(jid, status="failed", error=str(exc),
                   auto_orient=bool(options.get("auto_orient")), shrink_to_fit=shrink)
         return
-    orient = bool(options.get("auto_orient")) or (plan is not None and plan.scale < 1.0)
-    write_job(jid, auto_orient=bool(options.get("auto_orient")), auto_orient_used=orient,
+    if job.get("support_fins"):
+        orient = False
+    else:
+        orient = bool(options.get("auto_orient")) or (plan is not None and plan.scale < 1.0)
+    write_job(jid, auto_orient=bool(options.get("auto_orient")) and not bool(job.get("support_fins")),
+              auto_orient_used=orient,
               shrink_to_fit=shrink,
               fit_scale=(plan.scale if plan is not None else None),
               model_size=({"x": round(plan.bbox.size[0], 1), "y": round(plan.bbox.size[1], 1),
@@ -737,6 +754,13 @@ def run_slice(jid: str) -> None:
               bed_limits=({"x": round(plan.bed.xmax - plan.bed.xmin, 1),
                            "y": round(plan.bed.ymax - plan.bed.ymin, 1),
                            "z": round(plan.bed.zmax, 1)} if plan is not None else None))
+    if job.get("support_fins") and plan is not None and plan.scale < 1.0:
+        write_job(jid, status="failed",
+                  error=("support-fins meshes cannot be auto-oriented safely: OrcaSlicer requires "
+                         "--orient for --scale. Disable shrink to fit and scale the model "
+                         f"manually to fit (measured fit scale {plan.scale:g}), then upload again"),
+                  auto_orient=False, auto_orient_used=False, shrink_to_fit=shrink)
+        return
     # Hand-built environment: the slicer runs headless and must not inherit the Moonraker
     # API key (or anything else) from this process.
     env = {
@@ -765,7 +789,7 @@ def run_slice(jid: str) -> None:
             "--load-filaments", str(paths["filament"]),
             "--slice", "0",
         ]
-        if orient:
+        if orient and not job.get("support_fins"):
             cmd += ["--orient", "1"]
         if plan is not None and plan.scale < 1.0:
             cmd += ["--scale", f"{plan.scale:g}"]
@@ -823,16 +847,17 @@ def worker() -> None:
 
 
 def prune() -> None:
-    """Drop all but the KEEP_JOBS newest finished jobs. Queued/slicing jobs never go."""
-    def is_active(d: Path) -> bool:
+    """Drop all but the KEEP_JOBS newest finished jobs. Active/staged jobs never go."""
+    def is_kept(d: Path) -> bool:
         try:
-            return json.loads((d / "job.json").read_text()).get("status") in ACTIVE_STATUSES
+            return (json.loads((d / "job.json").read_text()).get("status")
+                    in PRUNE_KEEP_STATUSES)
         except (OSError, ValueError, AttributeError):
             return False        # a missing or corrupt job.json is not a reason to keep the dir
 
     dirs = sorted([d for d in JOBS.iterdir() if d.is_dir()],
                   key=lambda p: p.stat().st_mtime, reverse=True)
-    finished = [d for d in dirs if not is_active(d)]
+    finished = [d for d in dirs if not is_kept(d)]
     for old in finished[CONFIG.keep_jobs:]:
         shutil.rmtree(old, ignore_errors=True)
 
@@ -1121,7 +1146,8 @@ def prepare_3mf(model_path: Path) -> tuple[dict, str | None]:
 
 @app.post("/api/upload")
 async def api_upload(request: Request, file: UploadFile = File(...),
-                     output_name: str | None = Form(None)):
+                     output_name: str | None = Form(None),
+                     support_fins: bool = Form(False)):
     reject_oversize(request, CONFIG.max_upload_bytes,
                     f"file larger than {CONFIG.max_upload_bytes // (1024*1024)} MB")
     suffix = Path(file.filename or "").suffix.lower()
@@ -1163,11 +1189,34 @@ async def api_upload(request: Request, file: UploadFile = File(...),
 
     record = None
     slicer_input = None
+    fins = None
+    original = model_path.name
     try:
+        # Prepare the upload *itself* before finning it: the CLI's output 3MF carries no
+        # OrcaSlicer metadata, so preparing that copy could never match a printer/process.
         if model_path.suffix.lower() == ".3mf":
             record, slicer_input = prepare_3mf(model_path)
+        if support_fins:
+            finned = d / "upload" / f"fins-{model_path.stem}.3mf"
+            try:
+                fins = await asyncio.to_thread(supportfins.fin_model, model_path, finned,
+                                               timeout=CONFIG.support_fins_timeout)
+            except supportfins.SupportFinsError as exc:
+                shutil.rmtree(d, ignore_errors=True)
+                raise HTTPException(400, f"support fins failed: {exc}") from exc
+            # The finned 3MF is the slicer input and needs no identity rewrite, so drop the
+            # prepared copy rather than leave a slice-*.3mf in the job dir that nothing reads.
+            if slicer_input is not None:
+                (model_path.parent / slicer_input).unlink(missing_ok=True)
+                slicer_input = None
+            if record is not None:
+                record["rewrite"] = "discarded"
+                record.setdefault("notes", []).append(
+                    "support fins rebuilt the 3MF; the rewritten identity copy was discarded")
+            model_path = finned
 
-        fields = {"status": "queued", "filename": model_path.name, "output_name": name,
+        status = "awaiting_confirm" if support_fins else "queued"
+        fields = {"status": status, "filename": model_path.name, "output_name": name,
                   "upload_bytes": size, "model_bytes": model_path.stat().st_size,
                   "profile_snapshot": profile_snapshot(),
                   "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
@@ -1177,6 +1226,8 @@ async def api_upload(request: Request, file: UploadFile = File(...),
             fields["threemf"] = record
         if slicer_input is not None:
             fields["slicer_input"] = slicer_input
+        if support_fins:
+            fields.update({"original": original, "fins": fins, "support_fins": True})
         write_job(jid, **fields)
     except BaseException:
         # The job dir exists from here on but the job was never queued: a failed upload must
@@ -1184,13 +1235,62 @@ async def api_upload(request: Request, file: UploadFile = File(...),
         # interrupted request is cleaned up too). The rejection still reaches the client.
         shutil.rmtree(d, ignore_errors=True)
         raise
-    job_queue.put(jid)
-    body = {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
+    body = {"id": jid, "status": status}
+    if support_fins:
+        # Staged, not queued: the preview dialog's "Slice it" is what enters the queue.
+        body.update({"fins": fins, "original": original})
+    else:
+        job_queue.put(jid)
+        body["queue_position"] = job_queue.qsize()
     if archive is not None:
         body["archive"] = archive
     if record is not None:
         body["threemf"] = record
     return body
+
+
+@app.post("/api/jobs/{jid}/slice")
+def api_confirm_slice(jid: str):
+    """Enter the queue for a staged (fins) job — the preview dialog's *Slice it*.
+
+    Only an ``awaiting_confirm`` job may move, and the check-plus-queue is one critical
+    section, so a double click is a 409 rather than a second queue entry.
+    """
+    require_selection()
+    with STAGE_LOCK:
+        job = read_job(jid)
+        if job.get("status") != "awaiting_confirm":
+            raise HTTPException(
+                409, f"job is '{job.get('status')}', not awaiting confirmation")
+        write_job(jid, status="queued")
+        job_queue.put(jid)
+    return {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
+
+
+@app.get("/api/jobs/{jid}/preview")
+def api_preview(jid: str):
+    """Geometry of the job's finned 3MF, for the pre-slice preview dialog."""
+    job = read_job(jid)
+    if not job.get("support_fins") or not job.get("fins"):
+        raise HTTPException(409, "preview unavailable: this job has no support fins")
+    # job.json is a file on disk: `.name` keeps a hand-edited one from resolving outside
+    # the job's own upload directory.
+    name = Path(job.get("filename") or "").name
+    try:
+        scene = preview.read_scene(job_dir(jid) / "upload" / name)
+    except preview.PreviewError as exc:
+        raise HTTPException(409, f"preview unavailable: {exc}") from exc
+    return {"job": jid, **scene, "fins": job.get("fins"),
+            "original": job.get("original")}
+
+
+@app.get("/api/support-fins")
+def api_support_fins():
+    """Whether the fins checkbox can be offered — always 200, the page asks."""
+    return {"available": supportfins.available(),
+            "reason": supportfins.unavailable_reason(),
+            "timeout": CONFIG.support_fins_timeout,
+            "max_triangles": preview.MAX_TRIANGLES}
 
 
 @app.get("/api/jobs")
