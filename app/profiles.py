@@ -871,3 +871,370 @@ def import_into(datadir: Path, blob: bytes, filename: str,
         write_vendor_index(datadir, index)
 
     return {"imported": imported, "notes": notes, "ok": bool(imported)}
+
+
+class ProfileError(Exception):
+    def __init__(self, *args, status: int | None = None, detail: str | None = None):
+        if len(args) == 1:
+            detail = args[0] if detail is None else detail
+            status = 400 if status is None else status
+        elif len(args) == 2:
+            status = args[0] if status is None else status
+            detail = args[1] if detail is None else detail
+        else:
+            status = 400 if status is None else status
+            detail = "" if detail is None else detail
+        self.status = status
+        self.detail = detail or ""
+        super().__init__(self.detail)
+
+
+# Field editors for the preset UI. Values in OrcaSlicer presets are JSON *strings* (even numbers),
+# and some keys are lists; shapes below are preserved on write. "portal-options" owns supports/brim,
+# so they are deliberately absent here — two writers would fight.
+MACHINE_FIELDS = [
+    {"key": "printer_model", "label": "Printer model", "type": "text"},
+    {"key": "nozzle_diameter", "label": "Nozzle diameter", "type": "number_list", "unit": "mm"},
+    {"key": "printable_area", "label": "Printable area", "type": "area_list", "unit": "mm"},
+    {"key": "printable_height", "label": "Printable height", "type": "number", "unit": "mm"},
+    {"key": "max_layer_height", "label": "Max layer height", "type": "number_list", "unit": "mm"},
+    {"key": "retraction_length", "label": "Retraction length", "type": "number_list", "unit": "mm"},
+    {"key": "retraction_speed", "label": "Retraction speed", "type": "number_list", "unit": "mm/s"},
+]
+PROCESS_FIELDS = [
+    {"key": "layer_height", "label": "Layer height", "type": "number", "unit": "mm"},
+    {"key": "initial_layer_print_height", "label": "Initial layer height", "type": "number", "unit": "mm"},
+    {"key": "wall_loops", "label": "Wall loops", "type": "integer"},
+    {"key": "top_shell_layers", "label": "Top shell layers", "type": "integer"},
+    {"key": "sparse_infill_density", "label": "Sparse infill density", "type": "percent"},
+    {"key": "sparse_infill_pattern", "label": "Sparse infill pattern", "type": "enum",
+     "choices": ["grid", "line", "cubic", "triangles", "gyroid", "honeycomb", "concentric",
+                 "zig-zag", "cross-hatch", "lightning", "3d honeycomb", "adaptive cubic",
+                 "support cubic"]},
+    {"key": "print_speed", "label": "Print speed", "type": "number", "unit": "mm/s"},
+    {"key": "outer_wall_speed", "label": "Outer wall speed", "type": "number", "unit": "mm/s"},
+    {"key": "travel_speed", "label": "Travel speed", "type": "number", "unit": "mm/s"},
+]
+FILAMENT_FIELDS = [
+    {"key": "filament_type", "label": "Filament type", "type": "text"},
+    {"key": "nozzle_temperature", "label": "Nozzle temperature", "type": "number", "unit": "°C"},
+    {"key": "nozzle_temperature_initial_layer", "label": "Nozzle temp (initial layer)",
+     "type": "number", "unit": "°C"},
+    {"key": "hot_plate_temp", "label": "Bed temperature", "type": "number", "unit": "°C"},
+    {"key": "hot_plate_temp_initial_layer", "label": "Bed temp (initial layer)",
+     "type": "number", "unit": "°C"},
+    {"key": "filament_flow_ratio", "label": "Flow ratio", "type": "number"},
+    {"key": "filament_density", "label": "Density", "type": "number", "unit": "g/cm³"},
+    {"key": "filament_cost", "label": "Cost", "type": "number", "unit": "per kg"},
+    {"key": "enable_pressure_advance", "label": "Enable pressure advance", "type": "boolean"},
+    {"key": "pressure_advance", "label": "Pressure advance", "type": "number"},
+]
+FIELD_SPECS = {"machine": MACHINE_FIELDS, "process": PROCESS_FIELDS, "filament": FILAMENT_FIELDS}
+EXPOSED_KEYS = {k: {f["key"] for f in v} for k, v in FIELD_SPECS.items()}
+
+LIST_KEYS = {"nozzle_diameter", "printable_area", "max_layer_height",
+             "retraction_length", "retraction_speed"}
+
+
+def _is_custom(datadir: Path, path: Path) -> bool:
+    try:
+        rel = path.relative_to(datadir).as_posix()
+    except ValueError:
+        return False
+    return rel.startswith("system/Custom/")
+
+
+def preset_read_only_reason(datadir: Path, path: Path) -> str | None:
+    if not _is_custom(datadir, path):
+        return "this preset comes from the imported bundle and is read-only"
+    rel = path.relative_to(datadir).as_posix()
+    if rel == PORTAL_PROCESS_REL:
+        return ("this is the derived preset the portal regenerates on every option save "
+                "and every slice")
+    return None
+
+
+def _effective_value(chain: list[dict], key: str):
+    for level in chain:
+        if key in level and level[key] not in (None, "", []):
+            return level[key], level
+    return None, None
+
+
+def _to_form_value(value) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, list):
+        if any(isinstance(x, str) and "," in x for x in value):
+            return "\n".join(str(x) for x in value)
+        return ", ".join(str(x) for x in value)
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    return str(value)
+
+
+def preset_view(datadir: Path, kind: str, path: Path) -> dict:
+    data = json.loads(path.read_text())
+    chain = _parent_chain(datadir, kind, data)
+    rel = path.relative_to(datadir).as_posix()
+    reason = preset_read_only_reason(datadir, path)
+    editable = reason is None
+    fields_out = []
+    for spec in FIELD_SPECS[kind]:
+        key = spec["key"]
+        eff, src_level = _effective_value(chain, key)
+        if eff is None:
+            source = "inherited"
+        elif src_level is chain[0]:
+            source = "own"
+        else:
+            source = "inherited"
+        inherited_from = None
+        if source == "inherited" and src_level is not None and src_level is not chain[0]:
+            inherited_from = src_level.get("name")
+        is_list = isinstance(eff, list)
+        if is_list and any(isinstance(x, str) and "," in x for x in eff):
+            ftype = "area_list"
+        elif is_list:
+            ftype = "number_list"
+        else:
+            ftype = spec["type"]
+        entry = {
+            "key": key,
+            "label": spec["label"],
+            "type": ftype,
+            "value": _to_form_value(eff),
+            "source": source,
+            "inherited_from": inherited_from,
+        }
+        if "choices" in spec:
+            entry["choices"] = spec["choices"]
+        if "unit" in spec:
+            entry["unit"] = spec["unit"]
+        fields_out.append(entry)
+    return {
+        "kind": kind,
+        "rel": rel,
+        "name": data.get("name", path.stem),
+        "editable": editable,
+        "read_only_reason": reason,
+        "fields": fields_out,
+    }
+
+
+def _parse_field(spec, raw: str):
+    key = spec["key"]
+    ftype = spec["type"]
+    if key in LIST_KEYS:
+        if key == "printable_area":
+            lines = [ln.strip() for ln in raw.splitlines() if ln.strip()]
+            if len(lines) < 4:
+                raise ValueError(f"{key}: need at least 4 'x,y' pairs")
+            out = []
+            for ln in lines:
+                parts = [p.strip() for p in ln.split(",")]
+                if len(parts) != 2:
+                    raise ValueError(f"{key}: each line must be 'x,y'")
+                try:
+                    x, y = float(parts[0]), float(parts[1])
+                except ValueError:
+                    raise ValueError(f"{key}: '{ln}' is not two numbers")
+                if not (x > 0 and y > 0):
+                    raise ValueError(f"{key}: coordinates must be positive")
+                out.append(f"{parts[0]},{parts[1]}")
+            return out
+        if raw.strip() == "":
+            raise ValueError(f"{key}: value required")
+        parts = [p.strip() for p in raw.split(",")]
+        if any(p == "" for p in parts):
+            raise ValueError(f"{key}: empty entry in list")
+        out = []
+        for p in parts:
+            try:
+                v = float(p)
+            except ValueError:
+                raise ValueError(f"{key}: '{p}' is not a number")
+            if v != v or v == float("inf"):
+                raise ValueError(f"{key}: '{p}' is not a finite number")
+            if v < 0:
+                raise ValueError(f"{key}: must be >= 0")
+            out.append(p)
+        return out
+    if ftype == "number":
+        try:
+            v = float(raw)
+        except ValueError:
+            raise ValueError(f"{key}: '{raw}' is not a number")
+        if v != v or v == float("inf"):
+            raise ValueError(f"{key}: must be finite")
+        if v < 0:
+            raise ValueError(f"{key}: must be >= 0")
+        return raw.strip()
+    if ftype == "integer":
+        try:
+            v = int(raw)
+        except ValueError:
+            raise ValueError(f"{key}: '{raw}' is not an integer")
+        if v < 0:
+            raise ValueError(f"{key}: must be >= 0")
+        return str(v)
+    if ftype == "percent":
+        s = raw.strip()
+        if s.endswith("%"):
+            s = s[:-1].strip()
+        try:
+            v = float(s)
+        except ValueError:
+            raise ValueError(f"{key}: '{raw}' is not a percentage")
+        if v < 0 or v > 100:
+            raise ValueError(f"{key}: must be between 0 and 100")
+        return f"{v:g}%"
+    if ftype == "boolean":
+        s = raw.strip().lower()
+        if s in ("true", "1", "yes", "on"):
+            return "true"
+        if s in ("false", "0", "no", "off"):
+            return "false"
+        raise ValueError(f"{key}: must be true or false")
+    if ftype == "enum":
+        spec_choices = None
+        for f in FIELD_SPECS.get(None, []) if False else []:
+            pass
+        # choices come from the spec; caller passes spec via closure-free lookup
+        return raw
+    if raw.strip() == "":
+        raise ValueError(f"{key}: value required")
+    return raw.strip()
+
+
+def apply_preset_patch(datadir: Path, kind: str, path: Path, fields: dict) -> dict:
+    reason = preset_read_only_reason(datadir, path)
+    if reason is not None:
+        raise ProfileError(409, reason)
+    if not isinstance(fields, dict) or not fields:
+        raise ProfileError(400, "nothing to update")
+    exposed = EXPOSED_KEYS[kind]
+    unknown = [k for k in fields if k not in exposed]
+    if unknown:
+        raise ProfileError(400, f"unknown field(s): {', '.join(sorted(unknown))}")
+    specs = {f["key"]: f for f in FIELD_SPECS[kind]}
+    parsed = {}
+    for k, v in fields.items():
+        if not isinstance(v, str):
+            raise ProfileError(400, f"{k}: value must be a string")
+        # enum choices validation uses spec
+        if specs[k]["type"] == "enum" and v not in specs[k]["choices"]:
+            raise ProfileError(400, f"{k}: '{v}' is not one of {specs[k]['choices']}")
+        try:
+            parsed[k] = _parse_field(specs[k], v)
+        except ValueError as e:
+            raise ProfileError(400, str(e))
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise ProfileError(400, "preset file is unreadable")
+    if not isinstance(data, dict):
+        raise ProfileError(400, "preset file is not a JSON object")
+    for k, v in parsed.items():
+        data[k] = v
+    write_json_atomic(path, data)
+    return preset_view(datadir, kind, path)
+
+
+def delete_preset(datadir: Path, kind: str, path: Path):
+    if kind not in ("machine", "process"):
+        raise ProfileError(405, f"presets of kind '{kind}' cannot be deleted")
+    reason = preset_read_only_reason(datadir, path)
+    if reason is not None:
+        raise ProfileError(409, reason)
+    try:
+        data = json.loads(path.read_text())
+    except (OSError, ValueError):
+        raise ProfileError(400, "preset file is unreadable")
+    name = data.get("name", path.stem) if isinstance(data, dict) else path.stem
+    rel = path.relative_to(datadir).as_posix()
+
+    deleted = [{"kind": kind, "rel": rel, "name": name}]
+    if kind == "machine":
+        try:
+            rows = list_presets(datadir).get("process", [])
+        except Exception:
+            rows = []
+        for row in rows:
+            if row.get("rel") == PORTAL_PROCESS_REL:
+                continue
+            cp = row.get("compatible_printers")
+            if isinstance(cp, list) and name in cp:
+                prow = _preset_path(row.get("rel")) if False else None
+                # resolve via datadir
+                try:
+                    prow = (datadir / row["rel"]).resolve()
+                except Exception:
+                    prow = None
+                if prow is not None and prow.is_file() and _is_custom(datadir, prow):
+                    try:
+                        pdata = json.loads(prow.read_text())
+                    except (OSError, ValueError):
+                        continue
+                    pname = pdata.get("name", prow.stem) if isinstance(pdata, dict) else prow.stem
+                    prow.unlink(missing_ok=True)
+                    deleted.append({"kind": "process", "rel": row["rel"], "name": pname})
+
+    if kind == "process":
+        path.unlink(missing_ok=True)
+    elif kind == "machine":
+        path.unlink(missing_ok=True)
+
+    deleted_rels = {d["rel"] for d in deleted}
+
+    try:
+        idx = read_vendor_index(datadir)
+        changed_idx = False
+        for key in ("machine_model_list", "machine_list", "process_list", "filament_list"):
+            before = idx.get(key, [])
+            after = [row for row in before
+                     if not (isinstance(row, dict) and row.get("sub_path") in deleted_rels)]
+            if after != before:
+                idx[key] = after
+                changed_idx = True
+        if changed_idx:
+            write_vendor_index(datadir, idx)
+    except Exception:
+        pass
+
+    cleared = {"machine": False, "process": False, "filament": False}
+    try:
+        doc = read_profile_document()
+        doc_changed = False
+        for slot in ("machine", "process", "filament"):
+            v = doc.get(slot)
+            if isinstance(v, str) and v in deleted_rels:
+                doc[slot] = None
+                cleared[slot] = True
+                doc_changed = True
+        for mp in list_presets(datadir).get("machine", []):
+            mpath = None
+            try:
+                mpath = (datadir / mp["rel"]).resolve()
+            except Exception:
+                mpath = None
+            if mpath is None or not mpath.is_file() or not _is_custom(datadir, mpath):
+                continue
+            try:
+                mdata = json.loads(mpath.read_text())
+            except (OSError, ValueError):
+                continue
+            if not isinstance(mdata, dict):
+                continue
+            dpp = mdata.get("default_print_profile")
+            deleted_names = {d["name"] for d in deleted if d["kind"] == "process"}
+            if isinstance(dpp, str) and dpp in deleted_names:
+                del mdata["default_print_profile"]
+                write_json_atomic(mpath, mdata)
+        if doc_changed:
+            write_profile_file(doc)
+    except Exception:
+        pass
+
+    # printers.json repair is done by the caller (main.py), which owns CONFIG.
+    return deleted, cleared

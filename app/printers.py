@@ -765,3 +765,52 @@ def _pairing_shape(stored: dict[str, str] | None) -> dict[str, str | None]:
 def _seed_target(seed: SeededPrinter) -> PrintTarget:
     return PrintTarget(id=seed.id, name=seed.name, url=seed.url, api_key=seed.api_key,
                        source="env", ui_url=seed.ui_url)
+
+
+def repair_deleted_presets(deleted_rels: set[str], path: Path,
+                          key_file: Path | None = None) -> None:
+    """Clear pairing slots and env profiles that point at deleted preset rels.
+
+    Best-effort: a corrupt or unreadable store is left untouched.
+    """
+    try:
+        store = PrinterStore.open(path, key_file)
+    except Exception:
+        return
+    try:
+        for printer in store.all():
+            pairing = printer.profiles
+            if not isinstance(pairing, dict):
+                continue
+            new_pairing = dict(pairing)
+            changed = False
+            for slot in ("machine", "process"):
+                v = new_pairing.get(slot)
+                if isinstance(v, str) and v in deleted_rels:
+                    new_pairing[slot] = None
+                    changed = True
+            if changed:
+                try:
+                    store.update(printer.id, profiles=new_pairing)
+                except Exception:
+                    pass
+        # env profiles
+        try:
+            ep = store._env_profiles  # noqa: SLF001
+        except Exception:
+            ep = None
+        if isinstance(ep, dict):
+            new_ep = dict(ep)
+            changed = False
+            for slot in ("machine", "process"):
+                v = new_ep.get(slot)
+                if isinstance(v, str) and v in deleted_rels:
+                    new_ep[slot] = None
+                    changed = True
+            if changed:
+                try:
+                    store.set_env_pairing(new_ep)
+                except Exception:
+                    pass
+    except Exception:
+        pass

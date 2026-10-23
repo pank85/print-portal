@@ -10,7 +10,7 @@
 # Pin the version you run; `latest` moves. See README "Run the published image".
 services:
   print-portal:
-    image: pank85/print-portal:2.2.5
+    image: pank85/print-portal:2.3.0
     container_name: print-portal
     restart: unless-stopped
     env_file:

@@ -71,6 +71,25 @@ A bad env value fails loudly at startup, e.g. `PRINTER_UI_URL must start with ht
 same value typed into the Settings form is rejected with `400` and a detail naming `ui_url`
 (`ui_url must ...`); an empty field means "no embedded UI" and is valid.
 
+## The printer store (`printers.json`)
+
+Settings → **Add printer** writes `DATA_DIR/printers.json`, a version 2 document. A version 1 file
+still loads: reads never rewrite it, and the next change writes it as version 2. A single uvicorn
+worker is assumed (there is no portal authentication).
+
+A printer may carry an optional `profiles: {"machine": <rel>, "process": <rel>}` pairing of
+datadir-relative preset paths. An absent pairing, or a `null` slot inside one, means that printer
+inherits the global selection in `profile.json`. Selecting a printer applies its pairing, including
+the displayed `machine_label`; choosing machine and process presets on the dashboard writes them back
+onto the selected printer (best effort — a read-only store loses the stored pairing, never the
+selection). The API checks that each path is a preset inside `ORCA_DATADIR` and answers `400`
+`machine: '<rel>' is not a preset inside the datadir` otherwise.
+
+The environment printer has no editable record to hold a pairing, so its pairing lives in an optional
+top-level `env_profiles` object of the same `{"machine", "process"}` shape — written only for that
+printer, and a malformed value is ignored on read so the printer falls back to the global selection
+instead of the whole file counting as corrupt.
+
 ## Build / image variables
 
 Set in the `Dockerfile` or the entrypoint, not by the operator — listed because they are read at
