@@ -53,6 +53,7 @@ import fit
 import mesh
 import moonraker
 import preview
+import shot
 import printers
 import profiles as prof
 import supportfins
@@ -67,6 +68,7 @@ ALLOWED = {".stl", ".3mf", ".obj", ".zip"}
 PROFILE_BUNDLE_MAX = prof.BUNDLE_MAX_BYTES
 PROFILE_BUNDLE_SUFFIXES = (".orca_printer", ".json", ".zip")
 JOB_ID_RE = re.compile(r"[0-9a-f]{12}")
+_SHOT_LOCKS: dict[str, threading.Lock] = {}
 ACTIVE_STATUSES = ("queued", "slicing")
 # `awaiting_confirm` is deliberately absent from ACTIVE_STATUSES: a staged job can still be
 # deleted, individually or by "delete finished", exactly like a finished one. prune() has
@@ -1269,19 +1271,52 @@ def api_confirm_slice(jid: str):
 
 @app.get("/api/jobs/{jid}/preview")
 def api_preview(jid: str):
-    """Geometry of the job's finned 3MF, for the pre-slice preview dialog."""
+    """Geometry of the job's finned 3MF, or still pictures when that mesh is too large."""
     job = read_job(jid)
     if not job.get("support_fins") or not job.get("fins"):
         raise HTTPException(409, "preview unavailable: this job has no support fins")
     # job.json is a file on disk: `.name` keeps a hand-edited one from resolving outside
     # the job's own upload directory.
     name = Path(job.get("filename") or "").name
+    path = job_dir(jid) / "upload" / name
     try:
-        scene = preview.read_scene(job_dir(jid) / "upload" / name)
+        size = path.stat().st_size
+    except OSError as exc:
+        raise HTTPException(409, f"preview unavailable: {name} is missing") from exc
+    if size > shot.SHOT_MAX_BYTES:
+        raise HTTPException(
+            409, f"preview unavailable: {name} is {size} bytes; the picture cap is {shot.SHOT_MAX_BYTES}")
+    if size > preview.MAX_BYTES:
+        return {"mode": "shots", "views": ["front", "side"], "job": jid,
+                "bytes": size, "fins": job.get("fins"), "original": job.get("original")}
+    try:
+        scene = preview.read_scene(path)
     except preview.PreviewError as exc:
         raise HTTPException(409, f"preview unavailable: {exc}") from exc
-    return {"job": jid, **scene, "fins": job.get("fins"),
+    return {"job": jid, "mode": "scene", **scene, "fins": job.get("fins"),
             "original": job.get("original")}
+
+
+@app.get("/api/jobs/{jid}/preview-shot")
+def api_preview_shot(jid: str, view: str = "front"):
+    """One cached still picture. ``view`` is ``front`` or ``side``."""
+    if view not in ("front", "side"):
+        raise HTTPException(400, "view must be front or side")
+    job = read_job(jid)
+    if not job.get("support_fins"):
+        raise HTTPException(409, "preview unavailable: this job has no support fins")
+    name = Path(job.get("filename") or "").name
+    path = job_dir(jid) / "upload" / name
+    cache = job_dir(jid) / "shots" / f"{view}.png"
+    lock = _SHOT_LOCKS.setdefault(jid, threading.Lock())
+    with lock:
+        fresh = cache.is_file() and path.is_file() and cache.stat().st_mtime >= path.stat().st_mtime
+        if not fresh:
+            try:
+                shot.render(path, cache.parent)
+            except shot.ShotError as exc:
+                raise HTTPException(409, f"preview unavailable: {exc}") from exc
+    return FileResponse(cache, media_type="image/png")
 
 
 @app.post("/api/jobs/{jid}/scale")

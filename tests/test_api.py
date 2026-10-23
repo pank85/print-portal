@@ -672,6 +672,27 @@ def test_preview_names_an_unreadable_finned_model(client, jobs_dir, cube_stl, fa
     assert "is not a readable 3MF archive" in response.json()["detail"]
 
 
+def test_an_oversized_finned_mesh_returns_pictures(client, jobs_dir, cube_stl, fake_fins, monkeypatch):
+    monkeypatch.setattr(preview, "MAX_BYTES", 1)
+    jid = stage(client, cube_stl)
+
+    listed = client.get(f"/api/jobs/{jid}/preview")
+
+    assert listed.status_code == 200, listed.text
+    body = listed.json()
+    assert body["mode"] == "shots"
+    assert body["views"] == ["front", "side"]
+    assert body["bytes"] == (jobs_dir / jid / "upload" / "fins-cube.3mf").stat().st_size
+
+    picture = client.get(f"/api/jobs/{jid}/preview-shot?view=front")
+    assert picture.status_code == 200
+    assert picture.headers["content-type"].startswith("image/png")
+    assert picture.content.startswith(b"\x89PNG")
+    again = client.get(f"/api/jobs/{jid}/preview-shot?view=side")
+    assert again.status_code == 200
+    assert again.content.startswith(b"\x89PNG")
+
+
 def test_preview_of_an_unknown_job_is_404(client):
     assert client.get("/api/jobs/aaaaaaaaaaaa/preview").status_code == 404
 

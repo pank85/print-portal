@@ -97,7 +97,8 @@ finished job) but `prune()` keeps it, so an open preview dialog is never collect
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
 | POST | `/api/jobs/{jid}/slice` | enter the queue for a staged job — the preview dialog's *Slice it* | 200 `{id,status:"queued",queue_position}` · 404 · 409 `job is '<status>', not awaiting confirmation` (a double click is a 409, not a second queue entry: the check and the enqueue share one lock) |
-| GET | `/api/jobs/{jid}/preview` | geometry for the pre-slice preview: `{job, unit, bbox, objects:[{id,name,role,vertices,triangles,count}], fins, original}` | 200 · 404 · 409 `preview unavailable: this job has no support fins` · 409 `preview unavailable: <reason>` (unreadable 3MF, over the triangle/byte cap — see `app/preview.py`: `MAX_TRIANGLES` 200 000, `MAX_BYTES` 12 MiB) |
+| GET | `/api/jobs/{jid}/preview` | geometry for the pre-slice preview, or `{mode:"shots", views:["front","side"], bytes}` when the file is over `MAX_BYTES` (32 MiB) and at most `shot.SHOT_MAX_BYTES` (150 MiB) | 200 · 404 · 409 `preview unavailable: this job has no support fins` · 409 `preview unavailable: <reason>` |
+| GET | `/api/jobs/{jid}/preview-shot?view=front\|side` | one cached PNG of the finned mesh | 200 `image/png` · 400 · 404 · 409 |
 | GET | `/api/support-fins` | capability probe for the upload checkbox | 200 always: `{available, reason, timeout, max_triangles}`; `reason` is `""` when available, else `support-fins CLI is missing from the image` / `node runtime is not available` |
 
 A finned job's `filename` is the CLI's own output (`fins-<stem>.3mf`), `model_bytes` its size,

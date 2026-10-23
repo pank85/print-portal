@@ -421,6 +421,12 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 #previewCanvas{ display:block; width:100%; height:100%; touch-action:none; cursor:grab; }
 #previewCanvas:active{ cursor:grabbing; }
 #previewCanvas[hidden]{ display:none; }
+.preview-shots{ display:grid; grid-template-columns:1fr 1fr; gap:var(--space-2); width:100%; height:100%; align-content:center; }
+.preview-shots[hidden]{ display:none; }
+.preview-shots figure{ margin:0; min-width:0; }
+.preview-shots img{ display:block; width:100%; height:min(42vh,360px); object-fit:contain; background:#12161c; }
+.preview-shots figcaption{ font-size:var(--text-xs); text-align:center; color:var(--color-muted-foreground); }
+@media (max-width:700px){ .preview-shots{ grid-template-columns:1fr; } }
 #previewFallback{ max-width:46ch; padding:var(--space-4); text-align:center; color:var(--color-muted-foreground); }
 #previewFallback[hidden]{ display:none; }
 #previewStats{ margin-top:var(--space-2); font-size:var(--text-xs); font-variant-numeric:tabular-nums; }
@@ -825,6 +831,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
   <div class="preview-stage">
     <canvas id="previewCanvas" tabindex="0" role="img"
             aria-label="3-D preview of the finned model. Drag to rotate, scroll to zoom, arrow keys to rotate."></canvas>
+    <div id="previewShots" class="preview-shots" hidden></div>
     <p id="previewFallback" hidden></p>
   </div>
   <p id="previewStats" class="mono"></p>
@@ -1860,6 +1867,31 @@ function previewToggle(ev) {
   schedulePreview();
 }
 
+function showShotPreview(id, p) {
+  const canvas = $("#previewCanvas");
+  const box = document.getElementById("previewShots");
+  canvas.hidden = true;
+  box.hidden = false;
+  box.replaceChildren();
+  const labels = { front: "Front", side: "Side" };
+  for (const view of (p.views || ["front", "side"])) {
+    const fig = document.createElement("figure");
+    const img = document.createElement("img");
+    img.alt = (labels[view] || view) + " view of the finned model";
+    img.src = `/api/jobs/${encodeURIComponent(id)}/preview-shot?view=${encodeURIComponent(view)}`;
+    const cap = document.createElement("figcaption");
+    cap.textContent = labels[view] || view;
+    fig.append(img, cap);
+    box.append(fig);
+  }
+  const scale = document.getElementById("previewScale");
+  if (scale) scale.hidden = true;
+  $("#previewHint").textContent = "Still pictures. Green lines are the fins. The slice uses the full file.";
+  const mb = Math.round((p.bytes || 0) / 1e6);
+  $("#previewStats").textContent = mb ? `${mb} MB · pictures, not a rotatable model` : "Pictures, not a rotatable model";
+  $("#previewConfirm").disabled = false;
+}
+
 async function openPreview(id) {
   if (!id) return;
   const dlg = $("#previewDlg"), canvas = $("#previewCanvas"), err = $("#previewError"),
@@ -1874,6 +1906,10 @@ async function openPreview(id) {
   stats.textContent = "";
   fallback.hidden = true; fallback.textContent = "";
   canvas.hidden = false;
+  const shots = document.getElementById("previewShots");
+  if (shots) { shots.hidden = true; shots.replaceChildren(); }
+  const scale = document.getElementById("previewScale");
+  if (scale) scale.hidden = false;
   $("#previewConfirm").disabled = false;
   $("#previewHint").textContent = "Loading the finned model…";
   /* showModal first: only then does the canvas have a box to measure */
@@ -1883,6 +1919,7 @@ async function openPreview(id) {
     const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/preview`);
     const p = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(p.detail || r.statusText || "preview unavailable");
+    if (p.mode === "shots") { showShotPreview(id, p); return; }
     previewJob = Object.assign({ id }, p.job || {});
     previewScene = p;
     $("#previewHint").textContent = window.PointerEvent

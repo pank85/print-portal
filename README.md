@@ -199,8 +199,7 @@ Limits worth knowing before you tick the box:
   build time), which is why the image is ~1.1 GB.
 - **Serialised and bounded**: one fin run at a time, each capped by `SUPPORT_FINS_TIMEOUT` (300 s), so a
   second finned upload waits for the first.
-- **The preview is bounded** to 200 000 triangles and 12 MiB of input. Past that the dialog reports
-  `preview unavailable: …` and still offers **Slice it**.
+- **The preview is bounded** to 450 000 triangles and 32 MiB of input for the rotatable view. A larger finned file, up to the 150 MiB upload limit, shows still pictures (front and side) instead of refusing. Past that the dialog reports `preview unavailable: …` and still offers **Slice it**.
 - **A staged job is protected from age pruning** (absent from ACTIVE_STATUSES but in PRUNE_KEEP_STATUSES) and can be deleted
   individually or by **Delete finished**; it simply never enters the queue until you confirm.
 

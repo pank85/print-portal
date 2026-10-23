@@ -20,7 +20,8 @@ pipeline below is the same in both; the seed contents and the preset behaviour a
 | `app/moonraker.py` | Moonraker HTTP client; maps transport/HTTP failures onto `MoonrakerError` subclasses carrying `http_status` (`moonraker.py:46-69`). |
 | `app/threemf.py` | Reads a 3MF's embedded printer/process identity and rewrites a job-local copy that names local presets. |
 | `app/supportfins.py` | Wraps the bundled `app/support_fins.mjs`: `available()`/`unavailable_reason()`, and `fin_model()` — one `node` run with `--json`, bounded by `SUPPORT_FINS_TIMEOUT`, serialised by `_RUN_LOCK`, failures as `SupportFinsError`/`SupportFinsUnavailable`. |
-| `app/preview.py` | Reads a job's 3MF/STL/OBJ geometry for the pre-slice preview (`read_scene`), one object per leaf with `role: "part"` or `"supports"`, capped by `MAX_TRIANGLES` (200 000) and `MAX_BYTES` (12 MiB). No network, no UI. |
+| `app/preview.py` | Reads a job's 3MF/STL/OBJ geometry for the rotatable pre-slice preview (`read_scene`), capped by `MAX_TRIANGLES` (450 000) and `MAX_BYTES` (32 MiB). |
+| `app/shot.py` | Paints front and side PNGs when the finned file is over that byte cap, up to 150 MiB. The slice still uses the original file. |
 | `app/archives.py` | Picks one model out of an uploaded `.zip`, fail-closed on hostile members. |
 | `app/gcode.py` | Parses the slicer's gcode header for grams/time/layers (`MAX_HEAD_BYTES = 2_000_000`). |
 | `app/index.html` | The whole UI, inline CSS/JS. Served by `GET /`. |
