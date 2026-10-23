@@ -828,6 +828,14 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     <p id="previewFallback" hidden></p>
   </div>
   <p id="previewStats" class="mono"></p>
+  <div id="previewScale" class="preview-scale">
+    <span class="mono" id="previewSizeNow"></span>
+    <label>Height <input type="number" id="scaleHeight" step="0.1" min="0.1"></label>
+    <label>Width <input type="number" id="scaleWidth" step="0.1" min="0.1"></label>
+    <label>Length <input type="number" id="scaleLength" step="0.1" min="0.1"></label>
+    <button type="button" class="btn" id="scaleApply">Apply size</button>
+    <span class="mono" id="previewSizeAfter"></span>
+  </div>
   <div id="previewLegend" class="preview-legend" role="group" aria-label="Objects in the preview"></div>
   <p id="previewError" class="err" role="alert" hidden></p>
   <div class="dialog-actions preview-actions">
@@ -1612,7 +1620,7 @@ const PREVIEW_COLOUR = {
   other: [100, 116, 139],
   supports: [34, 197, 94],      // --color-accent: the fins are the point
 };
-const PREVIEW_TRIANGLE_BUDGET = 120000;   // one drag frame stays sane on a big mesh
+const PREVIEW_TRIANGLE_BUDGET = 200000;   // one drag frame stays sane on a big mesh
 const PREVIEW_KEY_STEP = 0.12;
 let previewJob = null;          // {id, filename, ...} of the staged job
 let previewScene = null;        // the last GET /preview payload
@@ -1881,6 +1889,9 @@ async function openPreview(id) {
       ? "Drag to orbit, scroll to zoom, arrow keys when the view has focus. Click a name to hide or show that object."
       : "Arrow keys orbit, + and − zoom. Click a name to hide or show that object.";
     renderPreviewChrome(p);
+    const sz = (p.bbox && p.bbox.size) || [];
+    const now = document.getElementById("previewSizeNow");
+    if (now) now.textContent = "current: " + sz.map(v=>Math.round(v*10)/10).join(" × ") + " mm";
     drawPreview();
     canvas.focus();
   } catch (e) {
@@ -1962,9 +1973,74 @@ async function initSupportFins() {
   } catch (e) { /* leave enabled by default */ }
 }
 
+function previewScaleAxis(id) {
+  // Axis map: width=bbox[0], length=bbox[1], height=bbox[2].
+  return id === "scaleHeight" ? 2 : id === "scaleWidth" ? 0 : 1;
+}
+
+function previewScaleFollow(e) {
+  const src = e.target.id;
+  const val = Number(e.target.value);
+  if (!previewScene || !Number.isFinite(val) || val <= 0) return;
+  const sz = (previewScene.bbox && previewScene.bbox.size) || [];
+  const cur = Number(sz[previewScaleAxis(src)]);
+  if (cur <= 0) return;
+  const factor = val / cur;
+  ["scaleHeight","scaleWidth","scaleLength"].forEach((k)=>{
+    if (k === src) return;
+    const el = document.getElementById(k);
+    if (el) el.value = (Number(sz[previewScaleAxis(k)]) * factor).toFixed(1);
+  });
+}
+
+async function applyPreviewScale() {
+  const id = previewJob && previewJob.id;
+  if (!id) return;
+  const filled = ["scaleHeight","scaleWidth","scaleLength"].filter(k=>{
+    const el=document.getElementById(k); return el && el.value && Number(el.value)>0;
+  });
+  if (filled.length === 0) { toast("Enter one of height, width or length", 4000); return; }
+  if (filled.length > 1) { toast("Set only one dimension", 4000); return; }
+  const axis = filled[0];
+  const field = document.getElementById(axis);
+  const value = Number(field.value);
+  const apiAxis = axis === "scaleHeight" ? "height" : axis === "scaleWidth" ? "width" : "length";
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/scale`, {
+      method: "POST", headers: {"Content-Type":"application/json"},
+      body: JSON.stringify({ axis: apiAxis, value })
+    });
+    const j = await r.json().catch(()=>({}));
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    const after = document.getElementById("previewSizeAfter");
+    if (after) after.textContent = "new: " + (j.size||[]).map(v=>Math.round(v*10)/10).join(" × ") + " mm";
+    // reload preview
+    const pr = await fetch("/api/jobs/" + encodeURIComponent(id) + "/preview");
+    const p = await pr.json().catch(() => ({}));
+    if (!pr.ok) throw new Error(p.detail || pr.statusText);
+    previewScene = p;
+    renderPreviewChrome(p);
+    const sz = (p.bbox && p.bbox.size) || [];
+    const now = document.getElementById("previewSizeNow");
+    if (now) now.textContent = "current: " + sz.map(v=>Math.round(v*10)/10).join(" × ") + " mm";
+    drawPreview();
+    // clear inputs
+    ["scaleHeight","scaleWidth","scaleLength"].forEach(k=>{const e=document.getElementById(k); if(e) e.value="";});
+    toast("Scaled");
+  } catch (e) {
+    toast("Scale failed: " + e.message, 6000);
+  }
+}
+
 function initPreview() {
   const canvas = $("#previewCanvas"), dlg = $("#previewDlg");
   $("#previewConfirm").addEventListener("click", () => confirmSlice());
+  const apply = document.getElementById("scaleApply");
+  if (apply) apply.addEventListener("click", applyPreviewScale);
+  ["scaleHeight","scaleWidth","scaleLength"].forEach(k=>{
+    const el = document.getElementById(k);
+    if (el) el.addEventListener("input", previewScaleFollow);
+  });
   $("#previewClose").addEventListener("click", closePreview);
   $("#previewDiscard").addEventListener("click", discardPreview);
   $("#previewLegend").addEventListener("click", previewToggle);

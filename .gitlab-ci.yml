@@ -27,18 +27,19 @@ variables:
   # Hardcoded defaults, so the pipeline needs no CI/CD variables at all. A project
   # or group variable of the same name (Settings > CI/CD > Variables) overrides
   # any of them.
-  CI_REGISTRY: "dockerhub.pkatopodis.me"
-  CI_REGISTRY_IMAGE: "dockerhub.pkatopodis.me/pank85/print-portal"
+  # Docker Hub is the registry the homeserver pulls. The old local registry
+  # (dockerhub.pkatopodis.me) is no longer a push target.
+  CI_REGISTRY: "docker.io"
+  CI_REGISTRY_IMAGE: "pank85/print-portal"
   GITLAB_REGISTRY_IMAGE: "gitlab-ce:5050/pank85/print-portal"
-  APP_VERSION: "2.3.0"                 # must equal app/config.py VERSION (test_config enforces)
+  APP_VERSION: "2.4.0"                 # must equal app/config.py VERSION (test_config enforces)
   FULL_VERSION: "${APP_VERSION}-${CI_COMMIT_SHORT_SHA}"
   # Optional overrides. Empty means "use the default" (see the docker job).
   # MIRROR_IMAGE=none disables the mirror push.
   PRIMARY_IMAGE: ""
   MIRROR_IMAGE: ""
-  # Docker Hub publishing is opt-in: set DOCKERHUB_USER and a masked DOCKERHUB_TOKEN
-  # under Settings > CI/CD > Variables. DOCKERHUB_IMAGE overrides the repo name
-  # (default <user>/print-portal). With them unset the job prints a skip line.
+  # Docker Hub credentials are required. DOCKERHUB_IMAGE overrides the repo name
+  # (default pank85/print-portal, which is what the homeserver compose pulls).
 
 test:
   stage: test
@@ -94,12 +95,16 @@ docker:
         sleep 1
       done
       echo "dind ready (retries: $i)"
-    # Primary registry login. Both registries live on the runner box and answer to
-    # the same account, so the mirror reuses this credential pair — but it logs in
-    # inside the script, only when the mirror is enabled.
-    # Optional per-registry credential overrides: PRIMARY_REGISTRY_USER/PASSWORD and
-    # MIRROR_REGISTRY_USER/PASSWORD (default to CI_REGISTRY_USER/PASSWORD).
-    - echo "${PRIMARY_REGISTRY_PASSWORD:-$CI_REGISTRY_PASSWORD}" | docker login -u "${PRIMARY_REGISTRY_USER:-$CI_REGISTRY_USER}" --password-stdin "$CI_REGISTRY"
+    # Docker Hub is the primary registry. Fail closed if the credentials are
+    # missing: a green docker job that never published is not a deployable build.
+    # The GitLab mirror still logs in later, and only when that mirror is enabled.
+    - |
+      if [ -z "${DOCKERHUB_USER:-}" ] || [ -z "${DOCKERHUB_TOKEN:-}" ]; then
+        echo "DOCKER HUB FAIL: set DOCKERHUB_USER and DOCKERHUB_TOKEN."
+        echo "The local registry dockerhub.pkatopodis.me is no longer a push target."
+        exit 1
+      fi
+      echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin docker.io
   script:
     - |
       set -eu
@@ -137,24 +142,6 @@ docker:
         echo "mirror push skipped (MIRROR_IMAGE=none)"
       fi
 
-      # Docker Hub (public) publish. Opt-in: skipped unless BOTH the account and a
-      # token are configured as CI variables, so a fork with no secrets still gets a
-      # green pipeline. The image is already in this job's daemon, so this costs no
-      # second build — only the upload of the layers Docker Hub does not have yet.
-      # Publish the release version and `latest`; the commit-sha tags stay internal.
-      if [ -n "${DOCKERHUB_USER:-}" ] && [ -n "${DOCKERHUB_TOKEN:-}" ]; then
-        HUB="${DOCKERHUB_IMAGE:-$DOCKERHUB_USER/print-portal}"
-        echo "Docker Hub target: $HUB"
-        echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin docker.io
-        for tag in "$APP_VERSION" "latest"; do
-          docker tag "$TARGET:$FULL_VERSION" "$HUB:$tag"
-          docker push "$HUB:$tag"
-        done
-        printf 'DOCKERHUB_PUBLISHED=%s:%s\n' "$HUB" "$APP_VERSION" >> release.env
-      else
-        echo "Docker Hub publish skipped (set DOCKERHUB_USER and DOCKERHUB_TOKEN to enable)"
-      fi
-
       # Hand the exact pushed digest to the deploy job. A tag can move; the digest
       # cannot, so the deploy asserts on this string rather than on ":latest".
       # Select the digest for THIS target repo explicitly: when the mirror is
@@ -174,7 +161,7 @@ docker:
 # 172.16.0.50 is NOT a separate production host: it is the LAN address of the CI
 # runner's own machine. This job therefore SSHes to the same box CI runs on and
 # drives the compose project at ~/homeserver/docker-compose/print-portal, which
-# pins image dockerhub.pkatopodis.me/pank85/print-portal:latest, container name
+# pins image pank85/print-portal:latest, container name
 # print-portal, public port 8088.
 #
 # That project is owned by the systemd unit docker-compose@print-portal, which

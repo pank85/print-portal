@@ -1284,6 +1284,46 @@ def api_preview(jid: str):
             "original": job.get("original")}
 
 
+@app.post("/api/jobs/{jid}/scale")
+def api_scale(jid: str, payload: dict):
+    job = read_job(jid)
+    if not job.get("support_fins"):
+        raise HTTPException(409, "scaling only applies to support-fins jobs")
+    if job.get("status") != "awaiting_confirm":
+        raise HTTPException(409, "job is not awaiting confirmation")
+    axis = str(payload.get("axis", "")).lower()
+    if axis not in ("height", "width", "length", "x", "y", "z"):
+        raise HTTPException(400, "axis must be height, width or length")
+    try:
+        value = float(payload.get("value"))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "value must be a number")
+    if not (value > 0):
+        raise HTTPException(400, "size must be positive")
+    if value > 10000:
+        raise HTTPException(400, "size is implausibly large")
+    name = Path(job.get("filename") or "").name
+    path = job_dir(jid) / "upload" / name
+    scene = preview.read_scene(path)
+    size = scene["bbox"]["size"]
+    # Axis map: width=bbox[0], length=bbox[1], height=bbox[2].
+    idx = {"width": 0, "length": 1, "height": 2, "x": 0, "y": 1, "z": 2}[axis]
+    current = float(size[idx])
+    if current <= 0:
+        raise HTTPException(400, "cannot scale a zero-size model")
+    factor = value / current
+    if factor <= 0 or factor > 100:
+        raise HTTPException(400, "resulting scale is out of range")
+    out = path.with_name(path.stem + ".scaled_tmp" + path.suffix)
+    preview.scale_file(path, factor, out)
+    os.replace(out, path)
+    write_job(jid, scale_axis=axis, scale_value=value,
+              scale_factor=factor)
+    new_scene = preview.read_scene(path)
+    return {"job": jid, "filename": name, "factor": factor,
+            "size": new_scene["bbox"]["size"]}
+
+
 @app.get("/api/support-fins")
 def api_support_fins():
     """Whether the fins checkbox can be offered — always 200, the page asks."""

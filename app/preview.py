@@ -34,15 +34,16 @@ against, so its objects are parts.
 from __future__ import annotations
 
 import math
+import re
 import struct
 import xml.etree.ElementTree as ET
 import zipfile
 from pathlib import Path
 
-MAX_TRIANGLES = 200_000
-"""Cap on the triangles in one preview response (≈10 MB of JSON at 3 dp)."""
+MAX_TRIANGLES = 450_000
+"""Cap on the triangles in one preview response."""
 
-MAX_BYTES = 12 * 1024 * 1024
+MAX_BYTES = 32 * 1024 * 1024
 """Cap on the input file: a bigger archive is refused before it is unpacked."""
 
 MAX_COMPONENT_DEPTH = 8
@@ -59,6 +60,10 @@ _BINARY_RECORD = struct.Struct("<12fH")
 """One binary STL facet: normal (3 floats), three vertices (9 floats), attribute word."""
 
 _IDENTITY = (1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0)
+
+# bbox.size[i] is the span of transformed vertex component i.
+# Axis map: width=bbox[0], length=bbox[1], height=bbox[2].
+SCALE_AXES = {"x": 0, "y": 1, "z": 2}
 
 _SUPPORT_WORDS = ("fin", "support")
 
@@ -557,3 +562,119 @@ def _read_stl(path: Path) -> list[dict]:
         "vertices": vertices,
         "triangles": triangles,
     }]
+
+
+def _scale_number(raw: str, factor: float, *, name: str) -> str:
+    try:
+        value = float(raw) * factor
+    except ValueError:
+        raise PreviewError(f"{name} has a non-numeric coordinate ({raw!r})") from None
+    if not math.isfinite(value):
+        raise PreviewError(f"{name} has a non-finite coordinate")
+    return format(value, "g")
+
+
+def _scale_model_xml(data: bytes, factor: float, name: str) -> bytes:
+    """Scale mesh vertices and any ``<component transform>`` (3x3 and translation)."""
+    try:
+        root = ET.fromstring(data)
+    except ET.ParseError as exc:
+        raise PreviewError(f"{name} has a malformed 3MF model part ({exc})") from exc
+    for element in root.iter():
+        local = _local(element.tag)
+        if local == "vertex":
+            for attr in ("x", "y", "z"):
+                raw = element.get(attr)
+                if raw is None:
+                    continue
+                element.set(attr, _scale_number(raw, factor, name=name))
+        elif local == "component":
+            raw = element.get("transform")
+            if not raw or not raw.strip():
+                continue
+            tokens = raw.split()
+            if len(tokens) not in (9, 12):
+                raise PreviewError(f"{name} has a malformed 3MF transform ({raw!r})")
+            # 9 floats are the 3x3; 12 also carry the translation. Both scale.
+            element.set(
+                "transform",
+                " ".join(_scale_number(token, factor, name=name) for token in tokens),
+            )
+    return ET.tostring(root, encoding="utf-8", xml_declaration=True)
+
+
+def _scale_3mf(path: Path, factor: float, out_path: Path) -> None:
+    """Rewrite the model XML; every other zip member is copied byte-for-byte."""
+    try:
+        with zipfile.ZipFile(path) as src:
+            members = [(info, src.read(info)) for info in src.infolist()]
+    except zipfile.BadZipFile as exc:
+        raise PreviewError(f"{path.name} is not a readable 3MF archive") from exc
+    except OSError as exc:
+        raise PreviewError(f"{path.name}: cannot read the file ({exc.strerror})") from exc
+    scaled = []
+    for info, data in members:
+        if info.filename == MODEL_MEMBER:
+            data = _scale_model_xml(data, factor, path.name)
+        scaled.append((info, data))
+    with zipfile.ZipFile(out_path, "w") as dst:
+        for info, data in scaled:
+            cloned = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
+            cloned.compress_type = zipfile.ZIP_STORED if info.filename != MODEL_MEMBER else info.compress_type
+            cloned.external_attr = info.external_attr
+            cloned.create_system = info.create_system
+            dst.writestr(cloned, data)
+
+
+def scale_file(path: Path, factor: float, out_path: Path) -> None:
+    """Bake a uniform scale into the geometry at ``path``, writing ``out_path``.
+
+    Only 3MF is fully supported (the fins path); STL/OBJ vertices are scaled too.
+    A 3MF component ``transform``, when present, has its 3x3 and translation multiplied
+    by the same factor as the mesh vertices. Other zip members are copied unchanged.
+    """
+    suffix = path.suffix.lower()
+    if suffix == ".3mf":
+        _scale_3mf(path, factor, out_path)
+    elif suffix == ".stl":
+        # binary STL
+        raw = path.read_bytes()
+        # detect binary: triangle count at offset 80
+        import struct
+        count = struct.unpack_from("<I", raw, 80)[0]
+        if 80 + 4 + count * 50 == len(raw):
+            out = bytearray(raw[:84])
+            # header 80 + count 4
+            for i in range(count):
+                off = 84 + i * 50
+                rec = bytearray(raw[off:off+50])
+                # normal 3 floats (0..12) and vertices 3*3 floats (12..48)
+                for j in range(3, 12):
+                    val = struct.unpack_from("<f", rec, j*4)[0] * factor
+                    struct.pack_into("<f", rec, j*4, val)
+                out += rec
+            out_path.write_bytes(out)
+        else:
+            # ASCII
+            text = path.read_text()
+            # scale v lines? STL uses vertex lines
+            import re
+            def repl(m):
+                return "vertex " + " ".join(f"{float(x)*factor:g}" for x in m.group(1).split())
+            text = re.sub(r"vertex\s+([-\d.eE+ ]+)", repl, text)
+            out_path.write_text(text)
+    elif suffix == ".obj":
+        import re
+        lines = path.read_text().splitlines()
+        out = []
+        for line in lines:
+            if line.startswith("v "):
+                parts = line.split()
+                coords = [float(x) * factor for x in parts[1:4]]
+                rest = parts[4:]
+                out.append("v " + " ".join(f"{c:g}" for c in coords) + (" " + " ".join(rest) if rest else ""))
+            else:
+                out.append(line)
+        out_path.write_text("\n".join(out) + "\n")
+    else:
+        raise PreviewError(f"{path.name}: cannot scale this file type")
