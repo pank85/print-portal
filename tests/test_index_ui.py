@@ -800,13 +800,15 @@ def test_print_progress_bar_stays_determinate_and_separate(page):
 def test_header_nav_keeps_the_three_hash_destinations(page):
     # drop the <nav> opening tag (it carries its own nav* id) so only the link ids are collected
     nav = slice_between(page, 'id="navSections"', "</nav>").split(">", 1)[1]
-    assert re.findall(r'id="(nav[\w-]+)"', nav) == ["navDash", "navPrinter", "navSettings"]
+    assert re.findall(r'id="(nav[\w-]+)"', nav) == ["navDash", "navPrinter", "navPresets", "navFilaments", "navSettings"]
     assert 'id="navDash" href="#/"' in nav
     assert 'id="navPrinter" href="#/printer"' in nav
+    assert 'id="navPresets" href="#/presets"' in nav
+    assert 'id="navFilaments" href="#/filaments"' in nav
     assert 'id="navSettings" href="#/settings"' in nav
-    assert nav.count("<a ") == 3
-    # one markup/class contract for all three: no bespoke tab styling for the new one
-    assert nav.count('class="tab"') == 3
+    assert nav.count("<a ") == 5
+    # one markup/class contract for all tabs
+    assert nav.count('class="tab"') == 5
 
 
 def test_switcher_is_one_compact_row_inside_the_header_bar(page):
@@ -886,11 +888,9 @@ def test_printer_is_a_cold_loadable_route(page):
 
 def test_the_printer_tab_shares_the_active_state_contract(page):
     script = script_block(page)
-    assert re.search(
-        r'const VIEWS = \{ dashboard: DASH, settings: SETT, printer: PRIN \};', script)
-    assert re.search(
-        r'const VIEW_TABS = \{ dashboard: "#navDash", settings: "#navSettings", printer: "#navPrinter" \};',
-        script)
+    assert 'const VIEWS = { dashboard: DASH, settings: SETT, printer: PRIN, presets: PRES, filaments: FILS };' in script
+    assert 'const VIEW_TABS = { dashboard: "#navDash", settings: "#navSettings", printer: "#navPrinter",' in script
+    assert 'presets: "#navPresets", filaments: "#navFilaments" };' in script
     body = function_body(page, "setView")
     assert "panel().hidden = view !== name" in body
     assert 'setAttribute("aria-current", "page")' in body

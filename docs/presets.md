@@ -250,3 +250,17 @@ the machine permits the process (`_paired_process`, `main.py:245`), and writes a
 * Whether A's merge path was ever tested with a bundle whose `compatible_printers` named the machine.
   A's comment (`profiles.py:31-35`) claims "every other variant stayed at -17"; no artifact of those
   runs exists in the repo. A single slice with a patched `compatible_printers` would settle it.
+
+## Editing presets in the UI
+
+The **Presets** and **Filaments** pages (`#/presets`, `#/filaments`) edit the basic settings of a
+machine, its process presets, and filaments. Values are written as overrides onto the preset's own file
+under `system/Custom/`; `inherits`/`from`/`name`/`type`/`version` and every untouched key are preserved,
+and the write is atomic. Vendor presets and the derived `print-portal-options.json` are read-only (409).
+
+Supports and brim are deliberately not exposed there — they are owned by the dashboard profile card,
+which writes the derived process preset. Two writers would fight.
+
+Deleting a machine also deletes every `system/Custom/process` preset whose effective
+`compatible_printers` names that machine, then repairs `profile.json`, `default_print_profile` and
+printer pairings. Filaments cannot be deleted from the UI.

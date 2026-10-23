@@ -61,6 +61,9 @@ One printer may also come from `PRINTER_URL` + `MOONRAKER_API_KEY` — the read-
 printer", whose credential fields stay owned by the deployment and whose Web UI fallback is
 `PRINTER_UI_URL`. Everything else is editable in Settings.
 
+Basic settings of machines, process presets and filaments can be edited (and machines and processes
+deleted) on the **Presets** and **Filaments** pages — deleting a machine also deletes its processes.
+
 ## Quickstart
 
 ```bash

@@ -30,7 +30,7 @@ variables:
   CI_REGISTRY: "dockerhub.pkatopodis.me"
   CI_REGISTRY_IMAGE: "dockerhub.pkatopodis.me/pank85/print-portal"
   GITLAB_REGISTRY_IMAGE: "gitlab-ce:5050/pank85/print-portal"
-  APP_VERSION: "2.2.5"                 # must equal app/config.py VERSION (test_config enforces)
+  APP_VERSION: "2.3.0"                 # must equal app/config.py VERSION (test_config enforces)
   FULL_VERSION: "${APP_VERSION}-${CI_COMMIT_SHORT_SHA}"
   # Optional overrides. Empty means "use the default" (see the docker job).
   # MIRROR_IMAGE=none disables the mirror push.

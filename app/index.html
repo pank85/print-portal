@@ -440,6 +440,8 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
       <nav class="tabs" id="navSections" aria-label="Sections">
         <a class="tab" id="navDash" href="#/">Dashboard</a>
         <a class="tab" id="navPrinter" href="#/printer">Printer</a>
+        <a class="tab" id="navPresets" href="#/presets">Presets</a>
+        <a class="tab" id="navFilaments" href="#/filaments">Filaments</a>
         <a class="tab" id="navSettings" href="#/settings">Settings</a>
       </nav>
     </div>
@@ -632,6 +634,42 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     </template>
   </section>
 
+  <!-- ================= presets ================= -->
+  <section class="view" id="viewPresets" aria-labelledby="presetsTitle" hidden>
+    <h1 id="presetsTitle" tabindex="-1">Presets</h1>
+    <p class="meta">Edit the basic settings of a machine and its process presets. Supports and brim are set on the dashboard profile card, not here.</p>
+    <section class="card" aria-labelledby="machineCardTitle">
+      <h2 id="machineCardTitle">Machine</h2>
+      <div class="field"><label for="machineSelect">Machine</label>
+        <select id="machineSelect"></select></div>
+      <div id="machineForm"></div>
+      <div class="actions"><button id="saveMachineBtn" type="button">Save machine</button>
+        <button id="deleteMachineBtn" type="button" class="danger">Delete machine</button></div>
+      <p class="hint" id="machineEmpty" hidden>No machine presets imported yet. Import a bundle on the dashboard first.</p>
+    </section>
+    <section class="card" aria-labelledby="processCardTitle">
+      <h2 id="processCardTitle">Process</h2>
+      <div class="field"><label for="processSelect">Process preset</label>
+        <select id="processSelect"></select></div>
+      <div id="processForm"></div>
+      <div class="actions"><button id="saveProcessBtn" type="button">Save process</button>
+        <button id="deleteProcessBtn" type="button" class="danger">Delete process</button></div>
+    </section>
+  </section>
+
+  <!-- ================= filaments ================= -->
+  <section class="view" id="viewFilaments" aria-labelledby="filamentsTitle" hidden>
+    <h1 id="filamentsTitle" tabindex="-1">Filaments</h1>
+    <p class="meta">Edit the basic settings of a filament preset.</p>
+    <section class="card" aria-labelledby="filamentCardTitle">
+      <h2 id="filamentCardTitle">Filament</h2>
+      <div class="field"><label for="filamentSelect">Filament preset</label>
+        <select id="filamentSelect"></select></div>
+      <div id="filamentForm"></div>
+      <div class="actions"><button id="saveFilamentBtn" type="button">Save filament</button></div>
+    </section>
+  </section>
+
   <!-- ================= settings ================= -->
   <section class="view" id="viewSettings" aria-labelledby="settingsTitle" hidden>
     <h1 id="settingsTitle" tabindex="-1">Settings</h1>
@@ -731,11 +769,13 @@ function isSlicing(status) { return status === "queued" || status === "slicing";
 
 /* ---------------- routing ---------------- */
 let currentView = null;
-const DASH = () => $("#viewDashboard"), SETT = () => $("#viewSettings"), PRIN = () => $("#viewPrinter");
+const DASH = () => $("#viewDashboard"), SETT = () => $("#viewSettings"), PRIN = () => $("#viewPrinter"),
+      PRES = () => $("#viewPresets"), FILS = () => $("#viewFilaments");
 /* One table per direction, so a view added here cannot be half-wired: the panels are the
    sections, the tabs are the header destinations that own the aria-current state. */
-const VIEWS = { dashboard: DASH, settings: SETT, printer: PRIN };
-const VIEW_TABS = { dashboard: "#navDash", settings: "#navSettings", printer: "#navPrinter" };
+const VIEWS = { dashboard: DASH, settings: SETT, printer: PRIN, presets: PRES, filaments: FILS };
+const VIEW_TABS = { dashboard: "#navDash", settings: "#navSettings", printer: "#navPrinter",
+                    presets: "#navPresets", filaments: "#navFilaments" };
 
 function setView(name) {
   setNavOpen(false);
@@ -752,7 +792,9 @@ function setView(name) {
     if (head) head.focus();
   }
   if (name === "settings") loadPrinters();
-  else if (name === "printer") loadPrinterUi();   // also on a cold #/printer link, not only on `moved`
+  else if (name === "printer") loadPrinterUi();
+  else if (name === "presets") loadPresets();
+  else if (name === "filaments") loadFilaments();
   else if (moved) refresh();
 }
 
@@ -760,6 +802,8 @@ function route() {
   const raw = location.hash.replace(/^#/, "").replace(/^\/+/, "").replace(/\/+$/, "").toLowerCase();
   if (raw === "settings" || raw === "viewsettings") return setView("settings");
   if (raw === "printer") return setView("printer");
+  if (raw === "presets") return setView("presets");
+  if (raw === "filaments") return setView("filaments");
   if (raw === "" || raw === "dashboard") return setView("dashboard");
   history.replaceState(null, "", "#/");
   setView("dashboard");
@@ -1904,6 +1948,235 @@ function boot() {
 
 document.addEventListener("DOMContentLoaded", boot);
 if (document.readyState !== "loading") boot();
+
+/* ---------------- presets & filaments ---------------- */
+let presetDirty = false;
+const presetFieldEls = {};
+
+function el(tag, attrs = {}, children = []) {
+  const e = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === "class") e.className = v;
+    else if (k === "text") e.textContent = v;
+    else e.setAttribute(k, v);
+  }
+  for (const c of children) e.appendChild(c);
+  return e;
+}
+
+function renderPresetForm(container, view) {
+  container.innerHTML = "";
+  presetFieldEls[view.rel] = {};
+  if (!view.editable) {
+    const note = el("p", { class: "hint", text: view.read_only_reason || "Read-only preset." });
+    container.appendChild(note);
+  }
+  for (const f of view.fields) {
+    const wrap = el("div", { class: "field" });
+    const label = el("label", { text: f.label + (f.unit ? " (" + f.unit + ")" : "") });
+    let input;
+    if (f.type === "boolean") {
+      input = el("select");
+      for (const [v, t] of [["true", "on"], ["false", "off"]]) {
+        const o = el("option", { value: v, text: t });
+        if (f.value === v) o.selected = true;
+        input.appendChild(o);
+      }
+    } else if (f.type === "enum") {
+      input = el("select");
+      for (const c of (f.choices || [])) {
+        const o = el("option", { value: c, text: c });
+        if (f.value === c) o.selected = true;
+        input.appendChild(o);
+      }
+    } else if (f.type === "area_list") {
+      input = el("textarea", { rows: "5" });
+      input.value = f.value;
+    } else {
+      input = el("input", { type: (f.type === "integer" ? "number" : (f.type === "number" || f.type === "number_list" || f.type === "percent" ? "text" : "text")) });
+      input.value = f.value;
+    }
+    input.dataset.key = f.key;
+    input.disabled = !view.editable;
+    const meta = el("span", { class: "hint", text: (f.source === "inherited" ? "inherited from " + (f.inherited_from || "parent") : "own") });
+    wrap.appendChild(label);
+    wrap.appendChild(input);
+    wrap.appendChild(meta);
+    container.appendChild(wrap);
+    presetFieldEls[view.rel][f.key] = input;
+  }
+  presetDirty = false;
+  for (const input of Object.values(presetFieldEls[view.rel])) {
+    input.addEventListener("input", () => { presetDirty = true; });
+    input.addEventListener("change", () => { presetDirty = true; });
+  }
+}
+
+function collectForm(rel) {
+  const els = presetFieldEls[rel] || {};
+  const out = {};
+  for (const [k, inp] of Object.entries(els)) {
+    out[k] = inp.value;
+  }
+  return out;
+}
+
+async function loadPresets() {
+  const mSel = $("#machineSelect"), pSel = $("#processSelect");
+  const res = await fetch("/api/presets?kind=machine");
+  const data = await res.json();
+  const machines = data.presets || [];
+  mSel.innerHTML = "";
+  if (!machines.length) {
+    $("#machineEmpty").hidden = false;
+    $("#machineForm").innerHTML = "";
+    $("#processSelect").innerHTML = "";
+    $("#processForm").innerHTML = "";
+    return;
+  }
+  $("#machineEmpty").hidden = true;
+  for (const m of machines) {
+    const o = document.createElement("option");
+    o.value = m.rel; o.textContent = m.name + (m.editable ? "" : " (read-only)");
+    mSel.appendChild(o);
+  }
+  await loadMachine(mSel.value);
+  mSel.onchange = async () => {
+    if (presetDirty && !await ask("Discard changes?", "You have unsaved edits.")) {
+      mSel.value = mSel.dataset.prev || mSel.value; return;
+    }
+    mSel.dataset.prev = mSel.value;
+    await loadMachine(mSel.value);
+  };
+  mSel.dataset.prev = mSel.value;
+}
+
+async function loadMachine(rel) {
+  const r = await fetch("/api/presets/machine/" + encodeURIComponent(rel));
+  const view = await r.json();
+  renderPresetForm($("#machineForm"), view);
+  const btns = [$("#saveMachineBtn"), $("#deleteMachineBtn")];
+  for (const b of btns) b.disabled = !view.editable;
+  $("#saveMachineBtn").onclick = async () => {
+    const r2 = await fetch("/api/presets/machine/" + encodeURIComponent(rel), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: collectForm(rel) })
+    });
+    const j = await r2.json();
+    if (!r2.ok) { toast(j.detail || r2.statusText, 5000); return; }
+    toast("Machine saved");
+    presetDirty = false;
+    renderPresetForm($("#machineForm"), j);
+  };
+  $("#deleteMachineBtn").onclick = async () => {
+    // build an accurate cascade message from the process list
+    const pr = await fetch("/api/presets?kind=process&machine=" + encodeURIComponent(rel));
+    const pdata = await pr.json();
+    const names = (pdata.presets || []).map(x => x.name);
+    const msg = names.length
+      ? "This also deletes its processes: " + names.join(", ") + "."
+      : "No processes depend on this machine.";
+    if (!await ask("Delete machine " + view.name + "?", msg)) return;
+    const r2 = await fetch("/api/presets/machine/" + encodeURIComponent(rel), { method: "DELETE" });
+    const j = await r2.json();
+    if (!r2.ok) { toast(j.detail || r2.statusText, 5000); return; }
+    toast("Machine deleted");
+    presetDirty = false;
+    await loadPresets();
+  };
+  // processes
+  const pr = await fetch("/api/presets?kind=process&machine=" + encodeURIComponent(rel));
+  const pdata = await pr.json();
+  const pSel = $("#processSelect");
+  pSel.innerHTML = "";
+  for (const p of (pdata.presets || [])) {
+    const o = document.createElement("option");
+    o.value = p.rel; o.textContent = p.name + (p.editable ? "" : " (read-only)");
+    pSel.appendChild(o);
+  }
+  if (pSel.options.length) await loadProcess(pSel.value);
+  else { $("#processForm").innerHTML = ""; $("#deleteProcessBtn").disabled = true; $("#saveProcessBtn").disabled = true; }
+  pSel.onchange = async () => {
+    if (presetDirty && !await ask("Discard changes?", "You have unsaved edits.")) {
+      pSel.value = pSel.dataset.prev || pSel.value; return;
+    }
+    pSel.dataset.prev = pSel.value;
+    await loadProcess(pSel.value);
+  };
+  pSel.dataset.prev = pSel.value;
+}
+
+async function loadProcess(rel) {
+  if (!rel) return;
+  const r = await fetch("/api/presets/process/" + encodeURIComponent(rel));
+  const view = await r.json();
+  renderPresetForm($("#processForm"), view);
+  $("#saveProcessBtn").disabled = !view.editable;
+  $("#deleteProcessBtn").disabled = !view.deletable;
+  $("#saveProcessBtn").onclick = async () => {
+    const r2 = await fetch("/api/presets/process/" + encodeURIComponent(rel), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: collectForm(rel) })
+    });
+    const j = await r2.json();
+    if (!r2.ok) { toast(j.detail || r2.statusText, 5000); return; }
+    toast("Process saved");
+    presetDirty = false;
+    renderPresetForm($("#processForm"), j);
+  };
+  $("#deleteProcessBtn").onclick = async () => {
+    if (!await ask("Delete process " + view.name + "?", "The machine stays.")) return;
+    const r2 = await fetch("/api/presets/process/" + encodeURIComponent(rel), { method: "DELETE" });
+    const j = await r2.json();
+    if (!r2.ok) { toast(j.detail || r2.statusText, 5000); return; }
+    toast("Process deleted");
+    presetDirty = false;
+    await loadMachine($("#machineSelect").value);
+  };
+}
+
+async function loadFilaments() {
+  const sel = $("#filamentSelect");
+  const r = await fetch("/api/presets?kind=filament");
+  const data = await r.json();
+  const rows = data.presets || [];
+  sel.innerHTML = "";
+  if (!rows.length) { $("#filamentForm").innerHTML = ""; return; }
+  for (const f of rows) {
+    const o = document.createElement("option");
+    o.value = f.rel; o.textContent = f.name + (f.editable ? "" : " (read-only)");
+    sel.appendChild(o);
+  }
+  await loadFilament(sel.value);
+  sel.onchange = async () => {
+    if (presetDirty && !await ask("Discard changes?", "You have unsaved edits.")) {
+      sel.value = sel.dataset.prev || sel.value; return;
+    }
+    sel.dataset.prev = sel.value;
+    await loadFilament(sel.value);
+  };
+  sel.dataset.prev = sel.value;
+}
+
+async function loadFilament(rel) {
+  if (!rel) return;
+  const r = await fetch("/api/presets/filament/" + encodeURIComponent(rel));
+  const view = await r.json();
+  renderPresetForm($("#filamentForm"), view);
+  $("#saveFilamentBtn").disabled = !view.editable;
+  $("#saveFilamentBtn").onclick = async () => {
+    const r2 = await fetch("/api/presets/filament/" + encodeURIComponent(rel), {
+      method: "PATCH", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ fields: collectForm(rel) })
+    });
+    const j = await r2.json();
+    if (!r2.ok) { toast(j.detail || r2.statusText, 5000); return; }
+    toast("Filament saved");
+    presetDirty = false;
+    renderPresetForm($("#filamentForm"), j);
+  };
+}
+
 </script>
 </body>
 </html>

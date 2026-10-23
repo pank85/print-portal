@@ -118,6 +118,20 @@ hold* against `filter_process_by_machine`. It runs before anything is written, s
 `profile.json`, the stored pairing and the derived preset exactly as they were. A filament-only pick
 is never refused. This is the `-17` guard — see [presets.md](presets.md#3-the--17-rule).
 
+### Editing presets in the UI (current develop)
+
+| Method | Path | Purpose | Statuses |
+|---|---|---|---|
+| GET | `/api/presets?kind=machine\|process\|filament[&machine=<rel>]` | preset rows with `editable`, `read_only_reason`, `deletable` | 200 · 400 unknown kind |
+| GET | `/api/presets/{kind}/{rel}` | one preset's editable fields, effective values, `own`/`inherited` source | 200 · 404 not a preset of that kind · 400 unreadable |
+| PATCH | `/api/presets/{kind}/{rel}` | write overrides onto the preset's own file | 200 · 400 unknown key / bad value / `nothing to update` · 404 · 409 read-only |
+| DELETE | `/api/presets/{kind}/{rel}` (`machine` or `process`) | delete; a machine delete also deletes its processes | 200 `{deleted,cleared}` · 404 · 405 filament · 409 read-only |
+
+Only presets under `system/Custom/` are editable/deletable; the derived `print-portal-options.json`
+and vendor presets answer `409`. A machine delete also removes every `system/Custom/process` preset
+whose effective `compatible_printers` names that machine, and repairs `profile.json`,
+`default_print_profile` and printer pairings (`printers.json`).
+
 ## Routes that do not exist
 
 There is no authentication, no `/api/jobs/{jid}/cancel`, no printer delete-all, no logs endpoint, and

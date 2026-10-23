@@ -1440,3 +1440,89 @@ def api_profile_options(body: dict):
     write_profile_file(document)
     regenerate_derived(document)
     return {"ok": True, "options": merged}
+
+
+@app.get("/api/presets")
+def api_presets(kind: str, machine: str | None = None):
+    if kind not in ("machine", "process", "filament"):
+        raise HTTPException(400, f"unknown kind '{kind}'")
+    datadir = CONFIG.orca_datadir
+    presets = prof.list_presets(datadir)
+    if kind not in presets:
+        raise HTTPException(400, f"unknown kind '{kind}'")
+    rows = presets[kind]
+    if kind == "process" and machine:
+        target = _preset_path(machine)
+        if target is not None and _preset_type(target) == "machine":
+            chosen = prof.summarise(target, "machine", datadir)
+            rows = prof.filter_process_by_machine(rows, chosen)
+            active = partial_selection().get("process")
+            if active is not None:
+                active_rel = relative_to_datadir(active)
+                active_rows = [r for r in presets["process"]
+                               if r.get("rel") == active_rel]
+                rows = rows + [r for r in active_rows if r not in rows]
+    out = []
+    for row in rows:
+        path = _preset_path(row.get("rel"))
+        editable = False
+        reason = None
+        deletable = False
+        if path is not None:
+            reason = prof.preset_read_only_reason(datadir, path)
+            editable = reason is None
+            deletable = (kind in ("machine", "process") and editable
+                         and path.relative_to(datadir).as_posix()
+                         != prof.PORTAL_PROCESS_REL)
+        out.append({**row, "editable": editable,
+                    "read_only_reason": reason, "deletable": deletable})
+    return {"kind": kind, "presets": out}
+
+
+@app.get("/api/presets/{kind}/{rel:path}")
+def api_preset_get(kind: str, rel: str):
+    if kind not in ("machine", "process", "filament"):
+        raise HTTPException(400, f"unknown kind '{kind}'")
+    path = _preset_path(rel)
+    if path is None or _preset_type(path) != kind:
+        raise HTTPException(404, f"{kind}: '{rel}' is not a preset inside the datadir")
+    try:
+        return prof.preset_view(CONFIG.orca_datadir, kind, path)
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.patch("/api/presets/{kind}/{rel:path}")
+def api_preset_patch(kind: str, rel: str, body: dict):
+    if kind not in ("machine", "process", "filament"):
+        raise HTTPException(400, f"unknown kind '{kind}'")
+    path = _preset_path(rel)
+    if path is None or _preset_type(path) != kind:
+        raise HTTPException(404, f"{kind}: '{rel}' is not a preset inside the datadir")
+    fields = body.get("fields") if isinstance(body, dict) else None
+    if not isinstance(fields, dict):
+        raise HTTPException(400, "fields must be an object")
+    try:
+        return prof.apply_preset_patch(CONFIG.orca_datadir, kind, path, fields)
+    except prof.ProfileError as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
+
+
+@app.delete("/api/presets/{kind}/{rel:path}")
+def api_preset_delete(kind: str, rel: str):
+    if kind not in ("machine", "process"):
+        raise HTTPException(405, f"presets of kind '{kind}' cannot be deleted")
+    path = _preset_path(rel)
+    if path is None or _preset_type(path) != kind:
+        raise HTTPException(404, f"{kind}: '{rel}' is not a preset inside the datadir")
+    try:
+        deleted, cleared = prof.delete_preset(CONFIG.orca_datadir, kind, path)
+    except prof.ProfileError as exc:
+        raise HTTPException(exc.status, exc.detail) from exc
+    # best-effort repair of printers.json pairing slots
+    try:
+        printers.repair_deleted_presets(
+            {d["rel"] for d in deleted}, CONFIG.printers_file, CONFIG.secret_key_file)
+    except Exception:
+        pass
+    return {"deleted": deleted, "cleared": cleared}
