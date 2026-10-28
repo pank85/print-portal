@@ -5,8 +5,8 @@ and hands the resulting `.gcode` to Moonraker over HTTP. No database, no shared 
 printer host (`AGENTS.md`, `app/main.py` module docstring).
 
 **Two states are documented.** **A** = `develop` @ `dc92ca1` (this worktree). **B** = the uncommitted
-`ergo/20261022T123034Z-import-name` branch, read from a read-only snapshot of the live tree. The job
-pipeline below is the same in both; the seed contents and the preset behaviour are not — see
+`ergo/20261022T123034Z-import-name` branch, read from a read-only snapshot of the live tree. The historical upload pipeline below describes those states; the current
+reslice path is described separately below. The seed contents and the preset behaviour differ — see
 [presets.md](presets.md) and the `data/` table at the end.
 
 ## Components
@@ -94,6 +94,8 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
+    [*] --> awaiting_confirm: fin upload or reslice fork
+    awaiting_confirm --> queued: explicit slice confirmation
     [*] --> queued: POST /api/upload
     queued --> slicing: worker pops the id
     slicing --> sliced: gcode produced and moved
@@ -102,11 +104,11 @@ stateDiagram-v2
     sliced --> [*]: DELETE /api/jobs/{jid}
 ```
 
-`ACTIVE_STATUSES = ("queued", "slicing")` (`main.py:65`). Nothing in the UI, and no route, rewrites a
-terminal state. `prune()` keeps the `KEEP_JOBS` newest finished job directories and never removes an
+`ACTIVE_STATUSES = ("queued", "slicing")` (`main.py:65`). Reslice creates a new staged child rather than
+rewriting a terminal state. `prune()` keeps the `KEEP_JOBS` newest finished job directories and never removes an
 active one (`main.py:710-722`).
 
-### Staged jobs (support fins)
+### Staged jobs (support fins and reslice)
 
 `POST /api/upload` with `support_fins=true` is the one upload that does not end in `queued`: the CLI
 runs inside the request (`supportfins.fin_model`, serialised on `_RUN_LOCK`) and the job is written as
@@ -117,16 +119,39 @@ carries no OrcaSlicer identity metadata; the rewritten copy is then deleted, so 
 `slicer_input: None` and `threemf["rewrite"] == "discarded"` with an explanatory note.
 
 Because `awaiting_confirm` is absent from `ACTIVE_STATUSES`, such a job lists and deletes like a
-finished one but is excluded from age pruning via PRUNE_KEEP_STATUSES, while
-it under an open preview dialog. The worker never sees it, so `run_slice` needed no change.
+finished one but is excluded from age pruning via PRUNE_KEEP_STATUSES, including while a preview dialog is open. The worker does not see a staged job until it is queued.
 `GET /api/jobs/{jid}/preview` serves its geometry through `preview.read_scene` (stdlib `zipfile` +
 `ElementTree`), which is also why the preview cannot drift from the file that will be sliced.
+
+### Reslice children
+
+`POST /api/jobs/{source}/reslice` copies the source's retained canonical model into a new job's
+working upload and baseline. A request UUID makes retries for that source idempotent while the child
+exists. Source status, G-code and print metadata are not transferred or changed. ZIP uploads use the
+selected model; finned geometry and earlier manual scaling are retained, whereas source CLI
+orientation and auto-fit are recalculated. The child can outlive the source. Staged children can be
+resumed or deleted, are excluded from age pruning, and are also included in bulk deletion. Finished
+jobs are subject to `KEEP_JOBS`; pruning removes job directories, not the separate sliced-output
+copy. Active jobs and print uploads are protected from deletion and pruning.
+
+A child starts with source preset paths and slicing options, not historical preset contents. Local
+settings and geometry edits use a revision; stale operations fail rather than overwrite a newer draft.
+Resize modifies only the child, uniformly in millimetres, and reset restores its baseline. Preview
+parsing has byte, expanded ZIP, triangle and component-depth bounds and does not support external
+3MF references. A failed preview need not prevent settings-only slicing. On confirmation, the portal
+validates the local choices and writes job-owned machine, effective process and filament files with
+hashes, plus a prepared 3MF when needed. The worker uses those files rather than the legacy live-profile
+fallback. This pins directly loaded files, not the full datadir or embedded project/object overrides.
+3MF identity preflight can reject unreadable settings; 3MF and fin children cannot use auto-shrink,
+and fin orientation is suppressed. Queueing does not start printing.
 
 ### Concurrency
 
 One daemon thread (`worker`) consumes `queue.Queue`; slices are therefore serialised. `DERIVED_LOCK`
 (`main.py:94`) spans writing the derived process preset, building the argv and running the slicer, so
-a concurrent options save cannot replace the file a running slicer is loading.
+a concurrent options save cannot replace the file a running slicer is loading. `STAGE_LOCK`
+serializes job lifecycle changes and revision checks within the process; it is not a distributed lock.
+The worker claims queued jobs once, and print uploads hold an in-memory deletion pin.
 
 ## What lives in `data/` vs the image
 

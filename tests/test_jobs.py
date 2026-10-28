@@ -822,7 +822,7 @@ def test_run_slice_holds_the_derived_lock_across_the_launch(storage, switchable,
     def fake_run(cmd, **kwargs):
         # observed rather than asserted: `run_slice` turns anything the slicer raises into
         # a failed job, which would hide the reason
-        launch["lock_held"] = main.DERIVED_LOCK.locked()
+        launch["lock_held"] = main.DERIVED_LOCK._is_owned()
         saver.start()
         launch["attempted"] = attempting.wait(5)
         launch["entered_early"] = applied.wait(0.2)
@@ -1195,3 +1195,89 @@ def test_run_slice_slices_the_finned_3mf(storage, switchable, monkeypatch):
     assert "--orient" not in seen["cmd"]
     assert read_job(jobs, jid)["status"] == "sliced"
     assert (jobs / jid / "upload" / "cube.stl").read_text() == "solid cube\n"
+
+
+@pytest.mark.parametrize("status", ["queued", "slicing"])
+def test_single_delete_rejects_active_jobs(storage, api_client, status):
+    jobs, _ = storage
+    make_job(jobs, "decafbad1234", status)
+    assert api_client.delete("/api/jobs/decafbad1234").status_code == 409
+    assert (jobs / "decafbad1234").is_dir()
+
+
+def test_print_pin_blocks_delete_and_prune_until_upload_finishes(storage, monkeypatch):
+    jobs, sliced = storage
+    jid = "decafbad1234"
+    sliced_job(jobs, sliced, jid=jid)
+    entered, release = threading.Event(), threading.Event()
+
+    class BlockingClient(StubClient):
+        def upload(self, path, remote_name=None):
+            entered.set()
+            assert release.wait(5)
+            return super().upload(path, remote_name)
+
+    monkeypatch.setattr(main, "current_client", BlockingClient)
+    monkeypatch.setattr(main, "CONFIG", dataclasses.replace(main.CONFIG, keep_jobs=0))
+    errors = []
+
+    def do_print():
+        try:
+            main.api_print(jid)
+        except Exception as exc:
+            errors.append(exc)
+
+    thread = threading.Thread(target=do_print)
+    thread.start()
+    try:
+        assert entered.wait(5)
+        with pytest.raises(main.HTTPException) as exc:
+            main.api_delete(jid)
+        assert exc.value.status_code == 409
+        assert main.api_delete_all_jobs()["skipped_ids"] == [jid]
+        main.prune()
+        assert (jobs / jid).exists()
+        assert (sliced / jid / "Benchy v2.gcode").exists()
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert errors == []
+    assert jid not in main._PRINT_PINS
+    assert main.api_delete(jid) == {"deleted": jid}
+
+
+def test_print_pin_released_when_printer_client_fails(storage, monkeypatch):
+    jobs, sliced = storage
+    jid = "decafbad1234"
+    sliced_job(jobs, sliced, jid=jid)
+    def fail():
+        raise RuntimeError("unavailable")
+    monkeypatch.setattr(main, "current_client", fail)
+    with pytest.raises(RuntimeError, match="unavailable"):
+        main.api_print(jid)
+    assert jid not in main._PRINT_PINS
+    assert main.api_delete(jid) == {"deleted": jid}
+
+
+def test_queue_claim_is_atomic_and_stale_entries_are_ignored(storage):
+    jobs, _ = storage
+    jid = "decafbad1234"
+    make_job(jobs, jid, "queued")
+    barrier = threading.Barrier(3)
+    results = []
+
+    def claim():
+        barrier.wait()
+        results.append(main.claim_queued_job(jid))
+
+    threads = [threading.Thread(target=claim) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    barrier.wait()
+    for thread in threads:
+        thread.join(5)
+        assert not thread.is_alive()
+    assert sorted(results) == [False, True]
+    assert read_job(jobs, jid)["status"] == "slicing"
+    assert not main.claim_queued_job("aaaaaaaaaaaa")

@@ -31,13 +31,17 @@ Endpoints
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import functools
 import json
+import math
 import os
 import queue
 import re
 import shutil
 import subprocess
 import threading
+import tempfile
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -45,7 +49,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 
 import archives
 import config
@@ -100,16 +104,16 @@ SEED = (printers.SeededPrinter(id=printers.ENV_PRINTER_ID, name=CONFIG.env_print
         if CONFIG.env_printer_api_key else None)
 job_queue: "queue.Queue[str]" = queue.Queue()
 
-# A staged job enters the queue exactly once: the status check in /api/jobs/{jid}/slice and
-# the `put` that follows it run under this lock, so two "Slice it" clicks cannot both pass
-# the check and queue the same job twice.
-STAGE_LOCK = threading.Lock()
+# Serializes lifecycle decisions and metadata updates. Never held across printer HTTP or
+# the slicer subprocess; bounded file operations may temporarily block other requests.
+STAGE_LOCK = threading.RLock()
+_PRINT_PINS: dict[str, int] = {}
 
 # The derived process preset is shared state: `run_slice` writes it and launches the slicer
 # with it, `regenerate_derived` rewrites it from the options. Held across that whole span so
 # a concurrent option save cannot replace the file the running slicer is loading, which
 # would silently slice with the live options instead of the job's snapshot.
-DERIVED_LOCK = threading.Lock()
+DERIVED_LOCK = threading.RLock()
 
 
 # ---------------------------------------------------------------- printers
@@ -648,17 +652,18 @@ def write_job(jid: str, **fields) -> dict:
     A reader (the UI, `/api/jobs`) therefore sees either the old or the new file, never a
     half-written one.
     """
-    meta = job_dir(jid) / "job.json"
-    try:
-        data = json.loads(meta.read_text())
-    except (OSError, ValueError):
-        data = {"id": jid}
-    data.update(fields)
-    data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
-    tmp = meta.with_name(meta.name + ".tmp")
-    tmp.write_text(json.dumps(data, indent=2))
-    os.replace(tmp, meta)
-    return data
+    with STAGE_LOCK:
+        meta = job_dir(jid) / "job.json"
+        try:
+            data = json.loads(meta.read_text())
+        except (OSError, ValueError):
+            data = {"id": jid}
+        data.update(fields)
+        data["updated"] = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        tmp = meta.with_name(meta.name + ".tmp")
+        tmp.write_text(json.dumps(data, indent=2))
+        os.replace(tmp, meta)
+        return data
 
 
 # ---------------------------------------------------------------- slicer
@@ -690,6 +695,20 @@ def slice_profile(job: dict) -> tuple[dict[str, Path], dict[str, bool]]:
     /etc/passwd — and it falls back to the live selection otherwise, which is exactly what
     every job written before the snapshot existed does.
     """
+    if job.get("kind") == "reslice":
+        manifest = job.get("pinned_presets")
+        if not isinstance(manifest, dict) or manifest.get("version") != 1:
+            raise prof.ProfileError("reslice pinned presets are not available")
+        paths = {}
+        for kind in ("machine", "process", "filament"):
+            path = job_dir(job["id"]) / "pinned" / f"{kind}.json"
+            try:
+                if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sha256"][kind]:
+                    raise ValueError("hash mismatch")
+            except (OSError, KeyError, TypeError, ValueError) as exc:
+                raise prof.ProfileError(f"reslice pinned {kind} is unavailable or changed") from exc
+            paths[kind] = path
+        return paths, prof.read_options({"options": manifest.get("options")})
     snapshot = job.get("profile_snapshot")
     if isinstance(snapshot, dict):
         paths: dict[str, Path] = {}
@@ -780,7 +799,8 @@ def run_slice(jid: str) -> None:
     # of this job's snapshot.
     with DERIVED_LOCK:
         try:
-            process = prof.write_derived_process(paths["process"], CONFIG.orca_datadir, options)
+            process = (paths["process"] if job.get("kind") == "reslice" else
+                       prof.write_derived_process(paths["process"], CONFIG.orca_datadir, options))
         except Exception as exc:  # noqa: BLE001 - a job error, never a stale-options slice
             write_job(jid, status="failed", error=f"profile: {type(exc).__name__}: {exc}")
             return
@@ -830,10 +850,25 @@ def run_slice(jid: str) -> None:
         write_job(jid, status="failed", error=f"{type(exc).__name__}: {exc}")
 
 
+def claim_queued_job(jid: str) -> bool:
+    """Claim a queued item once, before touching its files; ignore stale queue entries."""
+    with STAGE_LOCK:
+        try:
+            job = read_job(jid)
+        except HTTPException:
+            return False
+        if job.get("status") != "queued":
+            return False
+        write_job(jid, status="slicing", error=None, started=time.time())
+        return True
+
+
 def worker() -> None:
     while True:
         jid = job_queue.get()
         try:
+            if not claim_queued_job(jid):
+                continue
             run_slice(jid)
         except Exception as exc:  # noqa: BLE001
             try:
@@ -857,11 +892,12 @@ def prune() -> None:
         except (OSError, ValueError, AttributeError):
             return False        # a missing or corrupt job.json is not a reason to keep the dir
 
-    dirs = sorted([d for d in JOBS.iterdir() if d.is_dir()],
-                  key=lambda p: p.stat().st_mtime, reverse=True)
-    finished = [d for d in dirs if not is_kept(d)]
-    for old in finished[CONFIG.keep_jobs:]:
-        shutil.rmtree(old, ignore_errors=True)
+    with STAGE_LOCK:
+        dirs = sorted([d for d in JOBS.iterdir() if d.is_dir() and JOB_ID_RE.fullmatch(d.name)],
+                      key=lambda p: p.stat().st_mtime, reverse=True)
+        finished = [d for d in dirs if not is_kept(d) and not _PRINT_PINS.get(d.name)]
+        for old in finished[CONFIG.keep_jobs:]:
+            shutil.rmtree(old, ignore_errors=True)
 
 
 @asynccontextmanager
@@ -1251,28 +1287,259 @@ async def api_upload(request: Request, file: UploadFile = File(...),
     return body
 
 
-@app.post("/api/jobs/{jid}/slice")
-def api_confirm_slice(jid: str):
-    """Enter the queue for a staged (fins) job — the preview dialog's *Slice it*.
+def _canonical_model(jid: str, job: dict) -> Path:
+    """Resolve a retained model without following job-owned symlinks."""
+    name = job.get("filename")
+    if (not isinstance(name, str) or not name or name in (".", "..")
+            or Path(name).name != name or "\\" in name
+            or Path(name).suffix.lower() not in {".stl", ".obj", ".3mf"}):
+        raise HTTPException(409, "retained geometry unavailable")
+    directory = job_dir(jid)
+    upload = directory / "upload"
+    model = upload / name
+    if directory.is_symlink() or upload.is_symlink() or model.is_symlink():
+        raise HTTPException(409, "retained geometry unavailable")
+    try:
+        if not model.is_file() or not model.resolve().is_relative_to(directory.resolve()):
+            raise HTTPException(409, "retained geometry unavailable")
+    except OSError:
+        raise HTTPException(409, "retained geometry unavailable") from None
+    return model
 
-    Only an ``awaiting_confirm`` job may move, and the check-plus-queue is one critical
-    section, so a double click is a 409 rather than a second queue entry.
-    """
-    require_selection()
+
+def _job_capabilities(job: dict) -> dict:
+    result = dict(job)
+    eligible = job.get("status") in ("sliced", "failed")
+    reason = None if eligible else "job is not completed or failed"
+    if eligible:
+        try:
+            _canonical_model(job.get("id", ""), job)
+        except HTTPException:
+            eligible, reason = False, "retained geometry unavailable"
+    result["reslice"] = {"eligible": eligible, "reason": reason}
+    if job.get("kind") == "reslice":
+        editable = job.get("status") == "awaiting_confirm"
+        geometry = {"preview_available": False, "resize_available": False,
+                    "reason": "geometry unavailable"}
+        if editable:
+            try:
+                geometry = preview.geometry_capability(_canonical_model(job["id"], job))
+            except (HTTPException, OSError):
+                pass
+        result["staging"] = {"settings_editable": editable, **geometry}
+    return result
+
+
+@app.post("/api/jobs/{jid}/reslice")
+def api_reslice(jid: str, body: dict):
+    if set(body) != {"request_id"} or not isinstance(body.get("request_id"), str):
+        raise HTTPException(422, "request_id must be a UUID")
+    token = body["request_id"]
+    try:
+        if len(token) != 36 or str(uuid.UUID(token)) != token.lower():
+            raise ValueError
+        token = str(uuid.UUID(token))
+    except ValueError:
+        raise HTTPException(422, "request_id must be a UUID") from None
+    with STAGE_LOCK:
+        for directory in JOBS.iterdir():
+            if not JOB_ID_RE.fullmatch(directory.name) or directory.is_symlink():
+                continue
+            try:
+                existing = read_job(directory.name)
+            except HTTPException:
+                continue
+            if (existing.get("kind") == "reslice" and existing.get("source_job_id") == jid
+                    and existing.get("reslice_request_id") == token):
+                return JSONResponse(_job_capabilities(existing), status_code=200)
+        source = read_job(jid)
+        if source.get("status") not in ("sliced", "failed"):
+            raise HTTPException(409, "source job is not completed or failed")
+        model = _canonical_model(jid, source)
+        child_id = uuid.uuid4().hex[:12]
+        while (JOBS / child_id).exists():
+            child_id = uuid.uuid4().hex[:12]
+        staging = Path(tempfile.mkdtemp(prefix=".reslice-", dir=JOBS))
+        try:
+            (staging / "upload").mkdir()
+            shutil.copyfile(model, staging / "upload" / model.name)
+            shutil.copyfile(model, staging / "baseline")
+            snapshot = source.get("profile_snapshot")
+            snapshot = snapshot if isinstance(snapshot, dict) else {}
+            options = snapshot.get("options")
+            options = options if isinstance(options, dict) else {}
+            local_snapshot = {key: snapshot.get(key) for key in ("machine", "process", "filament")}
+            local_snapshot["options"] = {key: options[key] for key in
+                                         ("supports", "brim", "auto_orient", "shrink_to_fit")
+                                         if type(options.get(key)) is bool}
+            now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+            child = {"id": child_id, "kind": "reslice", "source_job_id": jid,
+                     "reslice_request_id": token, "created": now, "updated": now,
+                     "status": "awaiting_confirm", "revision": 0, "filename": model.name,
+                     "output_name": normalise_output_name(source.get("output_name"), model.stem),
+                     "model_bytes": model.stat().st_size, "profile_snapshot": local_snapshot,
+                     "manual_scale": 1.0,
+                     "profile_warning": "Preset references use current contents, not historical preset bytes."}
+            for key in ("support_fins", "fins"):
+                if key in source:
+                    child[key] = source[key]
+            (staging / "job.json").write_text(json.dumps(child, indent=2))
+            os.rename(staging, JOBS / child_id)
+        finally:
+            shutil.rmtree(staging, ignore_errors=True)
+        return JSONResponse(_job_capabilities(child), status_code=201)
+
+
+@app.patch("/api/jobs/{jid}/settings")
+def api_reslice_settings(jid: str, body: dict):
+    if set(body) - {"revision", "profile", "options"} or type(body.get("revision")) is not int:
+        raise HTTPException(422, "expected revision and optional profile and options")
+    profile = body.get("profile", {})
+    options = body.get("options", {})
+    if not isinstance(profile, dict) or set(profile) - {"machine", "process", "filament"}:
+        raise HTTPException(422, "invalid profile fields")
+    if not isinstance(options, dict) or set(options) - {"supports", "brim", "auto_orient", "shrink_to_fit"}:
+        raise HTTPException(422, "invalid options fields")
+    if options:
+        try:
+            prof.validate_options(options)
+        except prof.ProfileError as exc:
+            raise HTTPException(422, str(exc)) from exc
     with STAGE_LOCK:
         job = read_job(jid)
-        if job.get("status") != "awaiting_confirm":
-            raise HTTPException(
-                409, f"job is '{job.get('status')}', not awaiting confirmation")
-        write_job(jid, status="queued")
-        job_queue.put(jid)
+        if job.get("kind") != "reslice" or job.get("status") != "awaiting_confirm":
+            raise HTTPException(409, "job is not a staged reslice")
+        if body["revision"] != job.get("revision"):
+            raise HTTPException(409, "stale revision")
+        snapshot = dict(job.get("profile_snapshot") or {})
+        merged = {key: snapshot.get(key) for key in ("machine", "process", "filament")}
+        for key, value in profile.items():
+            if not isinstance(value, str) or not value or Path(value).is_absolute():
+                raise HTTPException(400, f"{key}: expected a relative preset path")
+            _profile_rel(key, value)
+            merged[key] = value
+        # Existing unresolved slots may be repaired one at a time; validate every nonempty
+        # effective reference rather than silently falling back to global selections.
+        for key, value in merged.items():
+            if value is not None:
+                if not isinstance(value, str) or not value or Path(value).is_absolute():
+                    raise HTTPException(400, f"{key}: invalid preset reference")
+                _profile_rel(key, value)
+        if merged["machine"] and merged["process"]:
+            _reject_unpermitted_pair({"machine": merged["machine"]}, merged)
+        snapshot.update(merged)
+        snapshot["options"] = {**snapshot.get("options", {}), **options}
+        updated = write_job(jid, profile_snapshot=snapshot, revision=job["revision"] + 1)
+        return _job_capabilities(updated)
+
+
+@app.post("/api/jobs/{jid}/slice")
+def api_confirm_slice(jid: str, body: dict | None = None):
+    with STAGE_LOCK:
+        job = read_job(jid)
+        is_reslice = job.get("kind") == "reslice"
+        if is_reslice:
+            if not isinstance(body, dict) or set(body) != {"revision"} or type(body.get("revision")) is not int:
+                raise HTTPException(422, "expected revision")
+            _reslice_revision(job, body)
+    if not is_reslice:
+        require_selection()
+        with STAGE_LOCK:
+            job = read_job(jid)
+            if job.get("kind") == "reslice" or job.get("status") != "awaiting_confirm":
+                raise HTTPException(409, f"job is '{job.get('status')}', not awaiting confirmation")
+            write_job(jid, status="queued")
+            job_queue.put(jid)
+        return {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
+
+    # Copy bounded geometry while protected; capture presets without lifecycle lock and
+    # recheck revision before publishing. Concurrent edits discard this preparation.
+    with tempfile.TemporaryDirectory(prefix="reslice-confirm-", dir=TMP_DIR) as temporary:
+        temp = Path(temporary)
+        with STAGE_LOCK:
+            job = read_job(jid)
+            _reslice_revision(job, body)
+            model = _canonical_model(jid, job)
+            model_copy = temp / ("model" + model.suffix.lower())
+            if model_copy.suffix == ".3mf" and model.stat().st_size > threemf.IDENTITY_SOURCE_MAX_BYTES:
+                raise HTTPException(400, "reslice preflight: 3MF exceeds the compressed size limit")
+            shutil.copyfile(model, model_copy)
+            snapshot = dict(job.get("profile_snapshot") or {})
+        with DERIVED_LOCK:
+            paths = {}
+            for kind in ("machine", "process", "filament"):
+                rel = snapshot.get(kind)
+                if not isinstance(rel, str) or not rel or Path(rel).is_absolute():
+                    raise HTTPException(400, f"{kind}: select a local preset")
+                _profile_rel(kind, rel)
+                paths[kind] = _preset_path(rel)
+            _reject_unpermitted_pair({"machine": snapshot["machine"]}, snapshot)
+            try:
+                raw_options = snapshot.get("options", {})
+                if not isinstance(raw_options, dict):
+                    raise prof.ProfileError("invalid options")
+                if raw_options:
+                    prof.validate_options(raw_options)
+                options = prof.read_options(snapshot)
+                if options["shrink_to_fit"] and (model_copy.suffix == ".3mf" or job.get("support_fins")):
+                    raise prof.ProfileError("shrink to fit is unavailable for 3MF or support fins")
+                machine_bytes = paths["machine"].read_bytes()
+                filament_bytes = paths["filament"].read_bytes()
+                machine = json.loads(machine_bytes)
+                process = prof.derived_process_data(paths["process"], CONFIG.orca_datadir, options)
+                process_bytes = json.dumps(process, indent=2).encode()
+                if model_copy.suffix == ".3mf":
+                    rewritten, outcome = threemf.rewrite_identity_strict(model_copy.read_bytes(), machine, process)
+                    model_copy.write_bytes(rewritten)
+                else:
+                    outcome = None
+            except (OSError, ValueError, prof.ProfileError) as exc:
+                raise HTTPException(400, f"reslice preflight: {exc}") from exc
+        pinned = temp / "pinned"
+        pinned.mkdir()
+        hashes = {}
+        for kind, data in (("machine", machine_bytes), ("process", process_bytes), ("filament", filament_bytes)):
+            (pinned / f"{kind}.json").write_bytes(data)
+            hashes[kind] = hashlib.sha256(data).hexdigest()
+        with STAGE_LOCK:
+            job = read_job(jid)
+            _reslice_revision(job, body)
+            d = job_dir(jid)
+            prepared_name = f"reslice-prepared-{uuid.uuid4().hex}.3mf" if model_copy.suffix == ".3mf" else None
+            target = d / "pinned"
+            try:
+                os.replace(pinned, target)
+                if prepared_name:
+                    os.replace(model_copy, d / "upload" / prepared_name)
+                write_job(jid, status="queued", revision=job["revision"] + 1,
+                          slicer_input=prepared_name, identity_rewrite=outcome,
+                          pinned_presets={"version": 1, "sha256": hashes, "options": options})
+            except Exception:
+                shutil.rmtree(target, ignore_errors=True)
+                if prepared_name:
+                    (d / "upload" / prepared_name).unlink(missing_ok=True)
+                raise
+            job_queue.put(jid)
     return {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
 
 
 @app.get("/api/jobs/{jid}/preview")
 def api_preview(jid: str):
     """Geometry of the job's finned 3MF, or still pictures when that mesh is too large."""
-    job = read_job(jid)
+    with STAGE_LOCK:
+        job = read_job(jid)
+        if job.get("kind") == "reslice":
+            if job.get("status") != "awaiting_confirm":
+                raise HTTPException(409, "job is not awaiting confirmation")
+            path = _canonical_model(jid, job)
+            try:
+                scene = preview.read_scene(path)
+                geometry = preview.geometry_capability(path)
+            except (preview.PreviewError, OSError) as exc:
+                raise HTTPException(409, f"preview unavailable: {exc}") from exc
+            return {"job": jid, "mode": "scene", **scene, "fins": job.get("fins"),
+                    "original": job.get("original"), "revision": job["revision"],
+                    "manual_scale": job.get("manual_scale", 1.0), **geometry}
     if not job.get("support_fins") or not job.get("fins"):
         raise HTTPException(409, "preview unavailable: this job has no support fins")
     # job.json is a file on disk: `.name` keeps a hand-edited one from resolving outside
@@ -1303,8 +1570,8 @@ def api_preview_shot(jid: str, view: str = "front"):
     if view not in ("front", "side"):
         raise HTTPException(400, "view must be front or side")
     job = read_job(jid)
-    if not job.get("support_fins"):
-        raise HTTPException(409, "preview unavailable: this job has no support fins")
+    if job.get("kind") == "reslice" or not job.get("support_fins"):
+        raise HTTPException(409, "preview unavailable: still pictures only support legacy fin jobs")
     name = Path(job.get("filename") or "").name
     path = job_dir(jid) / "upload" / name
     cache = job_dir(jid) / "shots" / f"{view}.png"
@@ -1321,7 +1588,14 @@ def api_preview_shot(jid: str, view: str = "front"):
 
 @app.post("/api/jobs/{jid}/scale")
 def api_scale(jid: str, payload: dict):
-    job = read_job(jid)
+    with STAGE_LOCK:
+        job = read_job(jid)
+        if job.get("kind") == "reslice":
+            return _scale_reslice(jid, job, payload)
+        return _scale_fins(jid, job, payload)
+
+
+def _scale_fins(jid: str, job: dict, payload: dict):
     if not job.get("support_fins"):
         raise HTTPException(409, "scaling only applies to support-fins jobs")
     if job.get("status") != "awaiting_confirm":
@@ -1359,6 +1633,112 @@ def api_scale(jid: str, payload: dict):
             "size": new_scene["bbox"]["size"]}
 
 
+def _reslice_revision(job: dict, payload: dict) -> None:
+    if job.get("kind") != "reslice" or job.get("status") != "awaiting_confirm":
+        raise HTTPException(409, "job is not a staged reslice")
+    if type(payload.get("revision")) is not int:
+        raise HTTPException(422, "revision must be an integer")
+    if payload["revision"] != job.get("revision"):
+        raise HTTPException(409, "stale revision")
+
+
+def _commit_reslice_geometry(jid: str, job: dict, path: Path, candidate: Path,
+                             manual_scale: float) -> dict:
+    # Keep a sibling backup until metadata is committed; both replacements are on the
+    # same filesystem. The lifecycle lock prevents readers seeing the interim state.
+    with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as f:
+        backup = Path(f.name)
+    try:
+        shutil.copyfile(path, backup)
+        os.replace(candidate, path)
+        try:
+            updated = write_job(jid, revision=job["revision"] + 1,
+                                manual_scale=manual_scale, slicer_input=None)
+        except Exception:
+            os.replace(backup, path)
+            raise
+    finally:
+        backup.unlink(missing_ok=True)
+        candidate.unlink(missing_ok=True)
+    old_input = job.get("slicer_input")
+    if isinstance(old_input, str) and Path(old_input).name == old_input and old_input != path.name:
+        try:
+            (path.parent / old_input).unlink(missing_ok=True)
+        except OSError:
+            pass  # Metadata no longer references this disposable cache.
+    shutil.rmtree(job_dir(jid) / "shots", ignore_errors=True)
+    return updated
+
+
+def _scale_reslice(jid: str, job: dict, payload: dict) -> dict:
+    _reslice_revision(job, payload)
+    axes = {"width": 0, "depth": 1, "height": 2}
+    selected = set(payload) - {"revision"}
+    if len(selected) != 1 or not selected <= axes.keys():
+        raise HTTPException(422, "provide exactly one of width, depth or height")
+    axis = next(iter(selected))
+    value = payload[axis]
+    if type(value) not in (int, float):
+        raise HTTPException(422, "size must be a finite positive number")
+    try:
+        value = float(value)
+    except OverflowError:
+        raise HTTPException(422, "size must be a finite positive number") from None
+    if not math.isfinite(value) or not 0 < value <= 10000:
+        raise HTTPException(422, "size must be finite, positive and at most 10000 mm")
+    path = _canonical_model(jid, job)
+    candidate = None
+    try:
+        scene = preview.read_scene(path)
+        current = scene["bbox"]["size"][axes[axis]]
+        if not math.isfinite(current) or current <= 0:
+            raise HTTPException(400, "cannot scale a zero-size model")
+        factor = value / current
+        cumulative = job.get("manual_scale", 1.0) * factor
+        if not math.isfinite(factor) or not 0 < factor <= 100 or not math.isfinite(cumulative) or cumulative <= 0:
+            raise HTTPException(400, "resulting scale is out of range")
+        with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as f:
+            candidate = Path(f.name)
+        preview.scale_file(path, factor, candidate)
+        size = preview.read_scene(candidate)["bbox"]["size"]
+        updated = _commit_reslice_geometry(jid, job, path, candidate, cumulative)
+        return {"job": jid, "filename": path.name, "factor": factor, "size": size,
+                "revision": updated["revision"], "manual_scale": cumulative, "unit": "millimeter"}
+    except (preview.PreviewError, OSError) as exc:
+        raise HTTPException(409, f"resize unavailable: {exc}") from exc
+    finally:
+        if candidate is not None:
+            candidate.unlink(missing_ok=True)
+
+
+@app.post("/api/jobs/{jid}/scale/reset")
+def api_scale_reset(jid: str, payload: dict):
+    with STAGE_LOCK:
+        job = read_job(jid)
+        _reslice_revision(job, payload)
+        if set(payload) != {"revision"}:
+            raise HTTPException(422, "expected revision only")
+        path = _canonical_model(jid, job)
+        baseline = job_dir(jid) / "baseline"
+        if baseline.is_symlink() or not baseline.is_file():
+            raise HTTPException(409, "baseline geometry unavailable")
+        candidate = None
+        try:
+            with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as f:
+                candidate = Path(f.name)
+            shutil.copyfile(baseline, candidate)
+            # Reset must also work for unsupported preview geometry.
+            geometry = preview.geometry_capability(candidate)
+            updated = _commit_reslice_geometry(jid, job, path, candidate, 1.0)
+            return {"job": jid, "revision": updated["revision"], "manual_scale": 1.0,
+                    "size": geometry["size"], "unit": "millimeter"}
+        except OSError as exc:
+            raise HTTPException(409, f"reset unavailable: {exc}") from exc
+        finally:
+            if candidate is not None:
+                candidate.unlink(missing_ok=True)
+
+
 @app.get("/api/support-fins")
 def api_support_fins():
     """Whether the fins checkbox can be offered — always 200, the page asks."""
@@ -1370,20 +1750,22 @@ def api_support_fins():
 
 @app.get("/api/jobs")
 def api_jobs():
-    out = []
-    for d in sorted(JOBS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
-        meta = d / "job.json"
-        if meta.exists():
-            try:
-                out.append(json.loads(meta.read_text()))
-            except json.JSONDecodeError:
-                continue
-    return out
+    with STAGE_LOCK:
+        out = []
+        for d in sorted(JOBS.iterdir(), key=lambda p: p.stat().st_mtime, reverse=True):
+            meta = d / "job.json"
+            if meta.exists():
+                try:
+                    out.append(_job_capabilities(json.loads(meta.read_text())))
+                except json.JSONDecodeError:
+                    continue
+        return out
 
 
 @app.get("/api/jobs/{jid}")
 def api_job(jid: str):
-    return read_job(jid)
+    with STAGE_LOCK:
+        return _job_capabilities(read_job(jid))
 
 
 @app.get("/api/jobs/{jid}/gcode")
@@ -1397,63 +1779,76 @@ def api_gcode(jid: str):
 
 @app.post("/api/jobs/{jid}/print")
 def api_print(jid: str):
-    job = read_job(jid)
-    if job.get("status") != "sliced":
-        raise HTTPException(409, f"job is '{job.get('status')}', not sliced")
-    gcode = gcode_path(jid, job)
-    if gcode is None:
-        raise HTTPException(409, "not sliced yet")
+    with STAGE_LOCK:
+        job = read_job(jid)
+        if job.get("status") != "sliced":
+            raise HTTPException(409, f"job is '{job.get('status')}', not sliced")
+        gcode = gcode_path(jid, job)
+        if gcode is None:
+            raise HTTPException(409, "not sliced yet")
 
-    client = current_client()
+        _PRINT_PINS[jid] = _PRINT_PINS.get(jid, 0) + 1
     try:
-        info = client.printer_status()
-    except moonraker.MoonrakerError as exc:
-        raise HTTPException(exc.http_status, str(exc)) from exc
-    if info["webhooks"] != "ready":
-        raise HTTPException(409, f"klipper not ready: {info['webhooks']}")
-    if info["state"] not in ("standby", "complete"):
-        raise HTTPException(409, f"printer busy: state={info['state']}")
+        client = current_client()
+        try:
+            info = client.printer_status()
+        except moonraker.MoonrakerError as exc:
+            raise HTTPException(exc.http_status, str(exc)) from exc
+        if info["webhooks"] != "ready":
+            raise HTTPException(409, f"klipper not ready: {info['webhooks']}")
+        if info["state"] not in ("standby", "complete"):
+            raise HTTPException(409, f"printer busy: state={info['state']}")
 
-    remote_name = f"portal_{jid}_{job_output_name(job)}.gcode"[:90]
-    try:
-        client.upload(gcode, remote_name)
-        client.start_print(remote_name)
-    except moonraker.MoonrakerError as exc:
-        write_job(jid, print_started=False, print_error=str(exc)[-300:])
-        raise HTTPException(exc.http_status, str(exc)) from exc
+        remote_name = f"portal_{jid}_{job_output_name(job)}.gcode"[:90]
+        try:
+            client.upload(gcode, remote_name)
+            client.start_print(remote_name)
+        except moonraker.MoonrakerError as exc:
+            write_job(jid, print_started=False, print_error=str(exc)[-300:])
+            raise HTTPException(exc.http_status, str(exc)) from exc
 
-    write_job(jid, printed=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-              remote_file=remote_name, print_started=True, print_error=None)
-    return {"started": True, "remote_file": remote_name}
+        write_job(jid, printed=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                  remote_file=remote_name, print_started=True, print_error=None)
+        return {"started": True, "remote_file": remote_name}
+    finally:
+        with STAGE_LOCK:
+            _PRINT_PINS[jid] -= 1
+            if not _PRINT_PINS[jid]:
+                del _PRINT_PINS[jid]
 
 
 @app.delete("/api/jobs")
 def api_delete_all_jobs():
     """Bulk cleanup of finished jobs. Every path comes from JOBS itself, never the request."""
-    deleted: list[str] = []
-    skipped: list[str] = []
-    for d in sorted(JOBS.iterdir()):
-        if not d.is_dir() or not JOB_ID_RE.fullmatch(d.name):
-            continue
-        try:
-            status = json.loads((d / "job.json").read_text()).get("status")
-        except (OSError, ValueError, AttributeError):
-            status = None
-        if status in ACTIVE_STATUSES:
-            skipped.append(d.name)
-            continue
-        shutil.rmtree(d, ignore_errors=True)
-        shutil.rmtree(SLICED / d.name, ignore_errors=True)
-        deleted.append(d.name)
-    return {"deleted": len(deleted), "skipped": len(skipped),
-            "deleted_ids": deleted, "skipped_ids": skipped}
+    with STAGE_LOCK:
+        deleted: list[str] = []
+        skipped: list[str] = []
+        for d in sorted(JOBS.iterdir()):
+            if not d.is_dir() or not JOB_ID_RE.fullmatch(d.name):
+                continue
+            try:
+                status = json.loads((d / "job.json").read_text()).get("status")
+            except (OSError, ValueError, AttributeError):
+                status = None
+            if status in ACTIVE_STATUSES or _PRINT_PINS.get(d.name):
+                skipped.append(d.name)
+                continue
+            shutil.rmtree(d, ignore_errors=True)
+            shutil.rmtree(SLICED / d.name, ignore_errors=True)
+            deleted.append(d.name)
+        return {"deleted": len(deleted), "skipped": len(skipped),
+                "deleted_ids": deleted, "skipped_ids": skipped}
 
 
 @app.delete("/api/jobs/{jid}")
 def api_delete(jid: str):
-    shutil.rmtree(job_dir(jid), ignore_errors=True)
-    shutil.rmtree(SLICED / jid, ignore_errors=True)
-    return {"deleted": jid}
+    with STAGE_LOCK:
+        job = read_job(jid)
+        if job.get("status") in ACTIVE_STATUSES or _PRINT_PINS.get(jid):
+            raise HTTPException(409, "job is active or being printed")
+        shutil.rmtree(job_dir(jid), ignore_errors=True)
+        shutil.rmtree(SLICED / jid, ignore_errors=True)
+        return {"deleted": jid}
 
 
 # ---------------------------------------------------------------- profiles
@@ -1556,7 +1951,8 @@ async def api_profile_upload(request: Request, file: UploadFile = File(...)):
     if not name.lower().endswith(PROFILE_BUNDLE_SUFFIXES):
         raise HTTPException(400, "expected an .orca_printer bundle or a preset .json")
     try:
-        result = prof.import_into(CONFIG.orca_datadir, blob, name, CONFIG.bed_size)
+        with DERIVED_LOCK:
+            result = prof.import_into(CONFIG.orca_datadir, blob, name, CONFIG.bed_size)
     except prof.ProfileError as exc:
         raise HTTPException(400, str(exc)) from exc
     result["ok"] = bool(result["imported"])
@@ -1667,7 +2063,16 @@ def api_preset_get(kind: str, rel: str):
         raise HTTPException(400, str(exc)) from exc
 
 
+def _preset_mutation_locked(func):
+    @functools.wraps(func)
+    def wrapped(*args, **kwargs):
+        with DERIVED_LOCK:
+            return func(*args, **kwargs)
+    return wrapped
+
+
 @app.patch("/api/presets/{kind}/{rel:path}")
+@_preset_mutation_locked
 def api_preset_patch(kind: str, rel: str, body: dict):
     if kind not in ("machine", "process", "filament"):
         raise HTTPException(400, f"unknown kind '{kind}'")
@@ -1684,6 +2089,7 @@ def api_preset_patch(kind: str, rel: str, body: dict):
 
 
 @app.delete("/api/presets/{kind}/{rel:path}")
+@_preset_mutation_locked
 def api_preset_delete(kind: str, rel: str):
     if kind not in ("machine", "process"):
         raise HTTPException(405, f"presets of kind '{kind}' cannot be deleted")

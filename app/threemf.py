@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import io
 import json
+import lzma
 import re
 import shutil
 import zipfile
@@ -174,11 +175,11 @@ def _printer_model_id(raw: bytes) -> str | None:
 
 
 _ARCHIVE_ERRORS = (zipfile.BadZipFile, zipfile.LargeZipFile, OSError, RuntimeError,
-                   ValueError, MemoryError, zlib.error)
+                   ValueError, MemoryError, zlib.error, lzma.LZMAError)
 """Everything reading a hostile archive can raise here.
 
-``RuntimeError`` is zipfile's "file is encrypted", ``zlib.error`` a corrupt deflate
-stream, ``MemoryError`` an allocation that cannot be satisfied, ``zipfile.BadZipFile`` a
+``RuntimeError`` is zipfile's "file is encrypted", ``zlib.error`` and ``lzma.LZMAError``
+are corrupt compressed streams, ``MemoryError`` an allocation that cannot be satisfied, ``zipfile.BadZipFile`` a
 broken central directory or member CRC, and ``ValueError`` covers a member name or JSON/XML
 payload that cannot be decoded.
 """
@@ -581,6 +582,74 @@ def _rezip(archive: zipfile.ZipFile, replacements: dict[str, bytes],
                 with archive.open(item) as source, target.open(clone, "w") as sink:
                     shutil.copyfileobj(source, sink)
     return out.getvalue()
+
+
+IDENTITY_SOURCE_MAX_BYTES = 32 * 1024 * 1024
+IDENTITY_EXPANDED_MAX_BYTES = 128 * 1024 * 1024
+
+
+class IdentityPreflightError(ValueError):
+    """The embedded settings or archive cannot safely be prepared for a reslice."""
+
+
+def rewrite_identity_strict(blob: bytes, machine: dict, process: dict) -> tuple[bytes, str]:
+    """Bound and validate a reslice archive before the existing pure identity rewrite.
+
+    The total expanded bound also limits the work performed by the subsequent rezip.
+    This deliberately leaves ordinary upload handling unchanged.
+    """
+    if len(blob) > IDENTITY_SOURCE_MAX_BYTES:
+        raise IdentityPreflightError("3MF exceeds the compressed size limit")
+    if not _text(machine.get("name")) or not _text(process.get("name")):
+        raise IdentityPreflightError("selected presets must have names")
+    recognized = {name.lower() for name in SETTINGS_MEMBERS}
+    seen: set[str] = set()
+    total = 0
+    present = False
+    try:
+        with zipfile.ZipFile(io.BytesIO(blob)) as archive:
+            for item in archive.infolist():
+                name = item.filename.replace("\\", "/").lower()
+                is_settings = name in recognized
+                if is_settings:
+                    if name in seen:
+                        raise IdentityPreflightError("duplicate 3MF settings member")
+                    seen.add(name)
+                    present = True
+                limit = MEMBER_MAX_BYTES if is_settings else IDENTITY_EXPANDED_MAX_BYTES
+                if item.file_size > limit or total + item.file_size > IDENTITY_EXPANDED_MAX_BYTES:
+                    raise IdentityPreflightError("3MF expanded data exceeds the limit")
+                chunks = []
+                size = 0
+                with archive.open(item) as source:
+                    while True:
+                        chunk = source.read(65536)
+                        if not chunk:
+                            break
+                        size += len(chunk)
+                        total += len(chunk)
+                        if size > limit or total > IDENTITY_EXPANDED_MAX_BYTES:
+                            raise IdentityPreflightError("3MF expanded data exceeds the limit")
+                        if is_settings:
+                            chunks.append(chunk)
+                if is_settings:
+                    raw = b"".join(chunks)
+                    if name == PROJECT_SETTINGS_MEMBER.lower():
+                        if not isinstance(json.loads(raw), dict):
+                            raise IdentityPreflightError("invalid 3MF project settings")
+                    else:
+                        text = raw.decode("utf-8")
+                        if any("=" not in line.strip() for line in text.splitlines()
+                               if line.strip() and not line.strip().startswith(("#", ";"))):
+                            raise IdentityPreflightError("invalid 3MF slicer settings")
+        result, outcome = rewrite_identity(blob, machine, process)
+        if present and outcome == "none":
+            raise IdentityPreflightError("3MF identity could not be rewritten")
+        return result, outcome
+    except IdentityPreflightError:
+        raise
+    except _MEMBER_READ_ERRORS as exc:
+        raise IdentityPreflightError("3MF settings or archive are unreadable") from exc
 
 
 def rewrite_identity(blob: bytes, machine: dict | None,

@@ -1,18 +1,11 @@
 # API
 
-Every route registered by `app/main.py` (`@app.…` decorators). The inventory below was captured when
-there were exactly 21 and the route **set** was identical in both states:
+The reslice section and job routes below describe the current implementation. Historical A/B
+comparisons elsewhere in this document do not describe the reslice changes.
 
-* **A** = `develop` @ `dc92ca1` (this worktree, `main.py` 1208 lines);
-* **B** = the uncommitted `ergo/20261022T123034Z-import-name` branch, read from a read-only snapshot
-  (`main.py` 1308 lines, `main.py:750-1308`).
-
-Line numbers quoted below are from B unless marked otherwise. Only the preset routes and
-`POST /api/upload` behave differently — see [Presets](#presets). Everything else is unchanged between
-the two states. The support-fins work adds three routes on top of that set (`POST
-/api/jobs/{jid}/slice`, `GET /api/jobs/{jid}/preview`, `GET /api/support-fins` — § [Support
-fins](#support-fins)), so a current `grep -c '^@app\.' app/main.py` says 29 rather than 21 — every one of
-them is listed below (the `{kind}/{rel:path}` preset routes appear once each, without the `:path`).
+The route inventory below includes historical A/B comparisons for the preset-import work. Those
+comparisons are historical rather than a statement of current route counts; the reslice routes are
+listed separately in [Reslice](#reslice).
 
 Error bodies are FastAPI's `{"detail": …}`. In state B, the no-printer condition raises a detail object
 (absent in state A, which has no empty-datadir state):
@@ -73,8 +66,8 @@ A pairing is a complete statement about a printer, not a patch: a slot the body 
 | GET | `/api/jobs/{jid}` | one job: status, stats, error, `threemf`, `archive`, and for a finned job `original`, `fins`, `support_fins` | 200 · 404 (`jid` must be 12 lowercase hex) |
 | GET | `/api/jobs/{jid}/gcode` | download the sliced gcode | 200 file · 409 `not sliced yet` · 404 |
 | POST | `/api/jobs/{jid}/print` | upload to Moonraker and start the print | 200 `{started:true,remote_file}` · 409 `job is '<status>', not sliced` / `not sliced yet` / `klipper not ready: <state>` / `printer busy: state=<state>` · Moonraker error status (502/503/409) |
-| DELETE | `/api/jobs/{jid}` | remove the job dir and its sliced output | 200 `{deleted}` |
-| DELETE | `/api/jobs` | remove every finished job, skipping active ones | 200 `{deleted,skipped,deleted_ids,skipped_ids}` |
+| DELETE | `/api/jobs/{jid}` | remove the job dir and its sliced output | 200 `{deleted}` · 409 active or print upload in progress |
+| DELETE | `/api/jobs` | remove finished and staged jobs, skipping active jobs and print uploads | 200 `{deleted,skipped,deleted_ids,skipped_ids}` |
 
 `/api/upload` calls `require_machine()` **before** creating the job directory, so a 409 leaves nothing
 on disk (`main.py:997`). `output_name` rules: no path separators, not a Windows reserved device name,
@@ -84,6 +77,37 @@ A job object (`GET /api/jobs`, `GET /api/jobs/{jid}` and the SSE stream) also ca
 decisions: `auto_orient`, `auto_orient_used` (true when orient actually ran, e.g. because a shrink
 forced it), `shrink_to_fit`, `fit_scale` (`1.0` when nothing was scaled, `null` when the model could
 not be measured), plus `model_size` and `bed_limits` as `{x,y,z}` spans in millimetres.
+
+## Reslice
+
+Job reads add `reslice: {eligible, reason}`; only `sliced` or `failed` jobs with a retained canonical
+STL, OBJ or 3MF model are eligible. A reslice child also has `staging`, with `settings_editable`,
+`preview_available`, `resize_available` and `reason`; geometry results also include `unit` and `size`. These
+are computed on reads. Printed jobs remain `sliced`. A child is independent of its source and uses a
+copy of its current canonical model, not the ZIP or the source's prepared slicer input.
+
+| Method | Path | Request and result |
+|---|---|---|
+| POST | `/api/jobs/{jid}/reslice` | `{"request_id":"<UUID>"}` creates a staged child: 201 with full job and capabilities. Retrying the same source/token returns the existing child with 200, including after queueing. 404 unknown source; 409 nonterminal source or missing retained model; 422 invalid body/token. |
+| PATCH | `/api/jobs/{jid}/settings` | `{"revision":0,"profile":{"machine":"<relative path>","process":"<relative path>","filament":"<relative path>"},"options":{"supports":true,"brim":false,"auto_orient":true,"shrink_to_fit":false}}`. Profile and options may be partial; returns updated job and incremented revision. Invalid references or incompatible pair: 400; invalid fields/types: 422; stale revision or non-draft: 409. |
+| GET | `/api/jobs/{jid}/preview` | Staged child: scene, `job` ID, `revision`, `manual_scale` and geometry capability fields. 409 if unavailable or no longer staged. Unlike legacy fin previews, reslice previews do not fall back to still shots. |
+| POST | `/api/jobs/{jid}/scale` | `{"revision":N,"width":120}` (or exactly one of `depth` or `height`), mm; returns `size`, `factor`, `manual_scale`, `unit` and new `revision`. Values must be finite, positive and at most 10000 mm; a single scaling factor cannot exceed 100. 400/422 for invalid geometry or input; 409 for stale state or unavailable resize. |
+| POST | `/api/jobs/{jid}/scale/reset` | `{"revision":N}` restores the child baseline and returns the new revision, `manual_scale: 1.0`, unit and size (possibly null if preview is unavailable). 409 for stale state or missing baseline. |
+| POST | `/api/jobs/{jid}/slice` | Child requires `{"revision":N}`; validates choices and prepares local files, then returns `{id,status:"queued",queue_position}`. Invalid choices or preflight: 400; invalid body: 422; stale revision or non-draft: 409. Existing fin staging still accepts the legacy no-body request. |
+
+Settings changes merge into the child, not global dashboard settings. The source snapshot holds preset
+references and options, not old preset bytes; missing or incompatible references need explicit repair.
+At confirmation the child captures the machine and filament files and effective derived process, with
+hashes and options, and the worker uses those local files. This is not a snapshot of the full Orca
+datadir or embedded object overrides. 3MF identity is prepared from the child's current geometry;
+unreadable identity settings fail preflight. Reslice confirmation rejects shrink-to-fit for 3MF or
+fins, and fin jobs suppress auto-orientation. Preview and resize are bounded and may be unavailable
+for otherwise sliceable inputs; arbitrary external-reference 3MF preview/resize is unsupported.
+
+Closing retains a staged child, and no slice or print is started until explicitly requested. Drafts
+are protected from age pruning, but individual and bulk delete can remove them. Queued/slicing jobs
+and jobs being uploaded for printing cannot be deleted. A source may be deleted independently; normal
+`KEEP_JOBS` pruning applies to finished children and sources.
 
 ## Support fins
 
@@ -97,7 +121,7 @@ finished job) but `prune()` keeps it, so an open preview dialog is never collect
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
 | POST | `/api/jobs/{jid}/slice` | enter the queue for a staged job — the preview dialog's *Slice it* | 200 `{id,status:"queued",queue_position}` · 404 · 409 `job is '<status>', not awaiting confirmation` (a double click is a 409, not a second queue entry: the check and the enqueue share one lock) |
-| GET | `/api/jobs/{jid}/preview` | geometry for the pre-slice preview, or `{mode:"shots", views:["front","side"], bytes}` when the file is over `MAX_BYTES` (32 MiB) and at most `shot.SHOT_MAX_BYTES` (150 MiB) | 200 · 404 · 409 `preview unavailable: this job has no support fins` · 409 `preview unavailable: <reason>` |
+| GET | `/api/jobs/{jid}/preview` | geometry for the pre-slice preview, or `{mode:"shots", views:["front","side"], bytes}` when the file is over `MAX_BYTES` (32 MiB) and at most `shot.SHOT_MAX_BYTES` (150 MiB) | 200 · 404 · 409 `preview unavailable: this job has no support fins` (for non-reslice jobs) · 409 `preview unavailable: <reason>` |
 | GET | `/api/jobs/{jid}/preview-shot?view=front\|side` | one cached PNG of the finned mesh | 200 `image/png` · 400 · 404 · 409 |
 | GET | `/api/support-fins` | capability probe for the upload checkbox | 200 always: `{available, reason, timeout, max_triangles}`; `reason` is `""` when available, else `support-fins CLI is missing from the image` / `node runtime is not available` |
 
@@ -141,7 +165,7 @@ In state A neither exists: there is no empty-datadir concept, so there is no 409
 `_reject_unpermitted_pair` (`main.py:260`) checks the machine/process pair the document is *about to
 hold* against `filter_process_by_machine`. It runs before anything is written, so a refusal leaves
 `profile.json`, the stored pairing and the derived preset exactly as they were. A filament-only pick
-is never refused. This is the `-17` guard — see [presets.md](presets.md#3-the--17-rule).
+is never refused. This is the `-17` guard — see [presets.md](presets.md).
 
 ### Editing presets in the UI (current develop)
 
