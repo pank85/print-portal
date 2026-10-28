@@ -300,6 +300,12 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 .btn[aria-busy="true"]{ cursor:progress; }
 .icon{ width:18px; height:18px; flex:0 0 auto; }
 
+#resliceSettings .preview-scale, #previewScale { display:flex; flex-wrap:wrap; gap:var(--space-2); align-items:end; }
+#previewScale[hidden], #resliceSettings[hidden] { display:none; }
+#resliceSettings label, #previewScale label { display:grid; gap:var(--space-1); }
+#resliceSettings input[type="checkbox"] { min-width:20px; min-height:20px; }
+#previewScale input { width:7rem; min-height:var(--target-min); font-size:var(--text-base); }
+
 /* ---------- drop zone ---------- */
 #drop.is-busy{ opacity:.6; cursor:progress; }
 #drop{
@@ -629,6 +635,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
               Preview fins
             </button>
+            <button type="button" class="btn" id="uploadLatestReslice" data-act="reslice" hidden>Reslice…</button>
             <button type="button" class="btn btn-danger" id="uploadLatestDelete"
                     data-act="delete" aria-label="Delete the last job">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -649,7 +656,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 
     <section aria-labelledby="jobsTitle">
       <div class="section-head">
-        <h2 id="jobsTitle">Jobs <span class="count mono" id="jobCount">0</span></h2>
+        <h2 id="jobsTitle" tabindex="-1">Jobs <span class="count mono" id="jobCount">0</span></h2>
         <button type="button" class="btn btn-danger" id="btnDeleteAll" disabled aria-disabled="true">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m6 6 1 14h10l1-14"/></svg>
@@ -828,6 +835,27 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 <dialog id="previewDlg" class="dialog" aria-labelledby="previewTitle" aria-describedby="previewHint">
   <h2 id="previewTitle">Support fins preview</h2>
   <p id="previewHint" class="hint">Drag to orbit, scroll to zoom, arrow keys when the view has focus.</p>
+  <div id="resliceSettings" hidden>
+    <p id="resliceSource" class="hint"></p>
+    <p class="hint">Preset references use their current contents, not historical preset contents. Embedded object overrides may still apply.</p>
+    <div class="preview-scale">
+      <label>Printer <select id="resliceMachine"></select></label>
+      <label>Process <select id="resliceProcess"></select></label>
+      <label>Filament <select id="resliceFilament"></select></label>
+    </div>
+    <p id="reslicePresetError" class="err" role="status"></p>
+    <div class="preview-scale">
+      <label><input type="checkbox" id="resliceSupports"> Supports</label>
+      <label><input type="checkbox" id="resliceBrim"> Brim</label>
+      <label><input type="checkbox" id="resliceOrient"> Auto-orient</label>
+      <label><input type="checkbox" id="resliceFit"> Shrink to fit</label>
+    </div>
+    <p class="hint">Manual size is applied before optional automatic fit. Resizing a finned model scales its fins too. Auto-fit is unavailable for 3MF; fin models cannot auto-orient.</p>
+    <button type="button" class="btn" id="resliceCopy">Use current dashboard settings</button>
+    <button type="button" class="btn" id="resliceSave">Save settings</button>
+    <p class="hint">Closing saves settings. Unapplied dimensions are kept only in this browser tab; apply them to save the size.</p>
+    <button type="button" class="btn" id="resliceReload" hidden>Reload draft revision</button>
+  </div>
   <div class="preview-stage">
     <canvas id="previewCanvas" tabindex="0" role="img"
             aria-label="3-D preview of the finned model. Drag to rotate, scroll to zoom, arrow keys to rotate."></canvas>
@@ -841,10 +869,12 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     <label>Width <input type="number" id="scaleWidth" step="0.1" min="0.1"></label>
     <label>Length <input type="number" id="scaleLength" step="0.1" min="0.1"></label>
     <button type="button" class="btn" id="scaleApply">Apply size</button>
+    <button type="button" class="btn" id="scaleReset" hidden>Reset size</button>
     <span class="mono" id="previewSizeAfter"></span>
   </div>
   <div id="previewLegend" class="preview-legend" role="group" aria-label="Objects in the preview"></div>
   <p id="previewError" class="err" role="alert" hidden></p>
+  <p id="previewBusy" role="status" aria-live="polite" hidden></p>
   <div class="dialog-actions preview-actions">
     <button type="button" class="btn btn-danger" id="previewDiscard">Discard</button>
     <button type="button" class="btn" id="previewClose">Keep for later</button>
@@ -1448,6 +1478,7 @@ function onJobAction(ev) {
   if (btn.dataset.act === "print") printJob(btn.dataset.ref);
   else if (btn.dataset.act === "delete") del(btn.dataset.ref);
   else if (btn.dataset.act === "preview") openPreview(btn.dataset.ref);
+  else if (btn.dataset.act === "reslice") createReslice(btn.dataset.ref, btn);
   else if (btn.dataset.act === "slice") confirmSlice(btn.dataset.ref);
 }
 
@@ -1522,6 +1553,7 @@ function renderJobBody(j, withWait = true) {
       ${out}
       ${j.support_fins ? `<span title="${esc((j.fins && j.fins.report) || "designed-in support fins")}">fins: ${esc(finsSummary(j))}</span>` : ""}
       ${j.original && j.original !== j.filename ? `<span class="mono" title="uploaded as">from ${esc(j.original)}</span>` : ""}
+      ${j.kind === "reslice" ? `<span>Reslice of <a href="#job-${esc(j.source_job_id)}">${esc(j.source_job_id)}</a>${j.status === "awaiting_confirm" ? " · awaiting settings / reslice draft" : ""}</span>` : ""}
       ${j.remote_file ? `<span class="mono" title="on printer">on printer: ${esc(j.remote_file)}</span>` : ""}
     </p>
     ${waitBlock}
@@ -1543,17 +1575,18 @@ function renderJobRow(j) {
             Gcode
           </a>` : "";
   /* a staged job has nothing to print yet, but it can still be reviewed or queued from here */
-  const staged = j.status === "awaiting_confirm" && !j.error ? `
+  const staged = j.kind === "reslice" && j.status === "awaiting_confirm" ? `<button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">Resume reslice</button>` : j.status === "awaiting_confirm" && !j.error ? `
           <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">
             Preview fins
           </button>
           <button type="button" class="btn btn-primary" data-act="slice" data-ref="${esc(j.id)}">
             Slice it
           </button>` : "";
-  return `<article class="job">
+  return `<article class="job" id="job-${esc(j.id)}">
         <div>${renderJobBody(j)}</div>
         <div class="job-actions">
           ${staged}
+          ${j.reslice?.eligible ? `<button type="button" class="btn" data-act="reslice" data-ref="${esc(j.id)}">Reslice…</button>` : ""}
           ${actions}
           <button type="button" class="btn btn-danger" data-act="delete" data-ref="${esc(j.id)}">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -1588,6 +1621,12 @@ function setUploadLatest(job) {
   preview.hidden = !staged;
   preview.dataset.ref = staged ? job.id : "";
   preview.setAttribute("aria-label", `Preview the support fins on ${name}`);
+  preview.textContent = job.kind === "reslice" ? "Resume reslice" : "Preview fins";
+  if (job.kind === "reslice") preview.setAttribute("aria-label", `Resume reslice of ${name}`);
+  const reslice = $("#uploadLatestReslice");
+  reslice.hidden = !job.reslice?.eligible;
+  reslice.dataset.ref = job.id;
+  reslice.disabled = reslicePending.has(job.id);
   remove.dataset.ref = job.id;
   remove.setAttribute("aria-label", `Delete ${name}`);
 }
@@ -1629,6 +1668,11 @@ const PREVIEW_COLOUR = {
 };
 const PREVIEW_TRIANGLE_BUDGET = 200000;   // one drag frame stays sane on a big mesh
 const PREVIEW_KEY_STEP = 0.12;
+let previewReturnFocus = null;
+let previewAxis = null;
+let previewBusy = false, savedResliceValues = null;
+const pendingDimensions = new Map();
+const reslicePending = new Set(), resliceTokens = new Map();
 let previewJob = null;          // {id, filename, ...} of the staged job
 let previewScene = null;        // the last GET /preview payload
 let previewHidden = new Set();  // object ids the legend has toggled off
@@ -1892,11 +1936,131 @@ function showShotPreview(id, p) {
   $("#previewConfirm").disabled = false;
 }
 
-async function openPreview(id) {
-  if (!id) return;
+
+function newRequestId() {
+  const bytes = crypto.getRandomValues(new Uint8Array(16));
+  bytes[6] = (bytes[6] & 15) | 64; bytes[8] = (bytes[8] & 63) | 128;
+  const hex = Array.from(bytes, b => b.toString(16).padStart(2, "0")).join("");
+  return `${hex.slice(0,8)}-${hex.slice(8,12)}-${hex.slice(12,16)}-${hex.slice(16,20)}-${hex.slice(20)}`;
+}
+
+async function createReslice(id, button) {
+  if (reslicePending.has(id)) return;
+  const token = resliceTokens.get(id) || newRequestId();
+  resliceTokens.set(id, token); reslicePending.add(id); button.disabled = true;
+  button.textContent = "Creating draft…";
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/reslice`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({request_id:token})});
+    const job = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(job.detail || r.statusText);
+    resliceTokens.delete(id);
+    await refresh();
+    if (job.status === "awaiting_confirm") await openPreview(job.id, button);
+    else toast("Reslice already queued or completed");
+  } catch (e) { toast("Could not create reslice: " + e.message + ". Retry to use the same request.", 8000); }
+  finally { reslicePending.delete(id); button.disabled = false; button.textContent = "Reslice…"; }
+}
+
+async function withPreviewBusy(label, action) {
+  if (previewBusy) return;
+  const dlg = $("#previewDlg"), status = $("#previewBusy");
+  previewBusy = true;
+  dlg.setAttribute("aria-busy", "true"); status.textContent = label; status.hidden = false;
+  try { return await action(); }
+  finally {
+    dlg.removeAttribute("aria-busy"); status.hidden = true; status.textContent = "";
+    previewBusy = false;
+  }
+}
+
+function rememberDimensions() {
+  if (previewJob?.kind !== "reslice") return;
+  pendingDimensions.set(previewJob.id, {axis: previewAxis, values: ["scaleHeight", "scaleWidth", "scaleLength"].map(id => document.getElementById(id).value)});
+}
+
+function resliceValues() {
+  const profile = {};
+  for (const [key, selector] of [["machine","#resliceMachine"],["process","#resliceProcess"],["filament","#resliceFilament"]]) profile[key] = $(selector).value;
+  return {profile, options:{supports:$("#resliceSupports").checked, brim:$("#resliceBrim").checked, auto_orient:$("#resliceOrient").checked, shrink_to_fit:$("#resliceFit").checked}};
+}
+
+async function renderResliceSettings(snapshot) {
+  const list = await fetchPresets(snapshot.machine);
+  const missing = [];
+  for (const [key, selector] of [["machine","#resliceMachine"],["process","#resliceProcess"],["filament","#resliceFilament"]]) {
+    let rows = list[key] || [];
+    if (key === "process") rows = rows.filter(row => processListedFor(list, row.rel, snapshot.machine));
+    const current = snapshot[key] || "";
+    const found = rows.some(row => row.rel === current);
+    $(selector).innerHTML = `<option value="">Select ${key}${current && !found ? " (missing or incompatible)" : ""}</option>` + rows.map(row => `<option value="${esc(row.rel)}"${row.rel === current ? " selected" : ""}>${esc(row.name)}</option>`).join("");
+    if (!found) missing.push(key);
+  }
+  const opts = snapshot.options || {};
+  for (const [key, selector] of [["supports","#resliceSupports"],["brim","#resliceBrim"],["auto_orient","#resliceOrient"],["shrink_to_fit","#resliceFit"]]) $(selector).checked = !!opts[key];
+  const fit = $("#resliceFit");
+  const fitUnsupported = previewJob?.support_fins || /\.3mf$/i.test(previewJob?.filename || "");
+  fit.disabled = !!fitUnsupported && !fit.checked;
+  $("#reslicePresetError").textContent = missing.length ? `Select valid ${missing.join(", ")} before slicing.` : "";
+}
+
+async function saveResliceSettings() {
+  const values = resliceValues();
+  const missing = Object.keys(values.profile).filter(key => !values.profile[key]);
+  if (missing.length) { $("#reslicePresetError").textContent = `Select valid ${missing.join(", ")}.`; document.getElementById("reslice" + missing[0][0].toUpperCase() + missing[0].slice(1)).focus(); throw new Error("Select all required presets"); }
+  const r = await fetch(`/api/jobs/${encodeURIComponent(previewJob.id)}/settings`, {method:"PATCH", headers:{"Content-Type":"application/json"}, body:JSON.stringify({revision:previewJob.revision, ...values})});
+  const job = await r.json().catch(() => ({}));
+  if (!r.ok) {
+    if (r.status === 409) $("#resliceReload").hidden = false;
+    throw new Error(r.status === 409 ? (job.detail || "Draft changed") + ". Reload the draft revision to review and retry; your edits remain here." : job.detail || r.statusText);
+  }
+  previewJob = job; savedResliceValues = JSON.stringify(values);
+  $("#resliceReload").hidden = true; $("#reslicePresetError").textContent = "";
+}
+
+async function resetPreviewScale() {
+  if (!previewJob || previewJob.kind !== "reslice") return;
+  const button = $("#scaleReset"); button.disabled = true;
+  try {
+    const r = await fetch(`/api/jobs/${encodeURIComponent(previewJob.id)}/scale/reset`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({revision:previewJob.revision})});
+    const result = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(resliceResponseError(r, result));
+    previewJob.revision = result.revision;
+    await reloadPreviewScene();
+    pendingDimensions.delete(previewJob.id);
+  } catch (e) { previewActionError("Reset failed: " + e.message); }
+  finally { button.disabled = false; }
+}
+
+function resliceResponseError(r, result) {
+  if (r.status === 409 && previewJob?.kind === "reslice") {
+    $("#resliceReload").hidden = false;
+    return (result.detail || "Draft changed") + ". Reload the draft revision and review your edits before retrying.";
+  }
+  return result.detail || r.statusText;
+}
+function previewActionError(message) { $("#previewError").textContent = message; $("#previewError").hidden = false; }
+async function reloadPreviewScene() {
+  const r = await fetch("/api/jobs/" + encodeURIComponent(previewJob.id) + "/preview");
+  const scene = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(scene.detail || r.statusText);
+  previewScene = scene; renderPreviewChrome(scene); drawPreview();
+  $("#previewSizeNow").textContent = "current: " + (scene.bbox?.size || []).map(fmtMm).join(" × ") + " mm";
+  $("#previewSizeAfter").textContent = `Manual scale: ${Number(scene.manual_scale || 1).toFixed(3)}× baseline`;
+  previewAxis = null; ["scaleHeight","scaleWidth","scaleLength"].forEach(k => {document.getElementById(k).value = "";});
+}
+
+async function openPreview(id, returnFocus = document.activeElement) {
+  if (!id || previewBusy) return;
+  return withPreviewBusy("Loading draft…", async () => {
   const dlg = $("#previewDlg"), canvas = $("#previewCanvas"), err = $("#previewError"),
         legend = $("#previewLegend"), stats = $("#previewStats"), fallback = $("#previewFallback");
+  previewReturnFocus = returnFocus;
   previewJob = { id };
+  previewAxis = null;
+  $("#resliceSettings").hidden = true;
+  $("#scaleReset").hidden = true;
+  $("#previewTitle").textContent = "Support fins preview";
+  $("#previewConfirm").textContent = "Slice it";
   previewScene = null;
   previewDrag = null;
   previewHidden = new Set();
@@ -1916,24 +2080,46 @@ async function openPreview(id) {
   if (typeof dlg.showModal === "function") { if (!dlg.open) dlg.showModal(); }
   else dlg.setAttribute("open", "");
   try {
+    const jr = await fetch(`/api/jobs/${encodeURIComponent(id)}`);
+    const job = await jr.json().catch(() => ({}));
+    if (!jr.ok) throw new Error(job.detail || jr.statusText);
+    previewJob = job;
+    if (job.kind === "reslice") {
+      $("#resliceSettings").hidden = false;
+      $("#previewTitle").textContent = "Reslice job";
+      $("#previewConfirm").textContent = "Slice new job";
+      $("#resliceSource").textContent = `Reslice of ${job.source_job_id}. Closing keeps this draft.`;
+      $("#scaleReset").hidden = false;
+      await renderResliceSettings(job.profile_snapshot || {});
+      savedResliceValues = JSON.stringify(resliceValues());
+      $("#resliceReload").hidden = true;
+      const pending = pendingDimensions.get(id);
+      ["scaleHeight", "scaleWidth", "scaleLength"].forEach((key, i) => { document.getElementById(key).value = pending?.values[i] || ""; });
+      previewAxis = pending?.axis || null;
+    }
     const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/preview`);
     const p = await r.json().catch(() => ({}));
     if (!r.ok) throw new Error(p.detail || r.statusText || "preview unavailable");
     if (p.mode === "shots") { showShotPreview(id, p); return; }
-    previewJob = Object.assign({ id }, p.job || {});
+    // Keep the revision from the job read: a concurrent change must produce a conflict.
     previewScene = p;
     $("#previewHint").textContent = window.PointerEvent
       ? "Drag to orbit, scroll to zoom, arrow keys when the view has focus. Click a name to hide or show that object."
       : "Arrow keys orbit, + and − zoom. Click a name to hide or show that object.";
     renderPreviewChrome(p);
+    if (previewJob.kind === "reslice") $("#previewSizeAfter").textContent = `Manual scale: ${Number(p.manual_scale || 1).toFixed(3)}× baseline`;
     const sz = (p.bbox && p.bbox.size) || [];
     const now = document.getElementById("previewSizeNow");
     if (now) now.textContent = "current: " + sz.map(v=>Math.round(v*10)/10).join(" × ") + " mm";
+    if (previewJob.kind === "reslice") $("#previewSizeAfter").textContent += ` · baseline: ${sz.map(v => fmtMm(v / (p.manual_scale || 1))).join(" × ")} mm`;
     drawPreview();
-    canvas.focus();
   } catch (e) {
     showPreviewError(e.message);
+    $("#previewScale").hidden = true;
+    if (!previewJob?.status) $("#previewConfirm").disabled = true;
+    if (previewJob?.kind === "reslice") $("#previewFallback").textContent = "Preview and resize unavailable; settings can still be saved and sliced.";
   }
+  }).then(() => { if ($("#previewDlg").open && !$("#previewCanvas").hidden) $("#previewCanvas").focus(); });
 }
 
 function closePreview() {
@@ -1944,13 +2130,36 @@ function closePreview() {
   previewHidden = new Set();
   if (typeof dlg.close === "function") { if (dlg.open) dlg.close(); }
   else dlg.removeAttribute("open");
+  (previewReturnFocus && previewReturnFocus.isConnected ? previewReturnFocus : $("#jobsTitle")).focus();
+}
+
+async function keepPreview() {
+  if (previewBusy) return;
+  await withPreviewBusy("Saving draft…", async () => {
+    try {
+      if (previewJob?.kind === "reslice") {
+        if (JSON.stringify(resliceValues()) !== savedResliceValues) await saveResliceSettings();
+        rememberDimensions();
+      }
+      closePreview();
+    } catch (e) { previewActionError("Draft not closed: " + e.message); }
+  });
+}
+
+async function reloadResliceRevision() {
+  const r = await fetch(`/api/jobs/${encodeURIComponent(previewJob.id)}`);
+  const job = await r.json().catch(() => ({}));
+  if (!r.ok || job.status !== "awaiting_confirm") throw new Error(job.detail || "Draft is no longer editable");
+  previewJob = job;
+  $("#resliceReload").hidden = true;
+  previewActionError("Latest revision loaded. Your edits are unchanged; saving them will replace the current draft settings. Geometry shown may be out of date; close and resume to refresh it before resizing.");
 }
 
 /* Discard deletes the staged job; Keep for later just closes and leaves it in the list */
 async function discardPreview() {
   const job = previewJob;
   if (!job) return;
-  const ok = await ask("Discard this staged job?", "Deletes the upload and the finned model. Nothing was sent to the slicer.", "Discard");
+  const ok = await ask("Discard this staged job?", job.kind === "reslice" ? "Deletes only this draft. The source job is unchanged." : "Deletes the upload and the finned model. Nothing was sent to the slicer.", "Discard");
   if (!ok) return;
   try {
     const r = await fetch(`/api/jobs/${encodeURIComponent(job.id)}`, { method: "DELETE" });
@@ -1958,10 +2167,11 @@ async function discardPreview() {
       const j = await r.json().catch(() => ({}));
       throw new Error(j.detail || r.statusText);
     }
+    pendingDimensions.delete(job.id);
     closePreview();
     toast("Staged job discarded");
   } catch (e) {
-    toast("Delete failed: " + e.message, 6000);
+    previewActionError("Delete failed: " + e.message);
   }
   refresh();
 }
@@ -1974,10 +2184,17 @@ async function confirmSlice(jobId) {
   btn.dataset.busy = "true";
   btn.disabled = true;
   try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/slice`, { method: "POST" });
+    if (previewJob?.kind === "reslice" && previewAxis && document.getElementById(previewAxis)?.value) {
+      throw new Error("Apply the entered size or clear it before slicing.");
+    }
+    if (previewJob?.kind === "reslice") await saveResliceSettings();
+    const r = previewJob?.kind === "reslice"
+      ? await fetch(`/api/jobs/${encodeURIComponent(id)}/slice`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({revision:previewJob.revision})})
+      : await fetch(`/api/jobs/${encodeURIComponent(id)}/slice`, { method: "POST" });
     const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(j.detail || r.statusText || "could not queue the slice");
+    if (!r.ok) throw new Error(resliceResponseError(r, j) || "could not queue the slice");
     const job = Object.assign({ id, status: "queued" }, previewJob || {}, j);
+    pendingDimensions.delete(id);
     closePreview();
     /* the card switches from the staged controls to the slice bar right away, before the poll */
     setUploadWait(job);
@@ -2017,6 +2234,7 @@ function previewScaleAxis(id) {
 
 function previewScaleFollow(e) {
   const src = e.target.id;
+  previewAxis = src;
   const val = Number(e.target.value);
   if (!previewScene || !Number.isFinite(val) || val <= 0) return;
   const sz = (previewScene.bbox && previewScene.bbox.size) || [];
@@ -2033,22 +2251,20 @@ function previewScaleFollow(e) {
 async function applyPreviewScale() {
   const id = previewJob && previewJob.id;
   if (!id) return;
-  const filled = ["scaleHeight","scaleWidth","scaleLength"].filter(k=>{
-    const el=document.getElementById(k); return el && el.value && Number(el.value)>0;
-  });
-  if (filled.length === 0) { toast("Enter one of height, width or length", 4000); return; }
-  if (filled.length > 1) { toast("Set only one dimension", 4000); return; }
-  const axis = filled[0];
-  const field = document.getElementById(axis);
-  const value = Number(field.value);
+  const axis = previewAxis;
+  const field = axis && document.getElementById(axis);
+  const value = field && Number(field.value);
+  if (!field || !Number.isFinite(value) || value <= 0) { previewActionError("Enter a finite positive dimension in mm."); if (field) field.focus(); return; }
   const apiAxis = axis === "scaleHeight" ? "height" : axis === "scaleWidth" ? "width" : "length";
+  const button = $("#scaleApply"); button.disabled = true;
   try {
     const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/scale`, {
       method: "POST", headers: {"Content-Type":"application/json"},
-      body: JSON.stringify({ axis: apiAxis, value })
+      body: JSON.stringify(previewJob.kind === "reslice" ? {revision:previewJob.revision, [apiAxis === "length" ? "depth" : apiAxis]:value} : { axis: apiAxis, value })
     });
     const j = await r.json().catch(()=>({}));
-    if (!r.ok) throw new Error(j.detail || r.statusText);
+    if (!r.ok) throw new Error(resliceResponseError(r, j));
+    if (previewJob.kind === "reslice") previewJob.revision = j.revision;
     const after = document.getElementById("previewSizeAfter");
     if (after) after.textContent = "new: " + (j.size||[]).map(v=>Math.round(v*10)/10).join(" × ") + " mm";
     // reload preview
@@ -2063,23 +2279,30 @@ async function applyPreviewScale() {
     drawPreview();
     // clear inputs
     ["scaleHeight","scaleWidth","scaleLength"].forEach(k=>{const e=document.getElementById(k); if(e) e.value="";});
+    previewAxis = null; pendingDimensions.delete(id);
     toast("Scaled");
   } catch (e) {
-    toast("Scale failed: " + e.message, 6000);
-  }
+    previewActionError("Scale failed: " + e.message);
+  } finally { button.disabled = false; }
 }
 
 function initPreview() {
   const canvas = $("#previewCanvas"), dlg = $("#previewDlg");
-  $("#previewConfirm").addEventListener("click", () => confirmSlice());
+  $("#previewConfirm").addEventListener("click", () => withPreviewBusy("Queuing slice…", () => confirmSlice()));
   const apply = document.getElementById("scaleApply");
-  if (apply) apply.addEventListener("click", applyPreviewScale);
+  if (apply) apply.addEventListener("click", () => withPreviewBusy("Applying size…", applyPreviewScale));
   ["scaleHeight","scaleWidth","scaleLength"].forEach(k=>{
     const el = document.getElementById(k);
     if (el) el.addEventListener("input", previewScaleFollow);
   });
-  $("#previewClose").addEventListener("click", closePreview);
-  $("#previewDiscard").addEventListener("click", discardPreview);
+  $("#scaleReset").addEventListener("click", () => withPreviewBusy("Resetting size…", resetPreviewScale));
+  $("#resliceFit").addEventListener("change", () => { if (!$("#resliceFit").checked && (previewJob?.support_fins || /\.3mf$/i.test(previewJob?.filename || ""))) $("#resliceFit").disabled = true; });
+  $("#resliceSave").addEventListener("click", ev => withPreviewBusy("Saving settings…", async () => { const button = $("#resliceSave"); button.disabled = true; try { await saveResliceSettings(); toast("Draft settings saved"); } catch (e) { previewActionError("Settings not saved: " + e.message); } finally { button.disabled = false; } }));
+  $("#resliceCopy").addEventListener("click", () => withPreviewBusy("Loading dashboard settings…", async () => { try { const r = await fetch("/api/profile"); const j = await r.json(); if (!r.ok) throw new Error(j.detail || r.statusText); await renderResliceSettings({...j.paths, options:j.options}); } catch (e) { previewActionError("Could not copy dashboard settings: " + e.message); } }));
+  $("#resliceMachine").addEventListener("change", () => withPreviewBusy("Loading compatible presets…", async () => { try { const values = resliceValues(); await renderResliceSettings({...values.profile, options:values.options}); } catch (e) { previewActionError("Could not load presets: " + e.message); } }));
+  $("#resliceReload").addEventListener("click", () => withPreviewBusy("Reloading draft…", async () => { try { await reloadResliceRevision(); } catch (e) { previewActionError("Could not reload draft: " + e.message); } }));
+  $("#previewClose").addEventListener("click", keepPreview);
+  $("#previewDiscard").addEventListener("click", () => withPreviewBusy("Discarding draft…", discardPreview));
   $("#previewLegend").addEventListener("click", previewToggle);
   canvas.addEventListener("pointerdown", previewOrbit);
   canvas.addEventListener("pointermove", previewOrbit);
@@ -2087,8 +2310,21 @@ function initPreview() {
   canvas.addEventListener("pointercancel", previewOrbit);
   canvas.addEventListener("wheel", previewZoom, { passive: false });
   canvas.addEventListener("keydown", previewKey);
+  // Keep focus in place during requests; making the focused subtree inert can close a modal.
+  for (const type of ["click", "pointerdown", "keydown", "input", "change"]) {
+    dlg.addEventListener(type, ev => {
+      if (type === "keydown" && ev.key === "Escape") {
+        ev.preventDefault(); ev.stopImmediatePropagation();
+        if (!previewBusy) keepPreview();
+      } else if (previewBusy) {
+        ev.preventDefault(); ev.stopImmediatePropagation();
+      }
+    }, true);
+  }
+  dlg.addEventListener("cancel", ev => { ev.preventDefault(); if (!previewBusy) keepPreview(); });
   /* Escape and the native close both land here: the staged job survives, only the dialog goes */
   dlg.addEventListener("close", () => {
+    if (dlg.open) return; // A previous close event may arrive after the dialog was reopened.
     if (previewFrame && typeof cancelAnimationFrame === "function") {
       cancelAnimationFrame(previewFrame);
       previewFrame = 0;
@@ -2097,6 +2333,7 @@ function initPreview() {
     previewScene = null;
     previewJob = null;
     previewHidden = new Set();
+    (previewReturnFocus && previewReturnFocus.isConnected ? previewReturnFocus : $("#jobsTitle")).focus();
   });
   window.addEventListener("resize", () => { if (previewScene) schedulePreview(); });
 }

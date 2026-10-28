@@ -1157,7 +1157,7 @@ def test_the_last_job_block_renders_the_shared_body_below_a_heading(page):
     assert 'class="slice-wait"' in body
 
     # the row keeps its own frame and its own three actions; the card has them statically
-    assert '<article class="job">' in row
+    assert '<article class="job" id="job-${esc(j.id)}">' in row
     assert 'class="job-actions"' in row and 'class="job-actions"' in upload_card(page)
     assert 'data-act="print"' in row and 'data-act="delete"' in row
 
@@ -1524,9 +1524,9 @@ def test_the_preview_wires_every_input_and_tears_down_on_close(page):
                      'canvas.addEventListener("wheel", previewZoom, { passive: false })',
                      'canvas.addEventListener("keydown", previewKey)',
                      '$("#previewLegend").addEventListener("click", previewToggle)',
-                     '$("#previewConfirm").addEventListener("click", () => confirmSlice())',
-                     '$("#previewClose").addEventListener("click", closePreview)',
-                     '$("#previewDiscard").addEventListener("click", discardPreview)'):
+                     '$("#previewConfirm").addEventListener("click", () => withPreviewBusy(',
+                     '$("#previewClose").addEventListener("click", keepPreview)',
+                     '$("#previewDiscard").addEventListener("click", () => withPreviewBusy('):
         assert listener in init, listener
     assert 'dlg.addEventListener("close", () => {' in init
     assert "previewScene = null;" in init               # Escape and the native close land here
@@ -1542,3 +1542,170 @@ def test_the_preview_wires_every_input_and_tears_down_on_close(page):
     assert "ev.preventDefault();" in keys
     zoom = function_body(page, "previewZoom")
     assert "ev.preventDefault();" in zoom and "Math.max(0.35, Math.min(4," in zoom
+
+
+# ---------------------------------------------------------------- reslice staged editor
+def test_reslice_actions_are_capability_gated_and_drafts_resume(page):
+    row = function_body(page, "renderJobRow")
+    assert 'j.reslice?.eligible' in row
+    assert 'data-act="reslice"' in row
+    assert 'Resume reslice' in row and 'j.kind === "reslice"' in row
+    assert 'source_job_id' in function_body(page, "renderJobBody")
+    assert 'uploadLatestReslice' in function_body(page, "setUploadLatest")
+
+
+def test_reslice_uses_idempotent_token_and_local_revisioned_mutations(page):
+    create = function_body(page, "createReslice")
+    assert 'resliceTokens.get(id) || newRequestId()' in create
+    assert 'reslicePending.has(id)' in create
+    assert 'request_id:token' in create
+    save = function_body(page, "saveResliceSettings")
+    assert '/settings`' in save and 'revision:previewJob.revision' in save
+    assert 'method:"PATCH"' in save
+    assert '/api/profile/select' not in save and '/api/profile/options' not in save
+    assert 'revision:previewJob.revision' in function_body(page, "confirmSlice")
+    assert 'revision:previewJob.revision' in function_body(page, "resetPreviewScale")
+
+
+def test_reslice_scale_submits_only_last_edited_axis(page):
+    follow = function_body(page, "previewScaleFollow")
+    apply = function_body(page, "applyPreviewScale")
+    assert 'previewAxis = src' in follow
+    assert 'const axis = previewAxis' in apply
+    assert '[apiAxis === "length" ? "depth" : apiAxis]:value' in apply
+    assert 'Number.isFinite(value)' in apply
+    assert 'filled.length' not in apply
+
+
+def test_reslice_settings_preview_and_errors_are_independent(page):
+    dlg = preview_dialog(page)
+    for id_ in ("resliceMachine", "resliceProcess", "resliceFilament", "resliceSupports", "resliceBrim", "resliceOrient", "resliceFit", "resliceCopy", "resliceSave", "scaleReset"):
+        assert f'id="{id_}"' in dlg
+    assert 'role="alert"' in dlg
+    open_ = function_body(page, "openPreview")
+    assert 'previewJob = job' in open_
+    assert 'p.job ||' not in open_
+    assert 'settings can still be saved and sliced' in open_
+    assert 'previewReturnFocus' in function_body(page, "closePreview")
+
+
+def test_reslice_keep_saves_before_close_and_recovers_stale_edits(page):
+    """Exercise the actual async handlers, including a delayed request and stale revision."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is unavailable")
+    names = ("withPreviewBusy", "rememberDimensions", "resliceValues", "saveResliceSettings",
+             "keepPreview", "reloadResliceRevision", "previewActionError")
+    functions = []
+    for name in names:
+        body = function_body(page, name) + "\n}"
+        if name in ("withPreviewBusy", "saveResliceSettings", "keepPreview", "reloadResliceRevision"):
+            body = "async " + body
+        functions.append(body)
+    js = r'''
+const assert = require('assert');
+const elements = {};
+for (const id of ['previewDlg','previewBusy','resliceMachine','resliceProcess','resliceFilament',
+ 'resliceSupports','resliceBrim','resliceOrient','resliceFit','reslicePresetError','resliceReload',
+ 'previewError','scaleHeight','scaleWidth','scaleLength']) {
+ elements[id] = {value:'', checked:false, hidden:true, textContent:'', inert:false, focus(){},
+ setAttribute(){}, removeAttribute(){}};
+}
+elements.previewDlg.children = [elements.resliceMachine, elements.previewBusy];
+const $ = s => elements[s.slice(1)];
+const document = {getElementById: id => elements[id]};
+let previewBusy = false, savedResliceValues = null, previewAxis = 'scaleWidth';
+let previewJob = {id:'abc', kind:'reslice', status:'awaiting_confirm', revision:0};
+const pendingDimensions = new Map();
+let closed = 0;
+function closePreview() { closed++; }
+''' + "\n".join(functions) + r'''
+(async () => {
+ for (const id of ['resliceMachine','resliceProcess','resliceFilament']) elements[id].value = id;
+ savedResliceValues = JSON.stringify(resliceValues());
+ elements.resliceBrim.checked = true; elements.scaleWidth.value = '80';
+ let resolveFetch;
+ global.fetch = () => new Promise(resolve => { resolveFetch = resolve; });
+ const closing = keepPreview();
+ assert.equal(previewBusy, true);
+ await keepPreview(); assert.equal(closed, 0);
+ resolveFetch({ok:false, status:409, json:async()=>({detail:'stale revision'})});
+ await closing;
+ assert.equal(closed, 0); assert.equal(elements.resliceBrim.checked, true);
+ assert.equal(elements.resliceReload.hidden, false); assert.match(elements.previewError.textContent, /not closed/);
+ assert.equal(previewBusy, false);
+ global.fetch = async () => ({ok:true, json:async()=>({id:'abc',kind:'reslice',status:'awaiting_confirm',revision:4})});
+ await reloadResliceRevision();
+ assert.equal(previewJob.revision, 4); assert.equal(elements.resliceBrim.checked, true);
+ let body;
+ global.fetch = async (url, options) => {body=JSON.parse(options.body); return {ok:true, json:async()=>({id:'abc',kind:'reslice',revision:5})};};
+ await keepPreview();
+ assert.equal(body.revision, 4); assert.equal(body.options.brim, true); assert.equal(closed, 1);
+ assert.deepEqual(pendingDimensions.get('abc'), {axis:'scaleWidth', values:['','80','']});
+})().catch(e => {console.error(e); process.exit(1);});
+'''
+    subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
+
+
+def test_reslice_cancel_and_mutations_are_guarded(page):
+    init = function_body(page, "initPreview")
+    assert 'ev.preventDefault(); if (!previewBusy) keepPreview();' in init
+    for label in ("Loading dashboard settings", "Loading compatible presets", "Applying size", "Resetting size", "Queuing slice", "Discarding draft"):
+        assert label in init
+    assert 'resliceResponseError(r, j)' in function_body(page, "applyPreviewScale")
+    assert 'resliceResponseError(r, result)' in function_body(page, "resetPreviewScale")
+    assert 'pendingDimensions.get(id)' in function_body(page, "openPreview")
+    assert "Apply the entered size or clear it before slicing" in function_body(page, "confirmSlice")
+
+
+def test_create_reslice_restores_focus_after_refresh_replaces_trigger(page):
+    """Run the real create/open/close handlers with a refresh that detaches the trigger."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is unavailable")
+    functions = []
+    for name in ("createReslice", "openPreview", "closePreview"):
+        functions.append(("async " if name != "closePreview" else "") + function_body(page, name) + "\n}")
+    js = r'''
+const assert = require('assert');
+const body = {isConnected:true, focus(){ throw Error('body should not receive focus'); }};
+let focused;
+const heading = {isConnected:true, focus(){ focused = 'heading'; }};
+const button = {isConnected:true, disabled:false, textContent:'', focus(){ focused = 'button'; }};
+const elements = new Proxy({}, {get(target, id) {
+ if (!target[id]) target[id] = {hidden:false, textContent:'', replaceChildren(){}, focus(){},
+  showModal(){this.open=true}, close(){this.open=false}, setAttribute(){}, removeAttribute(){}};
+ return target[id];
+}});
+const $ = s => s === '#jobsTitle' ? heading : elements[s.slice(1)];
+const document = {activeElement:button, getElementById: id => elements[id]};
+const resliceTokens = new Map(), reslicePending = new Set();
+const newRequestId = () => 'token';
+let previewBusy = false, previewReturnFocus, previewJob, previewAxis, previewScene, previewDrag, previewHidden, previewView;
+const withPreviewBusy = async (_, action) => action();
+const refresh = async () => {button.isConnected = false; document.activeElement = body;};
+const toast = () => {};
+const showPreviewError = () => {};
+global.fetch = async (url, opts) => opts ? {ok:true, json:async()=>({id:'child',status:'awaiting_confirm'})}
+ : {ok:false, statusText:'unavailable', json:async()=>({})};
+''' + "\n".join(functions) + r'''
+(async () => {
+ await createReslice('source', button);
+ assert.equal(previewReturnFocus, button);
+ assert.equal(elements.previewDlg.open, true);
+ closePreview();
+ assert.equal(focused, 'heading');
+ button.isConnected = true;
+ document.activeElement = button;
+ await openPreview('child');
+ closePreview();
+ assert.equal(focused, 'button');
+})().catch(e => {console.error(e); process.exit(1);});
+'''
+    subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)

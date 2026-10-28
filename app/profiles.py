@@ -598,7 +598,8 @@ def _derived_name(process: Path, data: dict) -> str:
     return f"{data.get('name') or Path(process).stem} (portal options)"
 
 
-def write_derived_process(process: Path, datadir: Path, options: dict[str, bool]) -> Path:
+def derived_process_data(process: Path, datadir: Path, options: dict[str, bool]) -> dict:
+    """Build the effective process without writing shared preset state."""
     """Write the per-slice process preset that carries the options; return its path.
 
     The selected preset is only ever read: the CLI refuses a second process file on
@@ -617,6 +618,11 @@ def write_derived_process(process: Path, datadir: Path, options: dict[str, bool]
     derived["name"] = _derived_name(process, data)
     derived.update(_portal_option_fields(Path(datadir), data, options))
 
+    return derived
+
+
+def write_derived_process(process: Path, datadir: Path, options: dict[str, bool]) -> Path:
+    derived = derived_process_data(process, datadir, options)
     derived_path = Path(datadir) / PORTAL_PROCESS_REL
     write_json_atomic(derived_path, derived)
     return derived_path

@@ -241,11 +241,13 @@ def test_vertices_are_rounded_to_a_micrometre_and_negative_zero_is_folded(tmp_pa
     assert len(vertices) == 9
 
 
-def test_the_unit_defaults_to_millimetres_and_is_carried_through(tmp_path):
+def test_the_unit_defaults_to_millimetres_and_is_normalized(tmp_path):
     assert preview.read_scene(three_mf(tmp_path, model_xml(
         [mesh_object(1)], [item(1)], unit=None)))["unit"] == "millimeter"
-    assert preview.read_scene(three_mf(tmp_path, model_xml(
-        [mesh_object(1)], [item(1)], unit="inch"), name="inch.3mf"))["unit"] == "inch"
+    scene = preview.read_scene(three_mf(tmp_path, model_xml(
+        [mesh_object(1)], [item(1)], unit="inch"), name="inch.3mf"))
+    assert scene["unit"] == "millimeter"
+    assert scene["bbox"]["size"] == pytest.approx([254, 254, 0])
 
 
 def test_an_empty_unit_attribute_falls_back_to_millimetres(tmp_path):
@@ -579,3 +581,41 @@ def test_preview_budget_keeps_supports_and_reports_dropped_triangles():
     assert part == 90000, part
     assert statsEl if False else True
     assert "truncated 10000 triangles" in result["statsText"]
+
+
+@pytest.mark.parametrize("unit,multiplier", [("micron", .001), ("centimeter", 10),
+                                              ("meter", 1000), ("foot", 304.8)])
+def test_3mf_units_are_millimetres(tmp_path, unit, multiplier):
+    path = three_mf(tmp_path, model_xml([mesh_object(1)], [item(1)], unit=unit))
+    assert preview.read_scene(path)["bbox"]["size"] == pytest.approx([10 * multiplier, 10 * multiplier, 0])
+
+
+def test_unknown_units_and_external_references_are_refused(tmp_path):
+    path = three_mf(tmp_path, model_xml([mesh_object(1)], [item(1)], unit="parsec"))
+    with pytest.raises(preview.PreviewError, match="unsupported 3MF unit"):
+        preview.read_scene(path)
+    path = three_mf(tmp_path, model_xml([mesh_object(1)], [item(1).replace('/>', ' path="/3D/other.model"/>')]))
+    with pytest.raises(preview.PreviewError, match="external 3MF references"):
+        preview.read_scene(path)
+
+
+def test_compressed_expansion_limits_preview_and_scale(tmp_path, monkeypatch):
+    monkeypatch.setattr(preview, "MAX_EXPANDED_MEMBER", 1000)
+    path = tmp_path / "bomb.3mf"
+    with zipfile.ZipFile(path, "w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(preview.MODEL_MEMBER, model_xml([mesh_object(1)], [item(1)]))
+        archive.writestr("extra", b"x" * 1001)
+    dest = tmp_path / "out.3mf"
+    dest.write_bytes(b"unchanged")
+    for operation in (lambda: preview.read_scene(path), lambda: preview.scale_file(path, 2, dest)):
+        with pytest.raises(preview.PreviewError, match="expanded data limit"):
+            operation()
+    assert dest.read_bytes() == b"unchanged"
+
+
+def test_expanded_total_limit(tmp_path, monkeypatch):
+    monkeypatch.setattr(preview, "MAX_EXPANDED_TOTAL", 1000)
+    path = three_mf(tmp_path, model_xml([mesh_object(1)], [item(1)]),
+                    members={"first": b"x" * 400, "second": b"x" * 400})
+    with pytest.raises(preview.PreviewError, match="expanded data limit"):
+        preview.read_scene(path)

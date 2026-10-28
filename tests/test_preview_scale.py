@@ -131,6 +131,9 @@ def test_scale_file_round_trips_cube_and_scales_a_3mf_transform(tmp_path):
     out = tmp_path / "part-scaled.3mf"
     preview.scale_file(src, 2, out)
     scene = preview.read_scene(out)
+    before_3mf = preview.read_scene(src)
+    for key in ("min", "max", "size"):
+        assert scene["bbox"][key] == pytest.approx([v * 2 for v in before_3mf["bbox"][key]])
     assert len(scene["bbox"]["size"]) == 3
     assert all(value > 0 for value in scene["bbox"]["size"])
     with zipfile.ZipFile(src) as original, zipfile.ZipFile(out) as scaled:
@@ -145,6 +148,57 @@ def test_scale_file_round_trips_cube_and_scales_a_3mf_transform(tmp_path):
             transform = [float(token) for token in element.get("transform").split()]
         if tag == "vertex" and element.get("x") == "2":
             vertex_x = 2.0
-    # 3x3 was 2 0 0 0 3 0 0 0 4 and translation 5 6 7; both multiplied by 2.
-    assert transform == pytest.approx([4, 0, 0, 0, 6, 0, 0, 0, 8, 10, 12, 14])
+    # Linear terms are preserved; translations and vertices scale once.
+    assert transform == pytest.approx([2, 0, 0, 0, 3, 0, 0, 0, 4, 10, 12, 14])
     assert vertex_x == 2.0
+
+
+def test_nested_shared_instances_rotation_build_translation_and_repeated_scale(tmp_path):
+    from test_preview import mesh_object, component_object, model_xml, item, three_mf
+    src = three_mf(tmp_path, model_xml([
+        mesh_object(1),
+        component_object(2, [(1, "0 1 0 -1 0 0 0 0 1 5 6 7"),
+                             (1, "1 0 0 0 1 0 0 0 1 -3 4 5")]),
+        component_object(3, [(2, "1 0 0 0 1 0 0 0 1 8 9 10")]),
+    ], [item(3, "1 0 0 0 1 0 0 0 1 11 12 13"), item(1)], unit="inch"))
+    before = preview.read_scene(src)
+    out = tmp_path / "out.3mf"
+    preview.scale_file(src, 2, out)
+    preview.scale_file(out, 1.5, out)
+    after = preview.read_scene(out)
+    for a, b in zip(before["objects"], after["objects"]):
+        assert b["vertices"] == pytest.approx([v * 3 for v in a["vertices"]], abs=0.002)
+    for key in ("min", "max", "size"):
+        assert after["bbox"][key] == pytest.approx([v * 3 for v in before["bbox"][key]], abs=0.003)
+
+
+def test_short_ascii_stl_and_whitespace_obj_scaling(tmp_path):
+    stl = tmp_path / "short.stl"
+    stl.write_text("vertex 0 0 0\nvertex 1 0 0\nvertex 0 1 0\n")
+    preview.scale_file(stl, 2, stl)
+    assert preview.read_scene(stl)["bbox"]["size"] == [2, 2, 0]
+    obj = tmp_path / "tabs.obj"
+    obj.write_text("  v\t0 0 0\nv\t1 0 0\n v 0 1 0\nf 1 2 3\n")
+    preview.scale_file(obj, 3, obj)
+    assert preview.read_scene(obj)["bbox"]["size"] == [3, 3, 0]
+
+
+@pytest.mark.parametrize("factor", [float('nan'), float('inf'), 0, -1, True, 1e100])
+def test_invalid_scale_preserves_destination(tmp_path, factor):
+    src = tmp_path / "in.stl"
+    src.write_bytes(_box_stl())
+    out = tmp_path / "out.stl"
+    out.write_bytes(b"unchanged")
+    with pytest.raises(preview.PreviewError):
+        preview.scale_file(src, factor, out)
+    assert out.read_bytes() == b"unchanged"
+    assert src.read_bytes() == _box_stl()
+
+
+def test_geometry_capability_zero_and_unsupported(tmp_path):
+    path = tmp_path / "zero.obj"
+    path.write_text("v 0 0 0\nv 0 0 0\nv 0 0 0\nf 1 2 3\n")
+    result = preview.geometry_capability(path)
+    assert result["preview_available"] and not result["resize_available"]
+    assert result["size"] == [0, 0, 0]
+    assert not preview.geometry_capability(tmp_path / "missing.obj")["preview_available"]

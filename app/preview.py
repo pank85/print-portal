@@ -33,11 +33,14 @@ against, so its objects are parts.
 """
 from __future__ import annotations
 
+import lzma
 import math
-import re
+import os
+import tempfile
 import struct
 import xml.etree.ElementTree as ET
 import zipfile
+import zlib
 from pathlib import Path
 
 MAX_TRIANGLES = 450_000
@@ -45,6 +48,13 @@ MAX_TRIANGLES = 450_000
 
 MAX_BYTES = 32 * 1024 * 1024
 """Cap on the input file: a bigger archive is refused before it is unpacked."""
+
+MAX_EXPANDED_MEMBER = 64 * 1024 * 1024
+MAX_EXPANDED_TOTAL = 128 * 1024 * 1024
+MAX_COORDINATE_MM = 1_000_000_000
+
+_UNIT_MM = {"micron": 0.001, "millimeter": 1.0, "centimeter": 10.0,
+            "inch": 25.4, "foot": 304.8, "meter": 1000.0}
 
 MAX_COMPONENT_DEPTH = 8
 """Cap on nested 3MF ``<components>``; deeper trees are refused, not flattened."""
@@ -112,6 +122,8 @@ def _scene(name: str, unit: str, leaves: list[dict]) -> dict:
     for index, leaf in enumerate(leaves, start=1):
         vertices: list[float] = []
         for x, y, z in leaf["vertices"]:
+            if not all(math.isfinite(v) and abs(v) <= MAX_COORDINATE_MM for v in (x, y, z)):
+                raise PreviewError(f"{name} has non-finite or out-of-range coordinates")
             point = (_round(x), _round(y), _round(z))
             vertices.extend(point)
             for axis, value in enumerate(point):
@@ -198,7 +210,7 @@ def _transform(raw: str | None, *, name: str) -> tuple[float, ...]:
     if not raw or not raw.strip():
         return _IDENTITY
     values = _floats(raw)
-    if values is None or len(values) not in (9, 12):
+    if values is None or len(values) not in (9, 12) or not all(math.isfinite(v) for v in values):
         raise PreviewError(f"{name} has a malformed 3MF transform ({raw!r})")
     if len(values) == 9:  # a bare 3x3 rotation/scale writers sometimes emit
         return (*values, 0.0, 0.0, 0.0)
@@ -316,22 +328,51 @@ def _read_objects(root: ET.Element, name: str) -> tuple[dict[int, _Object], list
     return objects, items
 
 
-def _settings_object_ids(archive: zipfile.ZipFile, names: set[str]) -> set[int]:
-    """Object ids described by the archive's slicer settings document (may be empty)."""
-    if MODEL_SETTINGS_MEMBER not in names:
+def _settings_object_ids(data: bytes | None) -> set[int]:
+    """Object ids in an optional slicer settings document."""
+    if data is None:
         return set()
     try:
-        root = ET.fromstring(archive.read(MODEL_SETTINGS_MEMBER))
-    except (ET.ParseError, KeyError, OSError, zipfile.BadZipFile):
+        root = ET.fromstring(data)
+    except ET.ParseError:
         return set()
     ids: set[int] = set()
     for element in root.iter():
-        if _local(element.tag) not in ("object", "part"):
-            continue
-        raw = (element.get("id") or "").strip()
-        if raw.lstrip("+-").isdigit():
-            ids.add(int(raw))
+        if _local(element.tag) in ("object", "part"):
+            raw = (element.get("id") or "").strip()
+            if raw.lstrip("+-").isdigit():
+                ids.add(int(raw))
     return ids
+
+
+def _archive_members(path: Path) -> list[tuple[zipfile.ZipInfo, bytes]]:
+    """Read every member with declared and streamed expansion limits."""
+    try:
+        with zipfile.ZipFile(path) as archive:
+            infos = archive.infolist()
+            if sum(info.filename == MODEL_MEMBER for info in infos) != 1:
+                raise PreviewError(f"{path.name} has no 3MF model part ({MODEL_MEMBER}) or has duplicate model parts")
+            if any(info.file_size > MAX_EXPANDED_MEMBER for info in infos) or sum(
+                    info.file_size for info in infos) > MAX_EXPANDED_TOTAL:
+                raise PreviewError(f"{path.name} exceeds the 3MF expanded data limit")
+            total = 0
+            members = []
+            for info in infos:
+                chunks = []
+                count = 0
+                with archive.open(info) as source:
+                    while chunk := source.read(65536):
+                        count += len(chunk)
+                        total += len(chunk)
+                        if count > MAX_EXPANDED_MEMBER or total > MAX_EXPANDED_TOTAL:
+                            raise PreviewError(f"{path.name} exceeds the 3MF expanded data limit")
+                        chunks.append(chunk)
+                members.append((info, b"".join(chunks)))
+            return members
+    except PreviewError:
+        raise
+    except (zipfile.BadZipFile, zlib.error, lzma.LZMAError, OSError, EOFError, RuntimeError, NotImplementedError) as exc:
+        raise PreviewError(f"{path.name} is not a readable 3MF archive") from exc
 
 
 def _role(obj: _Object, settings_ids: set[int]) -> str:
@@ -345,28 +386,23 @@ def _role(obj: _Object, settings_ids: set[int]) -> str:
 
 def _read_3mf(path: Path) -> tuple[str, list[dict]]:
     """``(unit, leaves)`` from a 3MF: one leaf per build item, components flattened."""
-    try:
-        with zipfile.ZipFile(path) as archive:
-            names = set(archive.namelist())
-            if MODEL_MEMBER not in names:
-                raise PreviewError(f"{path.name} has no 3MF model part ({MODEL_MEMBER})")
-            if archive.getinfo(MODEL_MEMBER).file_size > MAX_BYTES:
-                raise PreviewError(f"{path.name}: {MODEL_MEMBER} is too large")
-            try:
-                raw = archive.read(MODEL_MEMBER)
-            except (KeyError, OSError, zipfile.BadZipFile) as exc:
-                raise PreviewError(f"{path.name} has an unreadable 3MF model part") from exc
-            settings_ids = _settings_object_ids(archive, names)
-    except zipfile.BadZipFile as exc:
-        raise PreviewError(f"{path.name} is not a readable 3MF archive") from exc
-    except OSError as exc:
-        raise PreviewError(f"{path.name}: cannot read the file ({exc.strerror})") from exc
+    members = _archive_members(path)
+    raw = next(data for info, data in members if info.filename == MODEL_MEMBER)
+    settings_ids = _settings_object_ids(next(
+        (data for info, data in members if info.filename == MODEL_SETTINGS_MEMBER), None))
 
     try:
         root = ET.fromstring(raw)
     except ET.ParseError as exc:
         raise PreviewError(f"{path.name} has a malformed 3MF model part ({exc})") from exc
 
+    unit = (root.get("unit") or DEFAULT_UNIT).strip() or DEFAULT_UNIT
+    if unit not in _UNIT_MM:
+        raise PreviewError(f"{path.name} has unsupported 3MF unit {unit!r}")
+    for element in root.iter():
+        if _local(element.tag) in ("component", "item") and any(
+                _local(attr) == "path" for attr in element.attrib):
+            raise PreviewError(f"{path.name} has unsupported external 3MF references")
     objects, items = _read_objects(root, path.name)
     budget = _Budget(path.name)
     leaves: list[dict] = []
@@ -382,8 +418,10 @@ def _read_3mf(path: Path) -> tuple[str, list[dict]]:
                 f"{path.name} has a 3MF build item naming object {target}, which is not defined")
         _flatten(path.name, objects, target, _transform(item.get("transform"), name=path.name),
                  (), budget, settings_ids, leaves)
-    unit = (root.get("unit") or DEFAULT_UNIT).strip() or DEFAULT_UNIT
-    return unit, leaves
+    multiplier = _UNIT_MM[unit]
+    for leaf in leaves:
+        leaf["vertices"] = [tuple(v * multiplier for v in point) for point in leaf["vertices"]]
+    return DEFAULT_UNIT, leaves
 
 
 def _flatten(name: str, objects: dict[int, _Object], object_id: int,
@@ -571,11 +609,13 @@ def _scale_number(raw: str, factor: float, *, name: str) -> str:
         raise PreviewError(f"{name} has a non-numeric coordinate ({raw!r})") from None
     if not math.isfinite(value):
         raise PreviewError(f"{name} has a non-finite coordinate")
-    return format(value, "g")
+    if abs(value) > MAX_COORDINATE_MM:
+        raise PreviewError(f"{name} has an out-of-range coordinate")
+    return format(value, ".17g")
 
 
 def _scale_model_xml(data: bytes, factor: float, name: str) -> bytes:
-    """Scale mesh vertices and any ``<component transform>`` (3x3 and translation)."""
+    """Scale vertices and transform translations, leaving linear terms unchanged."""
     try:
         root = ET.fromstring(data)
     except ET.ParseError as exc:
@@ -588,30 +628,22 @@ def _scale_model_xml(data: bytes, factor: float, name: str) -> bytes:
                 if raw is None:
                     continue
                 element.set(attr, _scale_number(raw, factor, name=name))
-        elif local == "component":
+        elif local in ("component", "item"):
             raw = element.get("transform")
             if not raw or not raw.strip():
                 continue
             tokens = raw.split()
             if len(tokens) not in (9, 12):
                 raise PreviewError(f"{name} has a malformed 3MF transform ({raw!r})")
-            # 9 floats are the 3x3; 12 also carry the translation. Both scale.
-            element.set(
-                "transform",
-                " ".join(_scale_number(token, factor, name=name) for token in tokens),
-            )
+            _transform(raw, name=name)
+            element.set("transform", " ".join(tokens[:9] + [
+                _scale_number(token, factor, name=name) for token in tokens[9:]]))
     return ET.tostring(root, encoding="utf-8", xml_declaration=True)
 
 
 def _scale_3mf(path: Path, factor: float, out_path: Path) -> None:
     """Rewrite the model XML; every other zip member is copied byte-for-byte."""
-    try:
-        with zipfile.ZipFile(path) as src:
-            members = [(info, src.read(info)) for info in src.infolist()]
-    except zipfile.BadZipFile as exc:
-        raise PreviewError(f"{path.name} is not a readable 3MF archive") from exc
-    except OSError as exc:
-        raise PreviewError(f"{path.name}: cannot read the file ({exc.strerror})") from exc
+    members = _archive_members(path)
     scaled = []
     for info, data in members:
         if info.filename == MODEL_MEMBER:
@@ -620,61 +652,86 @@ def _scale_3mf(path: Path, factor: float, out_path: Path) -> None:
     with zipfile.ZipFile(out_path, "w") as dst:
         for info, data in scaled:
             cloned = zipfile.ZipInfo(filename=info.filename, date_time=info.date_time)
-            cloned.compress_type = zipfile.ZIP_STORED if info.filename != MODEL_MEMBER else info.compress_type
+            cloned.compress_type = info.compress_type
             cloned.external_attr = info.external_attr
             cloned.create_system = info.create_system
             dst.writestr(cloned, data)
 
 
-def scale_file(path: Path, factor: float, out_path: Path) -> None:
-    """Bake a uniform scale into the geometry at ``path``, writing ``out_path``.
+def geometry_capability(path: Path) -> dict:
+    """Return bounded preview/resize capability and millimetre dimensions, or a reason.
 
-    Only 3MF is fully supported (the fins path); STL/OBJ vertices are scaled too.
-    A 3MF component ``transform``, when present, has its 3x3 and translation multiplied
-    by the same factor as the mesh vertices. Other zip members are copied unchanged.
+    Zero-size axes cannot be used as resize inputs; other axes may still be usable.
+    This probe does not determine whether a slicer can consume the file.
     """
+    try:
+        scene = read_scene(path)
+    except PreviewError as exc:
+        return {"preview_available": False, "resize_available": False, "reason": str(exc),
+                "unit": "millimeter", "size": None}
+    size = scene["bbox"]["size"]
+    available = any(value > 0 for value in size)
+    return {"preview_available": True, "resize_available": available,
+            "reason": None if available else "geometry has zero extent",
+            "unit": "millimeter", "size": size}
+
+
+def scale_file(path: Path, factor: float, out_path: Path) -> None:
+    """Write validated uniformly scaled geometry atomically, preserving input on failure."""
+    if isinstance(factor, bool) or not isinstance(factor, (int, float)) or not math.isfinite(factor) or factor <= 0:
+        raise PreviewError(f"{path.name}: scale factor must be finite and positive")
+    read_scene(path)  # Validate the complete input and enforce all resource limits first.
     suffix = path.suffix.lower()
-    if suffix == ".3mf":
-        _scale_3mf(path, factor, out_path)
-    elif suffix == ".stl":
-        # binary STL
-        raw = path.read_bytes()
-        # detect binary: triangle count at offset 80
-        import struct
-        count = struct.unpack_from("<I", raw, 80)[0]
-        if 80 + 4 + count * 50 == len(raw):
-            out = bytearray(raw[:84])
-            # header 80 + count 4
-            for i in range(count):
-                off = 84 + i * 50
-                rec = bytearray(raw[off:off+50])
-                # normal 3 floats (0..12) and vertices 3*3 floats (12..48)
-                for j in range(3, 12):
-                    val = struct.unpack_from("<f", rec, j*4)[0] * factor
-                    struct.pack_into("<f", rec, j*4, val)
-                out += rec
-            out_path.write_bytes(out)
-        else:
-            # ASCII
-            text = path.read_text()
-            # scale v lines? STL uses vertex lines
-            import re
-            def repl(m):
-                return "vertex " + " ".join(f"{float(x)*factor:g}" for x in m.group(1).split())
-            text = re.sub(r"vertex\s+([-\d.eE+ ]+)", repl, text)
-            out_path.write_text(text)
-    elif suffix == ".obj":
-        import re
-        lines = path.read_text().splitlines()
-        out = []
-        for line in lines:
-            if line.startswith("v "):
-                parts = line.split()
-                coords = [float(x) * factor for x in parts[1:4]]
-                rest = parts[4:]
-                out.append("v " + " ".join(f"{c:g}" for c in coords) + (" " + " ".join(rest) if rest else ""))
+    tmp = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=out_path.parent, suffix=suffix, delete=False) as f:
+            tmp = Path(f.name)
+        if suffix == ".3mf":
+            _scale_3mf(path, factor, tmp)
+        elif suffix == ".stl":
+            raw = path.read_bytes()
+            count = _binary_triangle_count(raw)
+            if count:
+                out = bytearray(raw)
+                for i in range(count):
+                    for j in range(3, 12):
+                        offset = 84 + i * 50 + j * 4
+                        value = float(_scale_number(str(struct.unpack_from("<f", raw, offset)[0]), factor, name=path.name))
+                        try:
+                            struct.pack_into("<f", out, offset, value)
+                        except (OverflowError, struct.error) as exc:
+                            raise PreviewError(f"{path.name} has an out-of-range coordinate") from exc
+                tmp.write_bytes(out)
             else:
-                out.append(line)
-        out_path.write_text("\n".join(out) + "\n")
-    else:
-        raise PreviewError(f"{path.name}: cannot scale this file type")
+                lines = raw.decode("utf-8", errors="strict").splitlines(keepends=True)
+                result = []
+                for line in lines:
+                    parts = line.split()
+                    if parts and parts[0] == "vertex":
+                        if len(parts) != 4:
+                            raise PreviewError(f"{path.name} has a malformed STL vertex")
+                        line = "vertex " + " ".join(_scale_number(x, factor, name=path.name) for x in parts[1:]) + "\n"
+                    result.append(line)
+                tmp.write_text("".join(result))
+        elif suffix == ".obj":
+            lines = path.read_text().splitlines(keepends=True)
+            result = []
+            for line in lines:
+                parts = line.split()
+                if parts and parts[0] == "v":
+                    if len(parts) < 4:
+                        raise PreviewError(f"{path.name} has a malformed OBJ vertex")
+                    line = "v " + " ".join(_scale_number(x, factor, name=path.name) for x in parts[1:4])
+                    line += (" " + " ".join(parts[4:]) if parts[4:] else "") + "\n"
+                result.append(line)
+            tmp.write_text("".join(result))
+        else:
+            raise PreviewError(f"{path.name}: cannot scale this file type")
+        read_scene(tmp)
+        os.replace(tmp, out_path)
+        tmp = None
+    except (OSError, UnicodeError, ValueError) as exc:
+        raise PreviewError(f"{path.name}: cannot scale geometry ({exc})") from exc
+    finally:
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)

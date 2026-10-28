@@ -411,3 +411,56 @@ def test_rewrite_identity_is_a_noop_without_settings_members(zip_bytes, three_mf
     assert outcome == "stripped"
     assert threemf.PROJECT_SETTINGS_MEMBER not in members(stripped)
     assert members(stripped)["3D/3dmodel.model"] == members(unchanged)["3D/3dmodel.model"]
+
+
+def test_strict_rewrite_validates_and_preserves_geometry(zip_bytes):
+    geometry = b'<model>geometry</model>'
+    blob = zip_bytes({'3D/3dmodel.model': geometry,
+                      threemf.PROJECT_SETTINGS_MEMBER: b'{"printer_settings_id":["old"]}'})
+    rewritten, outcome = threemf.rewrite_identity_strict(
+        blob, {'name': 'local printer'}, {'name': 'local process'})
+    assert outcome == 'identity'
+    assert members(rewritten)['3D/3dmodel.model'] == geometry
+    assert settings_of(rewritten)['printer_settings_id'] == ['local printer']
+    plain = zip_bytes({'3D/3dmodel.model': geometry})
+    assert threemf.rewrite_identity_strict(plain, {'name': 'm'}, {'name': 'p'}) == (plain, 'none')
+
+
+def test_strict_rewrite_rejects_invalid_oversized_and_duplicate_settings(zip_bytes, monkeypatch):
+    machine, process = {'name': 'm'}, {'name': 'p'}
+    for value in (b'{broken', b'[]', b'\xff'):
+        blob = zip_bytes({threemf.PROJECT_SETTINGS_MEMBER: value})
+        with pytest.raises(threemf.IdentityPreflightError):
+            threemf.rewrite_identity_strict(blob, machine, process)
+    with pytest.raises(threemf.IdentityPreflightError):
+        threemf.rewrite_identity_strict(zip_bytes({threemf.SLIC3R_PE_MEMBER: b'not ini'}), machine, process)
+    monkeypatch.setattr(threemf, 'MEMBER_MAX_BYTES', 5)
+    with pytest.raises(threemf.IdentityPreflightError):
+        threemf.rewrite_identity_strict(zip_bytes({threemf.PROJECT_SETTINGS_MEMBER: b'{"x":1}'}), machine, process)
+    output = io.BytesIO()
+    with zipfile.ZipFile(output, 'w') as archive:
+        archive.writestr(threemf.PROJECT_SETTINGS_MEMBER, '{}')
+        archive.writestr(threemf.PROJECT_SETTINGS_MEMBER.upper(), '{}')
+    with pytest.raises(threemf.IdentityPreflightError):
+        threemf.rewrite_identity_strict(output.getvalue(), machine, process)
+    with pytest.raises(threemf.IdentityPreflightError):
+        threemf.rewrite_identity_strict(b'not a zip', machine, process)
+
+
+def test_strict_rewrite_honors_strip(zip_bytes, monkeypatch):
+    monkeypatch.setattr(threemf, 'STRIP', True)
+    blob = zip_bytes({threemf.PROJECT_SETTINGS_MEMBER: b'{}', '3D/3dmodel.model': b'geometry'})
+    result, outcome = threemf.rewrite_identity_strict(blob, {'name': 'm'}, {'name': 'p'})
+    assert outcome == 'stripped'
+    assert members(result) == {'3D/3dmodel.model': b'geometry'}
+
+
+def test_strict_rewrite_bounds_expanded_archive_and_compressed_input(zip_bytes, monkeypatch):
+    machine, process = {'name': 'm'}, {'name': 'p'}
+    blob = zip_bytes({'3D/3dmodel.model': b'x' * 100})
+    monkeypatch.setattr(threemf, 'IDENTITY_EXPANDED_MAX_BYTES', 20)
+    with pytest.raises(threemf.IdentityPreflightError, match='expanded'):
+        threemf.rewrite_identity_strict(blob, machine, process)
+    monkeypatch.setattr(threemf, 'IDENTITY_SOURCE_MAX_BYTES', 1)
+    with pytest.raises(threemf.IdentityPreflightError, match='compressed'):
+        threemf.rewrite_identity_strict(blob, machine, process)

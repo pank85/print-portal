@@ -42,6 +42,37 @@ config and web console, which the portal frames for you.
 5. **Monitor** — state, current file, progress, nozzle and bed temperatures, homed axes, and the job
    list with every job's gcode, reprint and delete.
 
+## Reslice an existing job
+
+A completed or failed job with its retained model offers **Reslice…**. This creates an independent
+`awaiting_confirm` child, leaving the source's status, G-code and print history unchanged. The child
+starts from the source's current retained model, including any fins or previously applied manual
+resize—not its original ZIP or the CLI's oriented/fitted output. A printed job remains `sliced` and
+can also be used. The child keeps its own copies, so deleting the source does not delete the child.
+
+In the reslice dialog, choose the child-only printer, process and filament presets and supports, brim,
+auto-orient and shrink-to-fit options. These edits do not change dashboard selections. The initial
+choices are the source's preset **references**, not historical preset contents: later preset edits
+are reflected when the child is queued. Missing or incompatible choices must be repaired; **Use
+current dashboard settings** explicitly copies the current choices into the dialog. Once confirmed,
+the directly loaded machine, effective process and filament files are captured for the child, but
+this does not freeze the entire Orca datadir or embedded 3MF object overrides.
+
+Enter one dimension in millimetres and **Apply size** to scale proportionally; **Reset size** restores
+the child's starting model, not the original pre-fins upload. Manual resize happens before optional
+CLI auto-fit, and scales fins too. Reslice auto-fit is unavailable for 3MF and finned models; finned
+models are not auto-oriented. Some 3MF projects, including external references or geometry above
+preview limits, cannot be previewed or resized; settings-only slicing remains available if preflight
+accepts the input. Embedded per-object/project overrides may still apply, and unreadable 3MF identity
+settings can prevent confirmation.
+
+**Keep for later** or Escape keeps the draft; resume it from the job list. Apply size to persist it:
+unapplied dimensions are only kept in the current browser tab. **Discard** deletes the child only.
+**Slice new job** saves the settings and queues the child; it does **not** print. Printing still
+requires a separate explicit action after slicing. Drafts are protected from age pruning but can be
+removed individually or by **Delete finished**; completed children and sources are subject to normal
+`KEEP_JOBS` retention. See [reslice API](docs/api.md#reslice) for revisions and error handling.
+
 ## Printer management
 
 Printers live in the UI (**Settings**), not in the deployment: name, Moonraker URL, API key, and an
@@ -130,7 +161,8 @@ Every variable, the datadir layout and the seeding rules: [docs/configuration.md
 
 `GET /api/health` · `/api/printer` · `/api/ui` · `/api/jobs` · `/api/support-fins` · `/api/printers`
 · `/api/profile` (with `POST /api/upload`, `POST /api/jobs/{id}/slice`, `GET /api/jobs/{id}/preview`,
-`POST /api/jobs/{id}/print`, printer CRUD and selection, profile import/select). Full surface with
+`POST /api/jobs/{id}/reslice`, `PATCH /api/jobs/{id}/settings`, `POST /api/jobs/{id}/scale`,
+`POST /api/jobs/{id}/scale/reset`, `POST /api/jobs/{id}/print`, printer CRUD and selection, profile import/select). Full surface with
 status codes and error bodies: [docs/api.md](docs/api.md).
 
 ## Troubleshooting
