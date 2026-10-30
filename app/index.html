@@ -629,6 +629,10 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
               Gcode
             </a>
+            <button type="button" class="btn" id="uploadLatestFromLayer"
+                    data-act="from-layer" aria-label="Print from layer on bed" hidden>
+              Print from layer…
+            </button>
             <button type="button" class="btn" id="uploadLatestPreview"
                     data-act="preview" aria-label="Preview the support fins" hidden>
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -883,6 +887,30 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     <button type="button" class="btn btn-danger" id="previewDiscard">Discard</button>
     <button type="button" class="btn" id="previewClose">Keep for later</button>
     <button type="button" class="btn btn-primary" id="previewConfirm">Slice it</button>
+  </div>
+</dialog>
+
+<dialog id="fromLayerDlg" class="dialog" aria-labelledby="fromLayerTitle" aria-describedby="fromLayerHint">
+  <h2 id="fromLayerTitle">Print from layer on bed</h2>
+  <p id="fromLayerHint" class="hint">Cuts the sliced G-code at the chosen layer and shifts all remaining layers down onto the bed so you can glue the parts together.</p>
+  <div id="fromLayerSavedWrap" class="subgroup" hidden>
+    <p id="fromLayerSavedText" class="hint"></p>
+    <button type="button" class="btn" id="fromLayerUseSaved">Use printer's last layer</button>
+  </div>
+  <div class="field">
+    <label for="fromLayerInput">Start layer</label>
+    <input id="fromLayerInput" type="number" min="1" step="1" aria-describedby="fromLayerSummary fromLayerError">
+  </div>
+  <div class="field">
+    <label for="fromLayerZ">Start Z height (mm)</label>
+    <input id="fromLayerZ" type="number" min="0.01" step="0.01" aria-describedby="fromLayerSummary fromLayerError">
+  </div>
+  <p id="fromLayerSummary" class="mono" role="status" aria-live="polite"></p>
+  <p id="fromLayerError" class="err" role="alert" hidden></p>
+  <div class="dialog-actions">
+    <button type="button" class="btn" id="fromLayerCancel">Cancel</button>
+    <a class="btn" id="fromLayerDownload" href="#">Download .gcode</a>
+    <button type="button" class="btn btn-primary" id="fromLayerPrint">Print on bed</button>
   </div>
 </dialog>
 
@@ -1481,12 +1509,167 @@ async function deleteAllJobs() {
    exactly one printJob(id) path and one del(id) path for the whole page */
 function onJobAction(ev) {
   const btn = ev.target.closest("[data-act]");
-  if (!btn) return;
+  if (!btn) {
+    if (ev.target.closest("a, button, input, select, label")) return;
+    const row = ev.target.closest("article.job");
+    const fromBtn = row && row.querySelector('[data-act="from-layer"]');
+    if (fromBtn && fromBtn.dataset.ref) openFromLayer(fromBtn.dataset.ref, fromBtn);
+    return;
+  }
   if (btn.dataset.act === "print") printJob(btn.dataset.ref);
+  else if (btn.dataset.act === "from-layer") openFromLayer(btn.dataset.ref, btn);
   else if (btn.dataset.act === "delete") del(btn.dataset.ref);
   else if (btn.dataset.act === "preview") openPreview(btn.dataset.ref);
   else if (btn.dataset.act === "reslice") createReslice(btn.dataset.ref, btn);
   else if (btn.dataset.act === "slice") confirmSlice(btn.dataset.ref);
+}
+
+let fromLayerState = { jid: null, layers: [], printerLayer: null, trigger: null };
+
+function updateFromLayerSummary() {
+  const inp = $("#fromLayerInput"), zInp = $("#fromLayerZ"),
+        sum = $("#fromLayerSummary"), err = $("#fromLayerError"),
+        dl = $("#fromLayerDownload"), pr = $("#fromLayerPrint");
+  const layers = fromLayerState.layers || [];
+  const jid = fromLayerState.jid;
+  err.hidden = true;
+  err.textContent = "";
+  const val = parseInt(inp.value, 10);
+  const entry = layers.find(l => l.layer === val);
+  if (!entry || val < 1) {
+    sum.textContent = layers.length > 1
+      ? `Choose a layer between 1 and ${layers[layers.length - 1].layer}`
+      : "No splittable layers found.";
+    dl.href = "#";
+    dl.setAttribute("aria-disabled", "true");
+    pr.disabled = true;
+    pr.textContent = "Print from layer and on";
+    return;
+  }
+  const idx = layers.indexOf(entry);
+  const remaining = layers.length - idx;
+  const maxZ = layers[layers.length - 1].z;
+  const bedZ = entry.height > 0 ? entry.height : 0.2;
+  const offset = +(entry.z - bedZ).toFixed(4);
+  const newHeight = +(maxZ - offset).toFixed(2);
+  if (document.activeElement !== zInp) zInp.value = String(entry.z);
+  sum.textContent = `Layer ${entry.layer} → ${layers[layers.length - 1].layer} (${remaining} layers) · Z ${entry.z} mm → ${bedZ} mm on bed (${newHeight} mm tall)`;
+  dl.href = `/api/jobs/${encodeURIComponent(jid)}/gcode?from_layer=${entry.layer}`;
+  dl.removeAttribute("aria-disabled");
+  pr.disabled = false;
+  pr.textContent = `Print from layer ${entry.layer} and on`;
+}
+
+async function openFromLayer(id, triggerBtn) {
+  const dlg = $("#fromLayerDlg"), inp = $("#fromLayerInput"), zInp = $("#fromLayerZ"),
+        savedWrap = $("#fromLayerSavedWrap"), savedText = $("#fromLayerSavedText"),
+        err = $("#fromLayerError"), sum = $("#fromLayerSummary"), pr = $("#fromLayerPrint");
+  fromLayerState = { jid: id, layers: [], printerLayer: null, trigger: triggerBtn || null };
+  err.hidden = true;
+  err.textContent = "";
+  savedWrap.hidden = true;
+  sum.textContent = "Loading layers…";
+  pr.disabled = true;
+  if (typeof dlg.showModal === "function" && !dlg.open) dlg.showModal();
+  try {
+    const r = await fetch(`/api/jobs/${id}/layers`);
+    const data = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(data.detail || r.statusText);
+    const layers = Array.isArray(data.layers) ? data.layers : [];
+    fromLayerState.layers = layers;
+    fromLayerState.printerLayer = typeof data.printer_current_layer === "number" ? data.printer_current_layer : null;
+    if (layers.length < 2) {
+      throw new Error("This G-code has fewer than 2 layers and cannot be split.");
+    }
+    const maxLayer = layers[layers.length - 1].layer;
+    inp.min = "1";
+    inp.max = String(maxLayer);
+    zInp.min = String(layers[1].z);
+    zInp.max = String(layers[layers.length - 1].z);
+    const pLayer = fromLayerState.printerLayer;
+    if (pLayer !== null && pLayer >= 1 && pLayer <= maxLayer) {
+      savedWrap.hidden = false;
+      savedText.textContent = `Printer variables.cfg saved current_layer = ${pLayer}${data.printer_file ? " (" + data.printer_file + ")" : ""}`;
+      inp.value = String(pLayer);
+    } else {
+      if (pLayer !== null) {
+        savedWrap.hidden = false;
+        savedText.textContent = `Printer variables.cfg has current_layer = ${pLayer} (outside 1..${maxLayer})`;
+      }
+      inp.value = String(layers[Math.max(1, Math.floor(layers.length / 2))].layer);
+    }
+    updateFromLayerSummary();
+    inp.focus();
+  } catch (e) {
+    sum.textContent = "";
+    err.textContent = e.message;
+    err.hidden = false;
+  }
+}
+
+async function submitFromLayerPrint() {
+  const { jid, layers } = fromLayerState;
+  const inp = $("#fromLayerInput"), err = $("#fromLayerError"), pr = $("#fromLayerPrint"),
+        dlg = $("#fromLayerDlg");
+  const layer = parseInt(inp.value, 10);
+  if (!jid || !layers.some(l => l.layer === layer)) {
+    err.textContent = "Enter a valid start layer.";
+    err.hidden = false;
+    inp.focus();
+    return;
+  }
+  pr.disabled = true;
+  pr.setAttribute("aria-busy", "true");
+  pr.textContent = "Starting…";
+  err.hidden = true;
+  try {
+    const r = await fetch(`/api/jobs/${jid}/print-from-layer`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ layer }),
+    });
+    const j = await r.json().catch(() => ({}));
+    if (!r.ok) throw new Error(j.detail || r.statusText);
+    if (dlg.open) dlg.close();
+    toast(`Started from layer ${j.start_layer} on bed: ${j.remote_file}`, 5000);
+    refresh();
+  } catch (e) {
+    err.textContent = e.message;
+    err.hidden = false;
+  } finally {
+    pr.disabled = false;
+    pr.removeAttribute("aria-busy");
+    updateFromLayerSummary();
+  }
+}
+
+function initFromLayer() {
+  const dlg = $("#fromLayerDlg"), inp = $("#fromLayerInput"), zInp = $("#fromLayerZ");
+  $("#fromLayerCancel").addEventListener("click", () => dlg.close());
+  $("#fromLayerUseSaved").addEventListener("click", () => {
+    const pLayer = fromLayerState.printerLayer;
+    if (pLayer !== null) {
+      inp.value = String(pLayer);
+      updateFromLayerSummary();
+    }
+  });
+  inp.addEventListener("input", updateFromLayerSummary);
+  zInp.addEventListener("input", () => {
+    const z = parseFloat(zInp.value);
+    const layers = fromLayerState.layers || [];
+    if (!Number.isFinite(z) || layers.length < 2) return;
+    const match = layers.find((l, idx) => idx >= 1 && l.z >= z - 1e-6) || layers[layers.length - 1];
+    if (match) {
+      inp.value = String(match.layer);
+      updateFromLayerSummary();
+    }
+  });
+  $("#fromLayerPrint").addEventListener("click", submitFromLayerPrint);
+  dlg.addEventListener("close", () => {
+    if (fromLayerState.trigger && document.contains(fromLayerState.trigger)) {
+      fromLayerState.trigger.focus();
+    }
+  });
 }
 
 /* The upload card is not re-rendered by the poll, so its element is updated in place
@@ -1576,6 +1759,9 @@ function renderJobRow(j) {
             <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
             Print
           </button>
+          <button type="button" class="btn" data-act="from-layer" data-ref="${esc(j.id)}">
+            Print from layer…
+          </button>
           <a class="btn" href="/api/jobs/${esc(j.id)}/gcode">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
@@ -1610,6 +1796,7 @@ function renderJobRow(j) {
 function setUploadLatest(job) {
   const box = $("#uploadLatest"), body = $("#uploadLatestBody"),
         print = $("#uploadLatestPrint"), gcode = $("#uploadLatestGcode"),
+        fromLayer = $("#uploadLatestFromLayer"),
         preview = $("#uploadLatestPreview"), slice = $("#uploadLatestSlice"),
         remove = $("#uploadLatestDelete");
   if (!job) { box.hidden = true; return; }
@@ -1623,6 +1810,9 @@ function setUploadLatest(job) {
   gcode.hidden = !printable;
   gcode.href = printable ? `/api/jobs/${job.id}/gcode` : "#";
   gcode.setAttribute("aria-label", `Download ${name} as gcode`);
+  fromLayer.hidden = !printable;
+  fromLayer.dataset.ref = printable ? job.id : "";
+  fromLayer.setAttribute("aria-label", `Print ${name} from a layer on the bed`);
   /* staged jobs are previewable up to the moment they queue; the poll re-aims this static button */
   const staged = job.status === "awaiting_confirm" && !job.error;
   preview.hidden = !staged;
@@ -2720,6 +2910,7 @@ function boot() {
   $("#uploadLatest").addEventListener("click", onJobAction);
   initPreview();
   initSupportFins();
+  initFromLayer();
 
   $("#profFile").addEventListener("change", async ev => {
     const f = ev.target.files[0]; if (!f) return;

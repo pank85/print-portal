@@ -241,6 +241,27 @@ class MoonrakerClient:
         except MoonrakerError as exc:
             return {"ok": False, "state": "offline", "error": str(exc)}
 
+    def saved_layer_info(self) -> dict[str, Any]:
+        """Read ``current_layer`` from Klipper's ``[save_variables]`` (``variables.cfg``) or ``print_stats``."""
+        status = self.query_objects(("save_variables", "print_stats"))
+        sv_vars = ((status.get("save_variables") or {}).get("variables")) or {}
+        print_stats = status.get("print_stats") or {}
+        ps_info = (print_stats.get("info") if isinstance(print_stats, dict) else None) or {}
+        raw_layer = sv_vars.get("current_layer")
+        if raw_layer is None:
+            raw_layer = ps_info.get("current_layer")
+        layer: int | None = None
+        if raw_layer is not None and not isinstance(raw_layer, bool):
+            try:
+                layer = int(raw_layer)
+            except (TypeError, ValueError):
+                layer = None
+        return {
+            "current_layer": layer,
+            "filename": Path(print_stats.get("filename") or "").name or None,
+            "state": print_stats.get("state", "unknown"),
+        }
+
     def upload(
         self,
         path: Path,

@@ -62,7 +62,7 @@ import printers
 import profiles as prof
 import supportfins
 import threemf
-from gcode import parse_gcode_stats
+from gcode import inspect_gcode_layers, parse_gcode_stats, rebase_gcode_to_bed
 
 # The env printer is optional here: printers normally live in printers.json. An unconfigured
 # instance still boots so the UI can be used, and printer traffic fails closed per request.
@@ -1854,12 +1854,67 @@ def api_job(jid: str):
         return _job_capabilities(read_job(jid))
 
 
-@app.get("/api/jobs/{jid}/gcode")
-def api_gcode(jid: str):
+@app.get("/api/jobs/{jid}/layers")
+def api_job_layers(jid: str):
     job = read_job(jid)
     gcode = gcode_path(jid, job)
     if gcode is None:
         raise HTTPException(409, "not sliced yet")
+    layers = inspect_gcode_layers(gcode)
+    printer_layer: int | None = None
+    printer_file: str | None = None
+    try:
+        saved = current_client().saved_layer_info()
+        printer_layer = saved.get("current_layer")
+        printer_file = saved.get("filename")
+    except (HTTPException, moonraker.MoonrakerError):
+        pass
+    return {
+        "total_layers": len(layers),
+        "layers": [
+            {"layer": entry["layer"], "z": entry["z"], "height": entry["height"]}
+            for entry in layers
+        ],
+        "printer_current_layer": printer_layer,
+        "printer_file": printer_file,
+    }
+
+
+def _rebased_gcode(
+    jid: str,
+    job: dict,
+    gcode: Path,
+    *,
+    start_layer: int | None = None,
+    start_z: float | None = None,
+) -> tuple[Path, dict]:
+    stem = job_output_name(job)
+    dst_dir = SLICED / jid
+    dst_dir.mkdir(parents=True, exist_ok=True)
+    tmp = dst_dir / f"{stem}_rebased_tmp.gcode"
+    try:
+        meta = rebase_gcode_to_bed(gcode, tmp, start_layer=start_layer, start_z=start_z)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+    final = dst_dir / f"{stem}_from_layer{meta['start_layer']}_on_bed.gcode"
+    tmp.replace(final)
+    return final, meta
+
+
+@app.get("/api/jobs/{jid}/gcode")
+def api_gcode(jid: str, from_layer: int | None = None, from_z: float | None = None):
+    job = read_job(jid)
+    gcode = gcode_path(jid, job)
+    if gcode is None:
+        raise HTTPException(409, "not sliced yet")
+    if from_layer is not None or from_z is not None:
+        rebased, meta = _rebased_gcode(
+            jid, job, gcode, start_layer=from_layer, start_z=from_z
+        )
+        return FileResponse(
+            rebased,
+            filename=f"{job_output_name(job)}_from_layer{meta['start_layer']}_on_bed.gcode",
+        )
     return FileResponse(gcode, filename=job_output_name(job) + ".gcode")
 
 
@@ -1896,6 +1951,86 @@ def api_print(jid: str):
         write_job(jid, printed=datetime.now(timezone.utc).isoformat(timespec="seconds"),
                   remote_file=remote_name, print_started=True, print_error=None)
         return {"started": True, "remote_file": remote_name}
+    finally:
+        with STAGE_LOCK:
+            _PRINT_PINS[jid] -= 1
+            if not _PRINT_PINS[jid]:
+                del _PRINT_PINS[jid]
+
+
+@app.post("/api/jobs/{jid}/print-from-layer")
+def api_print_from_layer(jid: str, body: dict | None = None):
+    payload = body if isinstance(body, dict) else {}
+    raw_layer = payload.get("layer")
+    raw_z = payload.get("z")
+    start_layer: int | None = None
+    start_z: float | None = None
+    if raw_layer is not None:
+        if isinstance(raw_layer, bool) or not isinstance(raw_layer, (int, float, str)):
+            raise HTTPException(422, "layer must be an integer")
+        try:
+            start_layer = int(raw_layer)
+        except ValueError as exc:
+            raise HTTPException(422, "layer must be an integer") from exc
+    elif raw_z is not None:
+        if isinstance(raw_z, bool) or not isinstance(raw_z, (int, float, str)):
+            raise HTTPException(422, "z must be a number")
+        try:
+            start_z = float(raw_z)
+        except ValueError as exc:
+            raise HTTPException(422, "z must be a number") from exc
+
+    with STAGE_LOCK:
+        job = read_job(jid)
+        if job.get("status") != "sliced":
+            raise HTTPException(409, f"job is '{job.get('status')}', not sliced")
+        gcode = gcode_path(jid, job)
+        if gcode is None:
+            raise HTTPException(409, "not sliced yet")
+        _PRINT_PINS[jid] = _PRINT_PINS.get(jid, 0) + 1
+    try:
+        client = current_client()
+        try:
+            info = client.printer_status()
+        except moonraker.MoonrakerError as exc:
+            raise HTTPException(exc.http_status, str(exc)) from exc
+        if info["webhooks"] != "ready":
+            raise HTTPException(409, f"klipper not ready: {info['webhooks']}")
+        if info["state"] not in ("standby", "complete"):
+            raise HTTPException(409, f"printer busy: state={info['state']}")
+
+        if start_layer is None and start_z is None:
+            try:
+                saved = client.saved_layer_info()
+            except moonraker.MoonrakerError as exc:
+                raise HTTPException(exc.http_status, str(exc)) from exc
+            start_layer = saved.get("current_layer")
+            if start_layer is None:
+                raise HTTPException(
+                    422, "printer has no saved current_layer; specify layer or z"
+                )
+
+        rebased, meta = _rebased_gcode(
+            jid, job, gcode, start_layer=start_layer, start_z=start_z
+        )
+        suffix = f"_from_layer{meta['start_layer']}_on_bed.gcode"
+        prefix = f"portal_{jid}_{job_output_name(job)}"[: 90 - len(suffix)]
+        remote_name = f"{prefix}{suffix}"
+        try:
+            client.upload(rebased, remote_name)
+            client.start_print(remote_name)
+        except moonraker.MoonrakerError as exc:
+            write_job(jid, print_started=False, print_error=str(exc)[-300:])
+            raise HTTPException(exc.http_status, str(exc)) from exc
+
+        write_job(
+            jid,
+            printed=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            remote_file=remote_name,
+            print_started=True,
+            print_error=None,
+        )
+        return {"started": True, "remote_file": remote_name, **meta}
     finally:
         with STAGE_LOCK:
             _PRINT_PINS[jid] -= 1
