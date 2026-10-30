@@ -14,15 +14,19 @@ The one field the CLI is strict about is `from`, measured with OrcaSlicer 2.4.2:
 preset must carry `"from": "system"` (`"user"` -> return_code -17 "The selected printer is not
 compatible with the process preset in the 3mf", `"System"`/`"SYSTEM"`/absent -> return_code 251
 "The input preset file is invalid and can not be parsed"), while process and filament presets
-take `"User"`/`"user"` and reject `"System"`. A dangling `inherits` is tolerated (rc=0) and so is
-an empty `system/Custom.json`, so import sets the type and `from`, rewrites
-`compatible_printers` to the imported machine's own name, and writes everything else as it came.
+take `"User"`/`"user"` and reject `"System"`. The CLI tolerates a dangling `inherits` but
+silently uses defaults, so the portal resolves chains itself and refuses incomplete slices.
+Import sets the type and `from`, rewrites `compatible_printers` to the imported machine's own
+name, and preserves the remaining source settings.
 """
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import math
 import os
+import stat
 import re
 import shutil
 import tempfile
@@ -90,13 +94,285 @@ SUMMARISE = {
 }
 
 
-class ProfileError(RuntimeError):
-    pass
-
-
 # The upload endpoint refuses bundles above this size; a single zip member may not be
 # larger either, so an inflated member cannot be read into memory.
 BUNDLE_MAX_BYTES = 20 * 1024 * 1024
+
+# The resources belonging to the pinned Orca installation, not the writable datadir.
+ORCA_PROFILES = Path('/opt/orca/resources/profiles')
+
+
+def _resolved_chain(path: Path, ptype: str, datadir: Path,
+                    resources: Path | None = None, *,
+                    chain_paths: list[Path] | None = None) -> list[dict]:
+    """Resolve a complete chain without changing the selected or parent presets.
+
+    A bundled vendor preset has a trusted vendor context; custom presets do not.
+    Otherwise require a unique name across both roots. Never interpret inherits as a path.
+    """
+    if ptype not in ('machine', 'process', 'filament'):
+        raise ProfileError(f'unknown preset type: {ptype}')
+    roots = [Path(datadir).resolve(), Path(resources or ORCA_PROFILES).resolve()]
+    path = Path(path).resolve()
+    if not any(path.is_relative_to(root) for root in roots):
+        raise ProfileError('preset escapes the preset roots')
+
+    def read_preset(file: Path) -> dict:
+        try:
+            if file.stat().st_size > BUNDLE_MAX_BYTES:
+                raise ValueError('preset is too large')
+            value = json.loads(file.read_text(encoding='utf-8'))
+        except (OSError, ValueError) as exc:
+            raise ProfileError(f'unreadable {ptype} preset: {file.name}') from exc
+        if not isinstance(value, dict) or value.get('type') not in (None, ptype):
+            raise ProfileError(f'invalid {ptype} preset: {file.name}')
+        return value
+
+    bindings = load_parent_edges(roots[0])
+
+    def identity(file: Path) -> str:
+        for prefix, root in zip(('datadir', 'resources'), roots):
+            if file.is_relative_to(root):
+                return prefix + ':' + file.relative_to(root).as_posix()
+        raise ProfileError('preset escapes the preset roots')
+
+    def mapped_parent(binding: object, expected: str) -> tuple[Path, dict]:
+        if not isinstance(binding, dict) or set(binding) != {'parent', 'inherits', 'sha256'} or binding['inherits'] != expected:
+            raise ProfileError(f'invalid explicit {ptype} parent mapping for {path.name}')
+        target = binding['parent']
+        digest = binding['sha256']
+        if not isinstance(target, str) or not isinstance(digest, str) or not re.fullmatch(r'[0-9a-f]{64}', digest):
+            raise ProfileError(f'invalid explicit {ptype} parent mapping for {path.name}')
+        prefix, sep, rel = target.partition(':')
+        if not sep or prefix not in ('datadir', 'resources') or not rel or Path(rel).is_absolute() or '..' in Path(rel).parts:
+            raise ProfileError('invalid explicit parent path')
+        root = roots[('datadir', 'resources').index(prefix)]
+        candidate = (root / rel).resolve()
+        if not candidate.is_relative_to(root) or ptype not in candidate.relative_to(root).parts or candidate.suffix != '.json':
+            raise ProfileError('explicit parent escapes its preset root or type')
+        try:
+            with candidate.open('rb') as handle:
+                raw = handle.read(BUNDLE_MAX_BYTES + 1)
+            if len(raw) > BUNDLE_MAX_BYTES or hashlib.sha256(raw).hexdigest() != digest:
+                raise ValueError('digest mismatch')
+            data = json.loads(raw)
+        except (OSError, ValueError) as exc:
+            raise ProfileError(f'explicit {ptype} parent is unavailable or changed') from exc
+        if not isinstance(data, dict) or data.get('type') not in (None, ptype):
+            raise ProfileError(f'invalid {ptype} preset: {candidate.name}')
+        if (data.get('name') or candidate.stem) != expected:
+            raise ProfileError(f'explicit {ptype} parent name does not match inherits')
+        return candidate, data
+
+    seen: set[Path] = set()
+    chain: list[dict] = []
+    verified: dict[Path, dict] = {}
+    index: dict[str, set[Path]] | None = None
+    while True:
+        if path in seen:
+            raise ProfileError(f'cyclic {ptype} preset inheritance at {path.name}')
+        if len(seen) >= 128:
+            raise ProfileError(f'{ptype} preset inheritance is too deep')
+        seen.add(path)
+        if chain_paths is not None:
+            chain_paths.append(path)
+        data = verified.pop(path, None)
+        if data is None:
+            data = read_preset(path)
+        chain.append(data)
+        parent = data.get('inherits')
+        if parent is None or parent == '':
+            break
+        if not isinstance(parent, str) or not parent.strip():
+            raise ProfileError(f'invalid {ptype} preset inherits in {path.name}')
+        if identity(path) in bindings:
+            path, parent_data = mapped_parent(bindings[identity(path)], parent)
+            verified[path] = parent_data
+            continue
+        if index is None:
+            index = {}
+            for root in roots:
+                if not root.is_dir():
+                    continue
+                for candidate in root.glob(f'**/{ptype}/**/*.json'):
+                    resolved = candidate.resolve()
+                    if not resolved.is_relative_to(root) or not resolved.is_file():
+                        continue
+                    try:
+                        value = read_preset(resolved)
+                    except ProfileError:
+                        continue
+                    name = value.get('name') or candidate.stem
+                    if isinstance(name, str):
+                        index.setdefault(name, set()).add(resolved)
+        matches = sorted(index.get(parent, set()))
+        # Within a vendor, Orca stores some presets in subdirectories. Prefer the
+        # nearest containing directory, stopping at the type directory; never pick a
+        # sibling vendor merely because filesystem traversal happens to find it first.
+        directory = path.parent
+        choices = []
+        # Only bundled resources supply a trusted vendor namespace. An imported
+        # Custom preset has no provenance, so a local file must not shadow a
+        # different bundled parent with the same name.
+        if path.is_relative_to(roots[1]):
+            while directory.name != ptype and directory.parent != directory:
+                choices = [candidate for candidate in matches if candidate.parent == directory]
+                if choices:
+                    break
+                directory = directory.parent
+            if not choices and directory.name == ptype:
+                choices = [candidate for candidate in matches if candidate.parent == directory]
+            if not choices and directory.name == ptype:
+                choices = [candidate for candidate in matches if candidate.is_relative_to(directory)]
+            if not choices:
+                raise ProfileError(f'missing {ptype} parent {parent!r} in bundled vendor for {path.name}')
+        else:
+            choices = matches
+        if not choices:
+            raise ProfileError(f'missing {ptype} parent {parent!r} for {path.name}')
+        if len(choices) != 1:
+            raise ProfileError(f'ambiguous {ptype} parent {parent!r} for {path.name}')
+        path = choices[0]
+    return chain
+
+
+PARENT_MAP_NAME = '.print-portal-parent-map.json'
+PARENT_MAP_MAX = 1_000_000
+
+
+def load_parent_edges(datadir: Path) -> dict:
+    """Read explicit parent bindings. A missing file means none; a symlink is refused."""
+    path = Path(datadir) / PARENT_MAP_NAME
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise ProfileError('invalid parent mapping file') from exc
+    if not stat.S_ISREG(info.st_mode) or info.st_size > PARENT_MAP_MAX:
+        raise ProfileError('invalid parent mapping file')
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+    except OSError as exc:
+        raise ProfileError('invalid parent mapping file') from exc
+    try:
+        with os.fdopen(fd, 'r', encoding='utf-8') as handle:
+            raw = handle.read(PARENT_MAP_MAX + 1)
+    except OSError as exc:
+        raise ProfileError('invalid parent mapping file') from exc
+    if len(raw) > PARENT_MAP_MAX:
+        raise ProfileError('invalid parent mapping file')
+    try:
+        data = json.loads(raw)
+    except ValueError as exc:
+        raise ProfileError('invalid parent mapping file') from exc
+    if not isinstance(data, dict) or data.get('version') != 1 or set(data) != {'version', 'edges'}:
+        raise ProfileError('invalid parent mapping file')
+    edges = data['edges']
+    if not isinstance(edges, dict):
+        raise ProfileError('invalid parent mapping file')
+    return edges
+
+
+def save_parent_edges(datadir: Path, edges: dict) -> None:
+    write_json_atomic(Path(datadir) / PARENT_MAP_NAME, {'version': 1, 'edges': edges})
+
+
+def list_parent_candidates(child: Path, ptype: str, datadir: Path,
+                           resources: Path | None = None) -> dict:
+    """List same-name parents without choosing one."""
+    if ptype not in ('machine', 'process', 'filament'):
+        raise ProfileError(f'unknown preset type: {ptype}')
+    roots = [Path(datadir).resolve(), Path(resources or ORCA_PROFILES).resolve()]
+    child = Path(child).resolve()
+    if not child.is_relative_to(roots[0]) or ptype not in child.relative_to(roots[0]).parts:
+        raise ProfileError('parent mapping applies only to a datadir preset of that type')
+    try:
+        data = json.loads(child.read_text(encoding='utf-8'))
+    except (OSError, ValueError) as exc:
+        raise ProfileError(f'unreadable {ptype} preset: {child.name}') from exc
+    if not isinstance(data, dict):
+        raise ProfileError(f'invalid {ptype} preset: {child.name}')
+    inherits = data.get('inherits')
+    if not isinstance(inherits, str) or not inherits.strip():
+        raise ProfileError('preset has no parent to map')
+    candidates = []
+    for root, prefix in zip(roots, ('datadir', 'resources')):
+        if not root.is_dir():
+            continue
+        for candidate in root.glob(f'**/{ptype}/**/*.json'):
+            try:
+                resolved = candidate.resolve()
+            except OSError:
+                continue
+            if (not resolved.is_relative_to(root) or resolved == child or not resolved.is_file()
+                    or resolved.is_symlink() or resolved.stat().st_size > BUNDLE_MAX_BYTES):
+                continue
+            try:
+                value = json.loads(resolved.read_text(encoding='utf-8'))
+                raw = resolved.read_bytes()
+            except (OSError, ValueError):
+                continue
+            if not isinstance(value, dict) or value.get('type') not in (None, ptype):
+                continue
+            name = value.get('name') or candidate.stem
+            if name != inherits:
+                continue
+            candidates.append({
+                'id': prefix + ':' + resolved.relative_to(root).as_posix(),
+                'name': name,
+                'sha256': hashlib.sha256(raw).hexdigest(),
+                'source': prefix,
+            })
+    candidates.sort(key=lambda item: item['id'])
+    return {'child': child.relative_to(roots[0]).as_posix(), 'type': ptype,
+            'inherits': inherits, 'candidates': candidates}
+
+
+def bind_parent(datadir: Path, resources: Path | None, child_rel: str, candidate_id: str,
+                expected_inherits: str, expected_digest: str) -> dict:
+    """Bind one explicit edge and roll it back if the chain still cannot resolve."""
+    if (not isinstance(child_rel, str) or not isinstance(candidate_id, str)
+            or Path(child_rel).is_absolute() or '..' in Path(child_rel).parts):
+        raise ProfileError('invalid child preset')
+    ptype = next((part for part in ('machine', 'process', 'filament') if part in Path(child_rel).parts), None)
+    if ptype is None:
+        raise ProfileError('invalid child preset')
+    child = (Path(datadir) / child_rel).resolve()
+    listing = list_parent_candidates(child, ptype, datadir, resources)
+    if listing['inherits'] != expected_inherits:
+        raise ProfileError('child inherits value does not match')
+    match = next((item for item in listing['candidates']
+                  if item['id'] == candidate_id and item['sha256'] == expected_digest
+                  and item['name'] == expected_inherits), None)
+    if match is None:
+        raise ProfileError('explicit parent is not a current candidate')
+    key = 'datadir:' + Path(listing['child']).as_posix()
+    edges = load_parent_edges(datadir)
+    previous = edges.get(key)
+    edges[key] = {'parent': candidate_id, 'inherits': expected_inherits, 'sha256': expected_digest}
+    save_parent_edges(datadir, edges)
+    try:
+        effective_preset(child, ptype, datadir, resources)
+    except ProfileError:
+        if previous is None:
+            edges.pop(key, None)
+        else:
+            edges[key] = previous
+        save_parent_edges(datadir, edges)
+        raise
+    return {'child': listing['child'], 'bound': candidate_id, 'resolved': True}
+
+
+def effective_preset(path: Path, ptype: str, datadir: Path,
+                     resources: Path | None = None) -> dict:
+    """Return child-over-parent values with no unresolved inherits reference."""
+    chain = _resolved_chain(path, ptype, datadir, resources)
+    merged: dict = {}
+    for level in reversed(chain):
+        merged.update(level)
+    merged.pop('inherits', None)
+    return merged
 
 
 def read_options(profile: object) -> dict[str, bool]:
@@ -352,20 +628,65 @@ def bed_limits(machine: Path) -> BedLimits:
 
 
 def clamp_area(area: list[str], bed: tuple[float, float]) -> list[str] | None:
-    """'0x0'.. style area -> clamped ["0x0", f"{W:g}x0", f"{W:g}x{H:g}", f"0x{H:g}"].
-    Returns None when within tolerance (max_x <= W+1 and max_y <= H+1) or unparsable."""
+    """Intersect a convex bed polygon with the size limit anchored at its minimum corner.
+
+    Never replace a polygon by its bounding rectangle. A concave polygon whose clipping
+    could produce disjoint regions is rejected instead of inventing printable space.
+    Unparseable areas are left to the existing preset validation.
+    """
     try:
-        xs = [float(v.split("x")[0]) for v in area]
-        ys = [float(v.split("x")[1]) for v in area]
-    except (AttributeError, ValueError, IndexError):
+        points = [tuple(float(c) for c in v.lower().split('x')) for v in area]
+        if len(points) < 3 or any(len(p) != 2 or not all(math.isfinite(c) for c in p) for p in points):
+            return None
+        w, h = bed
+        if not math.isfinite(w) or not math.isfinite(h) or w <= 0 or h <= 0:
+            raise ProfileError('invalid configured bed dimensions')
+    except (AttributeError, ValueError, TypeError):
         return None
-    if not xs or not ys:
+    first = points[0]
+    xmin, ymin = min(p[0] for p in points), min(p[1] for p in points)
+    xmax, ymax = xmin + w, ymin + h
+    if all(x <= xmax and y <= ymax for x, y in points):
         return None
-    max_x, max_y = max(xs), max(ys)
-    w, h = bed
-    if max_x <= w + 1 and max_y <= h + 1:
-        return None
-    return ["0x0", f"{w:g}x0", f"{w:g}x{h:g}", f"0x{h:g}"]
+    turns = []
+    for a, b, c in zip(points, points[1:] + points[:1], points[2:] + points[:2]):
+        cross = (b[0] - a[0]) * (c[1] - b[1]) - (b[1] - a[1]) * (c[0] - b[0])
+        if cross:
+            turns.append(cross > 0)
+    if not turns or any(turn != turns[0] for turn in turns):
+        raise ProfileError('cannot safely clamp a non-convex printable_area')
+    for axis, limit in ((0, xmax), (1, ymax)):
+        clipped = []
+        for start, end in zip(points[-1:] + points[:-1], points):
+            start_in, end_in = start[axis] <= limit, end[axis] <= limit
+            if start_in != end_in:
+                t = (limit - start[axis]) / (end[axis] - start[axis])
+                clipped.append(tuple(start[i] + t * (end[i] - start[i]) for i in range(2)))
+            if end_in:
+                clipped.append(end)
+        points = [point for i, point in enumerate(clipped) if i == 0 or point != clipped[i - 1]]
+        if len(points) > 1 and points[0] == points[-1]:
+            points.pop()
+    if len(points) < 3:
+        raise ProfileError('configured bed leaves no printable_area')
+    if first in points:
+        index = points.index(first)
+        points = points[index:] + points[:index]
+    def coord(value: float) -> str:
+        snapped = round(value, 6)
+        if abs(snapped - round(snapped)) <= 1e-6:
+            return str(int(round(snapped)))
+        return format(snapped, 'f').rstrip('0').rstrip('.')
+    return [f'{coord(x)}x{coord(y)}' for x, y in points]
+
+
+def clamp_machine(data: dict, bed: tuple[float, float]) -> None:
+    """Apply the import bed limit to an effective machine, including inherited area."""
+    area = data.get("printable_area")
+    if isinstance(area, list):
+        clamped = clamp_area(area, bed)
+        if clamped is not None:
+            data["printable_area"] = clamped
 
 
 def _guess_type(data: dict, hint: str | None) -> str:
@@ -388,7 +709,7 @@ def normalise(data: dict, ptype: str, machine_name: str | None,
     """Return (preset, warnings) ready to be loaded by the CLI.
 
     `from` is forced per type (machine: "system", everything else: "User"/"user"), `inherits`
-    is kept verbatim — a dangling inherits is tolerated by the CLI — and
+    is kept verbatim and checked after the entire bundle has been written, and
     `compatible_printers` is rewritten to `machine_name` only when the bundle brought a machine.
     """
     notes: list[str] = []
@@ -405,8 +726,7 @@ def normalise(data: dict, ptype: str, machine_name: str | None,
 
     parent = out.get("inherits")
     if parent:
-        # a dangling inherits slices fine (measured), and inventing a base would make the
-        # imported preset depend on a file this datadir does not ship — so it is copied as-is
+        # Preserve the relationship; import_into reports if it cannot be resolved.
         notes.append(f"inherits '{parent}' kept as-is")
 
     if ptype == "machine":
@@ -478,40 +798,18 @@ def _read_bundle(blob: bytes, filename: str) -> list[tuple[str, dict]]:
     return items
 
 
-def _parent_chain(datadir: Path, ptype: str, data: dict, depth: int = 3) -> list[dict]:
-    """[self, parent, grandparent...] for parents that exist in this datadir."""
-    chain = [data]
-    current = data
-    for _ in range(depth):
-        parent = current.get("inherits")
-        if not parent:
-            break
-        found = None
-        pattern = {"machine": "system/**/machine/*.json",
-                   "process": "system/**/process/*.json",
-                   "filament": "system/**/filament/**/*.json"}[ptype]
-        for f in datadir.glob(pattern):
-            try:
-                cand = json.loads(f.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            if (cand.get("name") or f.stem) == parent or f.stem == parent:
-                found = cand
-                break
-        if not found:
-            break
-        chain.append(found)
-        current = found
-    return chain
-
-
 def summarise(path: Path, ptype: str, datadir: Path | None = None) -> dict:
     try:
         data = json.loads(path.read_text())
     except (OSError, json.JSONDecodeError):
         return {"name": path.stem, "error": "unreadable"}
-    chain = _parent_chain(datadir, ptype, data) if datadir else [data]
     out = {"name": data.get("name", path.stem), "file": path.name, "type": ptype}
+    try:
+        effective = effective_preset(path, ptype, datadir) if datadir is not None else data
+    except ProfileError as exc:
+        # Keep the row visible, but never classify unknown compatibility as universal.
+        effective = data
+        out["error"] = str(exc)
     if datadir is not None:
         # the value the printer pairing stores, so the UI never rebuilds a path from the basename
         try:
@@ -520,10 +818,8 @@ def summarise(path: Path, ptype: str, datadir: Path | None = None) -> dict:
             pass
     fields = SUMMARISE.get(ptype, [])
     for key in fields:
-        for level in chain:                      # own value first, then inherited
-            if key in level and level[key] not in (None, "", []):
-                out[key] = level[key]
-                break
+        if key in effective:
+            out[key] = effective[key]
     if "compatible_printers" in fields:
         # published for every row, so the machine filter never has to guess between
         # "universal" and "field missing", and a hand-edited preset that stores a bare
@@ -564,17 +860,8 @@ def _positive_width(value: object) -> str | None:
 
 
 def _effective_brim_width(datadir: Path, data: dict) -> str:
-    """The brim width to generate when the brim is on: own value, else the first inherited one.
-
-    The CLI loads `--load-settings` files without resolving `inherits`, so a preset that only
-    inherits `brim_width` must have it copied in explicitly. 5 mm is the shipped preset intent.
-    """
-    chain = _parent_chain(datadir, "process", data)
-    for level in chain:
-        width = _positive_width(level.get("brim_width"))
-        if width is not None:
-            return width
-    return "5"
+    """Use the resolved process width, or the existing portal option's 5 mm fallback."""
+    return _positive_width(data.get("brim_width")) or "5"
 
 
 def _portal_option_fields(datadir: Path, data: dict, options: dict[str, bool]) -> dict[str, str]:
@@ -599,18 +886,8 @@ def _derived_name(process: Path, data: dict) -> str:
 
 
 def derived_process_data(process: Path, datadir: Path, options: dict[str, bool]) -> dict:
-    """Build the effective process without writing shared preset state."""
-    """Write the per-slice process preset that carries the options; return its path.
-
-    The selected preset is only ever read: the CLI refuses a second process file on
-    `--load-settings`, so this copy replaces it, keeping every key the preset contributes.
-    """
-    try:
-        data = json.loads(Path(process).read_text())
-    except (OSError, ValueError) as exc:
-        raise ProfileError("process preset is not readable") from exc
-    if not isinstance(data, dict):
-        raise ProfileError("process preset is not readable")
+    """Build the flattened per-slice process with portal options, without mutating sources."""
+    data = effective_preset(process, "process", datadir)
 
     derived = dict(data)
     derived["type"] = "process"
@@ -657,11 +934,10 @@ def effective_process(process: Path, datadir: Path, options: dict[str, bool]) ->
     have raised, so the endpoint can show it instead of failing the profile card.
     """
     try:
-        data = json.loads(Path(process).read_text())
-    except (OSError, ValueError):
-        return {"error": "process preset is not readable"}
-    if not isinstance(data, dict):
-        return {"error": "process preset is not readable"}
+        data = effective_preset(process, "process", datadir)
+    except ProfileError as exc:
+        message = "process preset is not readable" if not Path(process).is_file() else str(exc)
+        return {"error": message}
 
     fields = _portal_option_fields(Path(datadir), data, options)
     brim = bool(options.get("brim"))
@@ -680,17 +956,14 @@ def effective_process(process: Path, datadir: Path, options: dict[str, bool]) ->
 def derived_state(process: Path, datadir: Path, options: dict[str, bool]) -> dict:
     """Whether the derived preset on disk still matches the options; never raises.
 
-    `stale` covers the three ways the slice would load something other than the options: the
-    file is missing, unreadable, or carries different support/brim fields.
+    `stale` reports whether the shared UI-derived artifact is missing, unreadable or has
+    different option fields. Slices independently capture a temporary effective preset.
     """
     try:
-        data = json.loads(Path(process).read_text())
-    except (OSError, ValueError):
-        return {"path": PORTAL_PROCESS_REL, "stale": True,
-                "error": "process preset is not readable"}
-    if not isinstance(data, dict):
-        return {"path": PORTAL_PROCESS_REL, "stale": True,
-                "error": "process preset is not readable"}
+        data = effective_preset(process, "process", datadir)
+    except ProfileError as exc:
+        message = "process preset is not readable" if not Path(process).is_file() else str(exc)
+        return {"path": PORTAL_PROCESS_REL, "stale": True, "error": message}
 
     expected = _portal_option_fields(Path(datadir), data, options)
     try:
@@ -765,11 +1038,15 @@ def filter_process_by_machine(rows: list[dict], machine: dict | None) -> list[di
     """
     if not isinstance(machine, dict):
         return rows
+    if machine.get("error"):
+        return []
     wanted = _preset_name(machine.get("name"))
     if not wanted[0]:
         return rows
     kept = []
     for row in rows:
+        if isinstance(row, dict) and row.get("error"):
+            continue
         allowed = _name_list(row.get("compatible_printers")) if isinstance(row, dict) else []
         if not allowed or any(_same_preset_name(name, wanted) for name in allowed):
             kept.append(row)
@@ -845,7 +1122,8 @@ def _plan_import(datadir: Path, items: list[tuple[str, dict]],
 
 
 def import_into(datadir: Path, blob: bytes, filename: str,
-                bed: tuple[float, float] = (220.0, 220.0)) -> dict:
+                bed: tuple[float, float] = (220.0, 220.0),
+                protected: dict[str, Path] | None = None) -> dict:
     """Write every preset in the bundle into the datadir under its own name.
 
     Two phases, so a refused import writes nothing: the bundle is read and normalised in
@@ -863,6 +1141,27 @@ def import_into(datadir: Path, blob: bytes, filename: str,
 
     planned, notes = _plan_import(datadir, items, bed)
 
+    # Do not let an unselected import change or make ambiguous a currently
+    # resolvable chain. Unresolved selections are deliberately excluded so a
+    # missing parent can be imported to repair them.
+    for kind, path in (protected or {}).items():
+        paths: list[Path] = []
+        try:
+            chain = _resolved_chain(path, kind, datadir, chain_paths=paths)
+        except ProfileError:
+            continue
+        names = {level.get('inherits') for level in chain if isinstance(level.get('inherits'), str)}
+        names.update(level.get('name') for level in chain if isinstance(level.get('name'), str))
+        for planned_kind, preset, dest in planned:
+            if planned_kind != kind or (preset.get('name') not in names and dest.resolve() not in paths):
+                continue
+            try:
+                unchanged = dest.is_file() and json.loads(dest.read_text()) == preset
+            except (OSError, ValueError):
+                unchanged = False
+            if not unchanged:
+                raise ProfileError(f"import would change or make ambiguous the selected {kind} chain at {preset.get('name')!r}; choose another preset before importing")
+
     index = read_vendor_index(datadir)
     index_changed = False
     imported: list[dict] = []
@@ -876,6 +1175,15 @@ def import_into(datadir: Path, blob: bytes, filename: str,
     if index_changed:
         write_vendor_index(datadir, index)
 
+    # A bundle can reference a parent it does not contain. Preserve the import so
+    # the operator can import the missing preset later, but do not silently treat
+    # the incomplete chain as usable. Validate only after all bundle files exist.
+    for row in imported:
+        try:
+            effective_preset(datadir / row["path"], row["type"], datadir)
+        except ProfileError as exc:
+            row["error"] = str(exc)
+            notes.append(f"{row['name']}: {exc}; import the correct parent preset before selecting or slicing, or bind an explicit parent when the name is ambiguous")
     return {"imported": imported, "notes": notes, "ok": bool(imported)}
 
 
@@ -962,7 +1270,7 @@ def preset_read_only_reason(datadir: Path, path: Path) -> str | None:
 
 def _effective_value(chain: list[dict], key: str):
     for level in chain:
-        if key in level and level[key] not in (None, "", []):
+        if key in level:
             return level[key], level
     return None, None
 
@@ -981,7 +1289,12 @@ def _to_form_value(value) -> str:
 
 def preset_view(datadir: Path, kind: str, path: Path) -> dict:
     data = json.loads(path.read_text())
-    chain = _parent_chain(datadir, kind, data)
+    error = None
+    try:
+        chain = _resolved_chain(path, kind, datadir)
+    except ProfileError as exc:
+        chain = [data]
+        error = str(exc)
     rel = path.relative_to(datadir).as_posix()
     reason = preset_read_only_reason(datadir, path)
     editable = reason is None
@@ -1024,6 +1337,7 @@ def preset_view(datadir: Path, kind: str, path: Path) -> dict:
         "name": data.get("name", path.stem),
         "editable": editable,
         "read_only_reason": reason,
+        "error": error,
         "fields": fields_out,
     }
 

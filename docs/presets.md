@@ -161,9 +161,10 @@ nothing. The CLI never opens this file — it is the portal's registry and what 
 
 ### Selection follows the import
 
-`selection_from_import` (`main.py:1183`) writes the machine + first process + first filament just
-imported into `profile.json` (plus `machine_label`), because otherwise `machine_slot` would pick the
-first machine alphabetically once a second bundle exists.
+`selection_from_import` writes the first **resolvable** machine, process and filament just imported
+into `profile.json` (plus `machine_label`). An incomplete import is retained with an actionable note
+but is not automatically selected. Previously selected incomplete presets remain visible so they can
+be repaired; selection and slicing reject unresolved chains.
 
 ### Files on disk after an import (B)
 
@@ -228,8 +229,35 @@ switches are not — they reach the slicer only as argv, `--orient 1` and `--sca
 | `brim: true` | `brim_type: "outer_only"`, `brim_width` = own/inherited value, else `"5"` |
 | `brim: false` | `brim_type: "no_brim"`, `brim_width: "0"` |
 
-Hidden from the picker (`list_presets` skips `PORTAL_PROCESS_FILE`), regenerated per slice and per
-options save, reported as `derived.stale` (`derived_state`, `profiles.py:517`).
+Hidden from the picker (`list_presets` skips `PORTAL_PROCESS_FILE`) and regenerated on options saves.
+`derived.stale` reports whether this shared UI artifact matches the option fields. Slicing instead
+creates a private flattened process with the job's captured options; it does not load the shared file.
+
+## Preset inheritance at slice time
+
+OrcaSlicer 2.4.2's CLI can accept `inherits` in `--load-settings`/`--load-filaments` without loading
+the parent, silently falling back to defaults. The portal resolves the complete machine, process and
+filament chains before fit planning and slicing, copying parent fields first and child overrides last.
+The originals are not modified. The effective machine is intersected with `BED_SIZE` as a convex
+polygon anchored at its minimum corner; a rectangle is never substituted and a concave area fails
+closed. Options are applied last to the effective process. Upload, support-fins staging and reslice
+confirmation pin the flattened bytes under the job. Later parent edits cannot alter that job, and a
+legacy job without pins fails closed instead of reading the live selection.
+
+Parents are matched by exact preset name and type in the writable Orca datadir and the pinned Orca
+resources (`/opt/orca/resources/profiles`). For a parent already in the bundled resources, the
+nearest directory within its vendor/type tree wins, or there must be one match elsewhere in that
+same vendor/type tree. It never borrows a parent from another vendor. An unreadable file outside
+that vendor scope does not block a valid chain. Imported custom presets have no trusted vendor
+identity and require exactly one match across both roots. When the same name exists in several
+vendors, the portal does not guess: `GET /api/profile/parent-candidates` lists candidates and
+`PUT /api/profile/parent-mappings` binds one edge in `.print-portal-parent-map.json` with the exact
+inherits value and sha256. A changed, missing, symlink or traversal target fails closed and the
+bind is rolled back if the chain still cannot resolve. An ambiguous name, missing or unreadable
+parent, cycle or excessively deep chain is an error, not permission to slice with defaults.
+The import API keeps incomplete presets so their parents can be supplied later and reports an actionable
+note; it does not automatically select any part of an incomplete import. Existing incomplete selections must be repaired or
+replaced before use. Resource presets are read-only and never overwritten.
 
 ## 5. 3MF identity — identical in both states
 

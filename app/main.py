@@ -258,6 +258,10 @@ def _profile_rel(kind: str, rel: object) -> str | None:
     target = _preset_path(rel)
     if not isinstance(rel, str) or target is None or _preset_type(target) != kind:
         raise HTTPException(400, f"{kind}: '{rel}' is not a preset inside the datadir")
+    try:
+        prof.effective_preset(target, kind, CONFIG.orca_datadir)
+    except prof.ProfileError as exc:
+        raise HTTPException(400, f"{kind}: {exc}; import the correct parent preset") from exc
     return rel
 
 
@@ -317,8 +321,10 @@ def _reject_unpermitted_pair(chosen: dict[str, str], merged: dict[str, str], *,
     if "machine" not in chosen and "process" not in chosen:
         return
     machine_row = _preset_row("machine", merged.get("machine"))
-    if not isinstance(machine_row, dict) or machine_row.get("error"):
+    if not isinstance(machine_row, dict) or machine_row.get("error") == "unreadable":
         return
+    if machine_row.get("error"):
+        raise HTTPException(status, f"machine: {machine_row['error']}")
     if _permits(machine_row, _preset_row("process", merged.get("process"))):
         return
     raise HTTPException(status, f"process '{merged.get('process')}' is not permitted by "
@@ -388,6 +394,9 @@ def partial_selection() -> dict[str, Path]:
     stored = read_profile_document()
     for kind in PRESET_KINDS:
         value = stored.get(kind)
+        if kind in stored and value is None:
+            chosen.pop(kind, None)
+            continue
         if not isinstance(value, str) or not value:
             continue
         if kind == "machine" and not (datadir / value).is_file():
@@ -523,10 +532,11 @@ def apply_pairing(view: dict) -> dict | None:
     distinct states the operator can switch between. The pair is resolved (and refused) by
     ``resolve_pairing``, the rule the printer routes also use before they persist a row.
     """
-    merged = resolve_pairing(view.get("profiles"))
-    if merged is None:
-        return None
-    write_profile_file(merged)
+    with DERIVED_LOCK:
+        merged = resolve_pairing(view.get("profiles"))
+        if merged is None:
+            return None
+        write_profile_file(merged)
     return merged
 
 
@@ -619,9 +629,10 @@ def profile_snapshot() -> dict:
     copy of the presets and options; otherwise it would be sliced with whatever was
     uploaded after it.
     """
-    snapshot = {k: relative_to_datadir(v) for k, v in active_paths().items()}
-    snapshot["options"] = profile_options()
-    return snapshot
+    with DERIVED_LOCK:
+        snapshot = {k: relative_to_datadir(v) for k, v in active_paths().items()}
+        snapshot["options"] = profile_options()
+        return snapshot
 
 
 # ---------------------------------------------------------------- job storage
@@ -690,36 +701,28 @@ def gcode_path(jid: str, job: dict) -> Path | None:
 def slice_profile(job: dict) -> tuple[dict[str, Path], dict[str, bool]]:
     """The presets and options to slice with: the job's snapshot, else the live profile.
 
-    A snapshot is only trusted when all three presets still resolve inside the datadir —
-    job.json is a file on disk, so a hand-edited one must not point the slicer at
-    /etc/passwd — and it falls back to the live selection otherwise, which is exactly what
-    every job written before the snapshot existed does.
+    A snapshot is only trusted when all three presets still resolve inside the datadir.
+    Missing or invalid members fail closed; only legacy jobs without a snapshot use
+    the current selection.
     """
-    if job.get("kind") == "reslice":
+    if "pinned_presets" in job:
         manifest = job.get("pinned_presets")
         if not isinstance(manifest, dict) or manifest.get("version") != 1:
-            raise prof.ProfileError("reslice pinned presets are not available")
+            raise prof.ProfileError("pinned presets are not available")
+        pinned = job_dir(job["id"]) / "pinned"
+        if pinned.is_symlink() or not pinned.is_dir():
+            raise prof.ProfileError("pinned presets are not available")
         paths = {}
         for kind in ("machine", "process", "filament"):
-            path = job_dir(job["id"]) / "pinned" / f"{kind}.json"
+            path = pinned / f"{kind}.json"
             try:
-                if path.is_symlink() or hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sha256"][kind]:
+                if path.is_symlink() or not path.is_file() or hashlib.sha256(path.read_bytes()).hexdigest() != manifest["sha256"][kind]:
                     raise ValueError("hash mismatch")
             except (OSError, KeyError, TypeError, ValueError) as exc:
-                raise prof.ProfileError(f"reslice pinned {kind} is unavailable or changed") from exc
+                raise prof.ProfileError(f"pinned {kind} is unavailable or changed") from exc
             paths[kind] = path
         return paths, prof.read_options({"options": manifest.get("options")})
-    snapshot = job.get("profile_snapshot")
-    if isinstance(snapshot, dict):
-        paths: dict[str, Path] = {}
-        for kind in ("machine", "process", "filament"):
-            target = _preset_path(snapshot.get(kind))
-            if target is None:
-                break
-            paths[kind] = target
-        else:
-            return paths, prof.read_options(snapshot)
-    return active_paths(), profile_options()
+    raise prof.ProfileError("job has no pinned presets; re-upload or reconfirm it")
 
 
 # ---------------------------------------------------------------- slicer
@@ -735,9 +738,30 @@ def run_slice(jid: str) -> None:
     out.mkdir()
 
     write_job(jid, status="slicing", error=None, started=time.time())
-    paths, options = slice_profile(job)
-    # Measured before the lock: the file and the preset are read-only here, and the job has
-    # to record what it intends to do even when the slice itself hangs.
+    try:
+        with tempfile.TemporaryDirectory(prefix="effective-presets-", dir=TMP_DIR) as tmp:
+            effective = {}
+            with DERIVED_LOCK:
+                paths, options = slice_profile(job)
+                for kind in ("machine", "process", "filament"):
+                    if "pinned_presets" in job:
+                        # Validate exactly the bytes we copy, not an earlier read of the pin.
+                        raw = paths[kind].read_bytes()
+                        if hashlib.sha256(raw).hexdigest() != job["pinned_presets"]["sha256"][kind]:
+                            raise prof.ProfileError(f"pinned {kind} is unavailable or changed")
+                        data = json.loads(raw)
+                        if not isinstance(data, dict) or data.get("inherits"):
+                            raise prof.ProfileError(f"pinned {kind} is not fully resolved; re-upload or reconfirm the job")
+                    effective[kind] = Path(tmp) / f"{kind}.json"
+                    prof.write_json_atomic(effective[kind], data)
+            _run_slice_effective(jid, job, d, src, out, effective, options)
+    except (prof.ProfileError, OSError, ValueError) as exc:
+        write_job(jid, status="failed", error=f"profile: {type(exc).__name__}: {exc}")
+
+
+def _run_slice_effective(jid, job, d, src, out, paths, options):
+    # The per-job effective presets are immutable here; fit uses the exact machine
+    # passed to Orca, including any inherited area and the configured bed clamp.
     shrink = bool(options.get("shrink_to_fit"))
     plan = None
     try:
@@ -793,40 +817,32 @@ def run_slice(jid: str) -> None:
         "TMPDIR": str(TMP_DIR),
     }
     t0 = time.time()
-    # The derived preset is shared with `regenerate_derived`, so the lock spans writing it,
-    # building the argv around it and running the slicer that loads it: otherwise a
-    # concurrent option save could replace the file and slice with the live options instead
-    # of this job's snapshot.
-    with DERIVED_LOCK:
-        try:
-            process = (paths["process"] if job.get("kind") == "reslice" else
-                       prof.write_derived_process(paths["process"], CONFIG.orca_datadir, options))
-        except Exception as exc:  # noqa: BLE001 - a job error, never a stale-options slice
-            write_job(jid, status="failed", error=f"profile: {type(exc).__name__}: {exc}")
-            return
-        cmd = [
-            str(CONFIG.orca_bin),
-            "--datadir", str(CONFIG.orca_datadir),
-            "--load-settings", f"{paths['machine']};{process}",
-            "--load-filaments", str(paths["filament"]),
-            "--slice", "0",
-        ]
-        if orient and not job.get("support_fins"):
-            cmd += ["--orient", "1"]
-        if plan is not None and plan.scale < 1.0:
-            cmd += ["--scale", f"{plan.scale:g}"]
-        cmd += ["--outputdir", str(out), str(src)]
-        try:
-            proc = subprocess.run(
-                cmd, cwd=str(d), env=env, capture_output=True, text=True,
-                timeout=CONFIG.slice_timeout,
-            )
-        except subprocess.TimeoutExpired:
-            write_job(jid, status="failed", error=f"slice timed out after {CONFIG.slice_timeout}s")
-            return
-        except Exception as exc:  # noqa: BLE001 - surface anything to the UI
-            write_job(jid, status="failed", error=f"{type(exc).__name__}: {exc}")
-            return
+    # Private pin copies do not depend on the shared derived artifact, so the slicer
+    # launch must not hold DERIVED_LOCK and block option saves for the whole slice.
+    process = paths["process"]
+    cmd = [
+        str(CONFIG.orca_bin),
+        "--datadir", str(CONFIG.orca_datadir),
+        "--load-settings", f"{paths['machine']};{process}",
+        "--load-filaments", str(paths["filament"]),
+        "--slice", "0",
+    ]
+    if orient and not job.get("support_fins"):
+        cmd += ["--orient", "1"]
+    if plan is not None and plan.scale < 1.0:
+        cmd += ["--scale", f"{plan.scale:g}"]
+    cmd += ["--outputdir", str(out), str(src)]
+    try:
+        proc = subprocess.run(
+            cmd, cwd=str(d), env=env, capture_output=True, text=True,
+            timeout=CONFIG.slice_timeout,
+        )
+    except subprocess.TimeoutExpired:
+        write_job(jid, status="failed", error=f"slice timed out after {CONFIG.slice_timeout}s")
+        return
+    except Exception as exc:  # noqa: BLE001 - surface anything to the UI
+        write_job(jid, status="failed", error=f"{type(exc).__name__}: {exc}")
+        return
     elapsed = round(time.time() - t0, 1)
     try:
         result_file = out / "result.json"
@@ -976,6 +992,14 @@ def api_printer():
 
 
 # ---------------------------------------------------------------- printers API
+def _with_profile_lock(fn):
+    @functools.wraps(fn)
+    def locked(*args, **kwargs):
+        with DERIVED_LOCK:
+            return fn(*args, **kwargs)
+    return locked
+
+
 @app.get("/api/printers")
 def api_printers():
     """Masked printer views plus the selection; ``warning`` reports a corrupt file."""
@@ -985,6 +1009,7 @@ def api_printers():
 
 
 @app.post("/api/printers", status_code=201)
+@_with_profile_lock
 def api_add_printer(body: dict):
     profiles = pairing_from_body(body.get("profiles")) if "profiles" in body else None
     resolve_pairing(profiles)  # before the row exists: a refused pair must add no printer
@@ -1021,6 +1046,7 @@ def patch_env_printer(body: dict) -> dict:
 
 
 @app.patch("/api/printers/{pid}")
+@_with_profile_lock
 def api_update_printer(pid: str, body: dict):
     if pid == printers.ENV_PRINTER_ID:
         return printer_call(patch_env_printer, body)
@@ -1047,6 +1073,7 @@ def api_delete_printer(pid: str):
 
 
 @app.post("/api/printers/{pid}/select")
+@_with_profile_lock
 def api_select_printer(pid: str):
     view = printer_view(pid)
     resolve_pairing(view.get("profiles"))  # refused before the selection moves
@@ -1108,6 +1135,13 @@ def _validated_output_name(name: str) -> str:
 
 
 def prepare_3mf(model_path: Path) -> tuple[dict, str | None]:
+    # This operation may update profile.json; serialize its read/modify/write with
+    # imports, options and profile selection.
+    with DERIVED_LOCK:
+        return _prepare_3mf_locked(model_path)
+
+
+def _prepare_3mf_locked(model_path: Path) -> tuple[dict, str | None]:
     """Switch this portal to the printer/process a 3MF names; re-identify the file.
 
     Returns ``(record, slicer_input)``: ``record`` is stored as ``job["threemf"]``, and
@@ -1232,8 +1266,32 @@ async def api_upload(request: Request, file: UploadFile = File(...),
     try:
         # Prepare the upload *itself* before finning it: the CLI's output 3MF carries no
         # OrcaSlicer metadata, so preparing that copy could never match a printer/process.
-        if model_path.suffix.lower() == ".3mf":
-            record, slicer_input = prepare_3mf(model_path)
+        def prepare_and_snapshot():
+            with DERIVED_LOCK:
+                prepared = prepare_3mf(model_path) if model_path.suffix.lower() == ".3mf" else (None, None)
+                snapshot = profile_snapshot()
+                options = prof.read_options(snapshot)
+                paths = {kind: _preset_path(snapshot.get(kind)) for kind in ("machine", "process", "filament")}
+                if any(path is None for path in paths.values()):
+                    raise prof.ProfileError("selected presets are unavailable; select profiles and retry")
+                machine = prof.effective_preset(paths["machine"], "machine", CONFIG.orca_datadir)
+                prof.clamp_machine(machine, CONFIG.bed_size)
+                values = {"machine": machine,
+                          "process": prof.derived_process_data(paths["process"], CONFIG.orca_datadir, options),
+                          "filament": prof.effective_preset(paths["filament"], "filament", CONFIG.orca_datadir)}
+                pinned = d / "pinned"
+                pinned.mkdir()
+                hashes = {}
+                for kind, value in values.items():
+                    raw = json.dumps(value, indent=2).encode()
+                    (pinned / f"{kind}.json").write_bytes(raw)
+                    hashes[kind] = hashlib.sha256(raw).hexdigest()
+                return prepared, snapshot, {"version": 1, "sha256": hashes, "options": options}
+
+        try:
+            (record, slicer_input), captured_profile, pinned_presets = await asyncio.to_thread(prepare_and_snapshot)
+        except prof.ProfileError as exc:
+            raise HTTPException(409, f"profile: {exc}") from exc
         if support_fins:
             finned = d / "upload" / f"fins-{model_path.stem}.3mf"
             try:
@@ -1256,7 +1314,7 @@ async def api_upload(request: Request, file: UploadFile = File(...),
         status = "awaiting_confirm" if support_fins else "queued"
         fields = {"status": status, "filename": model_path.name, "output_name": name,
                   "upload_bytes": size, "model_bytes": model_path.stat().st_size,
-                  "profile_snapshot": profile_snapshot(),
+                  "profile_snapshot": captured_profile, "pinned_presets": pinned_presets,
                   "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
         if archive is not None:
             fields["archive"] = archive
@@ -1443,11 +1501,14 @@ def api_confirm_slice(jid: str, body: dict | None = None):
                 raise HTTPException(422, "expected revision")
             _reslice_revision(job, body)
     if not is_reslice:
-        require_selection()
         with STAGE_LOCK:
             job = read_job(jid)
             if job.get("kind") == "reslice" or job.get("status") != "awaiting_confirm":
                 raise HTTPException(409, f"job is '{job.get('status')}', not awaiting confirmation")
+            try:
+                slice_profile(job)
+            except prof.ProfileError as exc:
+                raise HTTPException(409, str(exc)) from exc
             write_job(jid, status="queued")
             job_queue.put(jid)
         return {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
@@ -1483,9 +1544,11 @@ def api_confirm_slice(jid: str, body: dict | None = None):
                 options = prof.read_options(snapshot)
                 if options["shrink_to_fit"] and (model_copy.suffix == ".3mf" or job.get("support_fins")):
                     raise prof.ProfileError("shrink to fit is unavailable for 3MF or support fins")
-                machine_bytes = paths["machine"].read_bytes()
-                filament_bytes = paths["filament"].read_bytes()
-                machine = json.loads(machine_bytes)
+                machine = prof.effective_preset(paths["machine"], "machine", CONFIG.orca_datadir)
+                prof.clamp_machine(machine, CONFIG.bed_size)
+                filament = prof.effective_preset(paths["filament"], "filament", CONFIG.orca_datadir)
+                machine_bytes = json.dumps(machine, indent=2).encode()
+                filament_bytes = json.dumps(filament, indent=2).encode()
                 process = prof.derived_process_data(paths["process"], CONFIG.orca_datadir, options)
                 process_bytes = json.dumps(process, indent=2).encode()
                 if model_copy.suffix == ".3mf":
@@ -1507,18 +1570,41 @@ def api_confirm_slice(jid: str, body: dict | None = None):
             d = job_dir(jid)
             prepared_name = f"reslice-prepared-{uuid.uuid4().hex}.3mf" if model_copy.suffix == ".3mf" else None
             target = d / "pinned"
+            staging = d / f".pinned-new-{uuid.uuid4().hex}"
+            backup = d / f".pinned-old-{uuid.uuid4().hex}"
+            prepared_path = d / "upload" / prepared_name if prepared_name else None
+            replaced = False
+            installed = False
             try:
-                os.replace(pinned, target)
-                if prepared_name:
-                    os.replace(model_copy, d / "upload" / prepared_name)
+                # The new directory is complete before the previous one moves.
+                # A same-directory rename cannot land on a non-empty directory, so
+                # move the old pins aside and restore them if the commit fails.
+                shutil.copytree(pinned, staging)
+                if target.exists() or target.is_symlink():
+                    os.replace(target, backup)
+                    replaced = True
+                os.replace(staging, target)
+                installed = True
+                if prepared_path is not None:
+                    os.replace(model_copy, prepared_path)
                 write_job(jid, status="queued", revision=job["revision"] + 1,
                           slicer_input=prepared_name, identity_rewrite=outcome,
                           pinned_presets={"version": 1, "sha256": hashes, "options": options})
             except Exception:
-                shutil.rmtree(target, ignore_errors=True)
-                if prepared_name:
-                    (d / "upload" / prepared_name).unlink(missing_ok=True)
+                if replaced and (backup.exists() or backup.is_symlink()):
+                    if target.exists() or target.is_symlink():
+                        failed = d / f".pinned-failed-{uuid.uuid4().hex}"
+                        os.replace(target, failed)
+                        shutil.rmtree(failed, ignore_errors=True)
+                    os.replace(backup, target)
+                elif installed:
+                    shutil.rmtree(target, ignore_errors=True)
+                shutil.rmtree(staging, ignore_errors=True)
+                if prepared_path is not None:
+                    prepared_path.unlink(missing_ok=True)
                 raise
+            else:
+                shutil.rmtree(backup, ignore_errors=True)
             job_queue.put(jid)
     return {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
 
@@ -1894,7 +1980,8 @@ def selection_from_import(result: dict) -> dict[str, str]:
     block used to do. `machine_label` is what the profile card shows, and it is not a preset
     slot, so `profile_labels()` keeps it out of the selection.
     """
-    rows = [row for row in (result.get("imported") or []) if isinstance(row, dict)]
+    rows = [row for row in (result.get("imported") or [])
+            if isinstance(row, dict) and not row.get("error")]
     first = {kind: next((row for row in rows if row.get("type") == kind), None)
              for kind in ("machine", "process", "filament")}
     selection = {kind: row["path"] for kind, row in first.items()
@@ -1950,19 +2037,39 @@ async def api_profile_upload(request: Request, file: UploadFile = File(...)):
     name = file.filename or "bundle.orca_printer"
     if not name.lower().endswith(PROFILE_BUNDLE_SUFFIXES):
         raise HTTPException(400, "expected an .orca_printer bundle or a preset .json")
-    try:
+    def import_and_select():
         with DERIVED_LOCK:
-            result = prof.import_into(CONFIG.orca_datadir, blob, name, CONFIG.bed_size)
+            # Capture the old selection before import changes the fallback machine slot.
+            previous_paths = partial_selection()
+            previous = {k: relative_to_datadir(v) for k, v in previous_paths.items()}
+            result = prof.import_into(CONFIG.orca_datadir, blob, name, CONFIG.bed_size,
+                                      protected=previous_paths)
+            result["ok"] = bool(result["imported"])
+            if result["imported"]:
+                document = read_profile_document()
+                chosen = selection_from_import(result)
+                if any(row.get("error") for row in result["imported"]):
+                    chosen = {}
+                    result["notes"].append("Import incomplete; previous selection was not changed. Resolve parents before selecting presets.")
+                merged = {**previous, **document, **chosen}
+                if chosen and merged.get("machine") and merged.get("process"):
+                    try:
+                        _reject_unpermitted_pair(chosen, merged)
+                    except HTTPException:
+                        chosen = {}
+                        result["notes"].append("Imported presets were not selected: the resulting machine/process pair is incompatible or incomplete.")
+                if not chosen:
+                    # Preserve effective fallback slots too, including an absent machine;
+                    # otherwise the newly imported machine can become the fallback.
+                    for kind in PRESET_KINDS:
+                        document.setdefault(kind, previous.get(kind))
+                document.update(chosen)
+                write_profile_file(document)
+            return result
+    try:
+        return await asyncio.to_thread(import_and_select)
     except prof.ProfileError as exc:
         raise HTTPException(400, str(exc)) from exc
-    result["ok"] = bool(result["imported"])
-    if result["imported"]:
-        # the import names its own presets: a fresh install has nothing selected, and the
-        # `options`/`machine_label` keys ride along untouched through the same document
-        document = read_profile_document()
-        document.update(selection_from_import(result))
-        write_profile_file(document)
-    return result
 
 
 @app.post("/api/profile/select")
@@ -1973,24 +2080,26 @@ def api_profile_select(body: dict):
     regenerating leaves `derived` holding a copy of the process that is no longer selected
     while `derived.stale` still reads false (that flag only compares option fields).
     """
-    chosen: dict[str, str] = {}
-    for kind in ("machine", "process", "filament"):
-        # one containment + type check for every slot, so a non-string value is a 400 here
-        # rather than a 500 inside `Path`
-        rel = _profile_rel(kind, body.get(kind))
-        if rel is not None:
-            chosen[kind] = rel
-    if not chosen:
-        raise HTTPException(400, "nothing to select")
-    merged = {k: relative_to_datadir(v) for k, v in require_machine().items()}
-    merged.update(profile_labels())
-    merged.update(chosen)
-    # before `write_profile_file`, so a refused pair leaves profile.json, the stored pairing
-    # and the derived preset exactly as they were
-    _reject_unpermitted_pair(chosen, merged)
-    write_profile_file(merged)
-    write_pairing_back(chosen)
-    regenerate_derived(merged)
+    with DERIVED_LOCK:
+        chosen: dict[str, str] = {}
+        for kind in ("machine", "process", "filament"):
+            rel = _profile_rel(kind, body.get(kind))
+            if rel is not None:
+                chosen[kind] = rel
+        if not chosen:
+            raise HTTPException(400, "nothing to select")
+        current = partial_selection()
+        if "machine" not in current and "machine" not in chosen:
+            raise no_printer_profile(["machine"])
+        merged = {k: relative_to_datadir(v) for k, v in current.items()}
+        merged.update(profile_labels())
+        merged.update(chosen)
+        # An initial machine can be selected before any process exists.
+        if merged.get("machine") and merged.get("process"):
+            _reject_unpermitted_pair(chosen, merged)
+        write_profile_file(merged)
+        write_pairing_back(chosen)
+        regenerate_derived(merged)
     return {"ok": True, "active": merged}
 
 
@@ -2005,12 +2114,39 @@ def api_profile_options(body: dict):
         update = prof.validate_options(body)
     except prof.ProfileError as exc:
         raise HTTPException(400, str(exc)) from exc
-    document = read_profile_document()
-    merged = {**prof.read_options(document), **update}
-    document["options"] = merged
-    write_profile_file(document)
-    regenerate_derived(document)
+    with DERIVED_LOCK:
+        document = read_profile_document()
+        merged = {**prof.read_options(document), **update}
+        document["options"] = merged
+        write_profile_file(document)
+        regenerate_derived(document)
     return {"ok": True, "options": merged}
+
+
+@app.get("/api/profile/parent-candidates")
+def api_parent_candidates(child: str):
+    """List same-name parents. The response never selects or recommends one."""
+    with DERIVED_LOCK:
+        try:
+            ptype = next((part for part in ("machine", "process", "filament") if part in Path(child).parts), None)
+            if ptype is None or _preset_path(child) is None:
+                raise prof.ProfileError("invalid child preset")
+            return prof.list_parent_candidates(CONFIG.orca_datadir / child, ptype, CONFIG.orca_datadir)
+        except prof.ProfileError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
+
+@app.put("/api/profile/parent-mappings")
+def api_bind_parent(body: dict):
+    """Bind one explicit parent edge without changing the active selection."""
+    if not isinstance(body, dict) or set(body) != {"child", "candidate", "inherits", "sha256"}:
+        raise HTTPException(422, "expected child, candidate, inherits and sha256")
+    with DERIVED_LOCK:
+        try:
+            return prof.bind_parent(CONFIG.orca_datadir, None, body["child"], body["candidate"],
+                                    body["inherits"], body["sha256"])
+        except prof.ProfileError as exc:
+            raise HTTPException(400, str(exc)) from exc
 
 
 @app.get("/api/presets")

@@ -8,6 +8,7 @@ built without its context manager, so the lifespan never starts the slicing work
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import io
 import json
 import queue
@@ -605,16 +606,12 @@ def test_upload_3mf_without_a_permitted_process_stamps_no_process_identity(
     before = switchable.profile_file.read_bytes()
     blob = three_mf_bytes(process="0.20mm Voron")
 
-    jid = upload(api_client, blob, filename="voron.3mf").json()["id"]
+    response = upload(api_client, blob, filename="voron.3mf")
 
-    job = read_job(jobs, jid)
-    assert switchable.profile_file.read_bytes() == before    # the stored pairing is kept
-    assert job["threemf"]["rewrite"] == "none"
-    assert "slicer_input" not in job
-    assert list((jobs / jid / "upload").glob("slice-*.3mf")) == []
-    uploaded = three_mf_member((jobs / jid / "upload" / "voron.3mf").read_bytes())
-    assert uploaded["print_settings_id"] == ["0.20mm Voron"]     # the 3MF's own, unstamped
-    assert [note for note in job["threemf"]["notes"] if "kept the stored pairing" in note]
+    assert response.status_code == 409, response.text
+    assert "unavailable" in response.json()["detail"]
+    assert switchable.profile_file.read_bytes() == before
+    assert list(jobs.iterdir()) == []
 
 
 def test_upload_3mf_survives_an_unreadable_stored_process(storage, api_client, switchable,
@@ -636,10 +633,10 @@ def test_upload_3mf_survives_an_unreadable_stored_process(storage, api_client, s
 
     response = upload(api_client, three_mf_bytes(), filename="benchy.3mf")
 
-    assert response.status_code == 200, response.text
-    assert switchable.profile_file.read_bytes() == before    # the stored pairing is kept
-    job = read_job(jobs, response.json()["id"])
-    assert [note for note in job["threemf"]["notes"] if "kept the stored pairing" in note]
+    assert response.status_code == 409, response.text
+    assert "unreadable process preset" in response.json()["detail"]
+    assert switchable.profile_file.read_bytes() == before
+    assert list(jobs.iterdir()) == []
 
 
 def test_upload_3mf_prefers_the_printer_paired_with_the_machine(storage, api_client,
@@ -751,18 +748,24 @@ def test_run_slice_prefers_the_snapshot_and_slicer_input(storage, switchable, mo
     (jobs / jid / "upload").mkdir(parents=True)
     (jobs / jid / "upload" / "cube.stl").write_text("solid cube\n")
     (jobs / jid / "upload" / "slice-benchy.3mf").write_bytes(b"PK\x03\x04rewritten")
+    options = {"supports": True, "brim": False, "hide_profiles": False}
     (jobs / jid / "job.json").write_text(json.dumps({
         "id": jid, "status": "queued", "filename": "cube.stl", "output_name": "cube",
         "slicer_input": "slice-benchy.3mf",
         "profile_snapshot": {"machine": MACHINE_REL, "process": PROCESS_REL,
-                             "filament": FILAMENT_REL,
-                             "options": {"supports": True, "brim": False,
-                                         "hide_profiles": False}},
+                             "filament": FILAMENT_REL, "options": options},
+        "pinned_presets": pin_current(jobs / jid, options),
     }))
+    machine = json.loads((datadir / MACHINE_REL).read_text())
+    machine["test_inherited_machine"] = "changed-after-queue"
+    (datadir / MACHINE_REL).write_text(json.dumps(machine))
     seen: dict = {}
 
     def fake_run(cmd, **kwargs):
         seen["cmd"] = cmd
+        machine, process = cmd[cmd.index("--load-settings") + 1].split(";")
+        seen["presets"] = [json.loads(Path(p).read_text()) for p in
+                           (machine, process, cmd[cmd.index("--load-filaments") + 1])]
         (Path(kwargs["cwd"]) / "out" / "cube.gcode").write_text("; total filament used [g] = 1\n")
         return SimpleNamespace(returncode=0, stdout="", stderr="")
 
@@ -772,35 +775,29 @@ def test_run_slice_prefers_the_snapshot_and_slicer_input(storage, switchable, mo
 
     cmd = seen["cmd"]
     assert cmd[-1] == str(jobs / jid / "upload" / "slice-benchy.3mf")
-    machine, process = cmd[cmd.index("--load-settings") + 1].split(";")
-    assert machine == str((datadir / MACHINE_REL).resolve())
-    assert process == str(datadir / prof.PORTAL_PROCESS_REL)
-    assert cmd[cmd.index("--load-filaments") + 1] == str((datadir / FILAMENT_REL).resolve())
-    derived = json.loads((datadir / prof.PORTAL_PROCESS_REL).read_text())
+    machine, derived, filament = seen["presets"]
+    assert machine["name"] == "Generic Klipper 0.4 nozzle"
+    assert machine["test_inherited_machine"] == "machine-parent"
+    assert filament["filament_max_volumetric_speed"] == ["12"]
+    assert all("inherits" not in p for p in seen["presets"])
     assert derived["enable_support"] == "1"        # the snapshot's options, not the live ones
     assert derived["brim_width"] == "0"
     assert read_job(jobs, jid)["status"] == "sliced"
 
 
-def test_run_slice_holds_the_derived_lock_across_the_launch(storage, switchable, monkeypatch):
-    """An option save must not rewrite the derived preset while the slicer is launching.
-
-    `run_slice` writes the shared derived preset, builds the argv around it and runs the
-    slicer that loads it; `regenerate_derived` takes the same lock for its own rewrite. A
-    save landing inside that window would slice with the live options instead of this
-    job's snapshot, so the second thread here has to stay outside until the launch ends.
-    """
+def test_run_slice_uses_private_pins_while_options_change(storage, switchable, monkeypatch):
+    """A concurrent option save may rewrite the shared derived file, not this job's pins."""
     jobs, _sliced = storage
     datadir = switchable.datadir
     jid = "decafbad1234"
     (jobs / jid / "upload").mkdir(parents=True)
     (jobs / jid / "upload" / "cube.stl").write_text("solid cube\n")
+    options = {"supports": False, "brim": True, "hide_profiles": False}
     (jobs / jid / "job.json").write_text(json.dumps({
         "id": jid, "status": "queued", "filename": "cube.stl", "output_name": "cube",
         "profile_snapshot": {"machine": MACHINE_REL, "process": PROCESS_REL,
-                             "filament": FILAMENT_REL,
-                             "options": {"supports": False, "brim": True,
-                                         "hide_profiles": False}},
+                             "filament": FILAMENT_REL, "options": options},
+        "pinned_presets": pin_current(jobs / jid, options),
     }))
     attempting = threading.Event()     # the save has reached the critical section
     applied = threading.Event()        # ... and has rewritten the shared preset
@@ -823,6 +820,9 @@ def test_run_slice_holds_the_derived_lock_across_the_launch(storage, switchable,
         # observed rather than asserted: `run_slice` turns anything the slicer raises into
         # a failed job, which would hide the reason
         launch["lock_held"] = main.DERIVED_LOCK._is_owned()
+        process = Path(cmd[cmd.index("--load-settings") + 1].split(";")[1])
+        launch["process"] = json.loads(process.read_text())
+        launch["private"] = "effective-presets-" in str(process)
         saver.start()
         launch["attempted"] = attempting.wait(5)
         launch["entered_early"] = applied.wait(0.2)
@@ -836,9 +836,10 @@ def test_run_slice_holds_the_derived_lock_across_the_launch(storage, switchable,
     main.run_slice(jid)
 
     assert launch, "the slicer was never launched"
-    assert launch["lock_held"], "the slicer launch runs outside DERIVED_LOCK"
+    assert not launch["lock_held"]
+    assert launch["private"]
+    assert launch["process"]["enable_support"] == "0"
     assert launch["attempted"], "the concurrent save never reached the lock"
-    assert not launch["entered_early"], "an option save rewrote the preset mid-launch"
     saver.join(5)
     assert not saver.is_alive()
     assert applied.is_set()               # released with the launch, not leaked
@@ -859,18 +860,52 @@ def scale_of(cmd: list[str]) -> str | None:
     return cmd[cmd.index("--scale") + 1] if "--scale" in cmd else None
 
 
+def pin_current(job_dir: Path, options: dict) -> dict:
+    """Capture the current effective presets the way an upload does."""
+    datadir = main.CONFIG.orca_datadir
+    rels = {"machine": MACHINE_REL, "process": PROCESS_REL, "filament": FILAMENT_REL}
+    paths = {kind: datadir / rel for kind, rel in rels.items()}
+    opts = prof.read_options({"options": options})
+    machine = prof.effective_preset(paths["machine"], "machine", datadir)
+    prof.clamp_machine(machine, main.CONFIG.bed_size)
+    values = {"machine": machine,
+              "process": prof.derived_process_data(paths["process"], datadir, opts),
+              "filament": prof.effective_preset(paths["filament"], "filament", datadir)}
+    pinned = job_dir / "pinned"
+    pinned.mkdir(exist_ok=True)
+    hashes = {}
+    for kind, value in values.items():
+        raw = json.dumps(value, indent=2).encode()
+        (pinned / f"{kind}.json").write_bytes(raw)
+        hashes[kind] = hashlib.sha256(raw).hexdigest()
+    return {"version": 1, "sha256": hashes, "options": opts}
+
+
+def minimal_pins(job_dir: Path, options: dict) -> dict:
+    """Write resolved pin files without reading the live datadir."""
+    pinned = job_dir / "pinned"
+    pinned.mkdir(exist_ok=True)
+    hashes = {}
+    for kind in ("machine", "process", "filament"):
+        raw = json.dumps({"type": kind, "name": kind, "from": "system"}).encode()
+        (pinned / f"{kind}.json").write_bytes(raw)
+        hashes[kind] = hashlib.sha256(raw).hexdigest()
+    return {"version": 1, "sha256": hashes, "options": prof.read_options({"options": options})}
+
+
 def queued_job(jobs: Path, blob: bytes, *, filename: str = "cube.stl",
                slicer_input: str | None = None, options: dict | None = None,
                jid: str = "decafbad1234") -> str:
-    """A queued job holding ``blob`` and a snapshot of the private datadir's presets."""
+    """A queued job holding ``blob`` and pinned effective presets."""
     upload_dir = jobs / jid / "upload"
     upload_dir.mkdir(parents=True)
     (upload_dir / (slicer_input or filename)).write_bytes(blob)
+    stored = {**FIT_SNAPSHOT_OPTIONS, **(options or {})}
     meta = {"id": jid, "status": "queued", "filename": filename,
             "output_name": Path(filename).stem,
             "profile_snapshot": {"machine": MACHINE_REL, "process": PROCESS_REL,
-                                 "filament": FILAMENT_REL,
-                                 "options": {**FIT_SNAPSHOT_OPTIONS, **(options or {})}}}
+                                 "filament": FILAMENT_REL, "options": stored},
+            "pinned_presets": pin_current(jobs / jid, stored)}
     if slicer_input is not None:
         meta["slicer_input"] = slicer_input
     (jobs / jid / "job.json").write_text(json.dumps(meta))
@@ -1031,14 +1066,14 @@ def test_run_slice_refuses_a_finned_job_needing_shrink(storage, switchable, monk
     upload_dir = jobs / jid / "upload"
     upload_dir.mkdir(parents=True)
     (upload_dir / "cube.stl").write_bytes(scaled_cube(cube_stl, 15))
+    options = {"auto_orient": True, "shrink_to_fit": True, "supports": False,
+               "brim": False, "hide_profiles": False}
     (jobs / jid / "job.json").write_text(json.dumps({
         "id": jid, "status": "queued", "filename": "cube.stl",
         "output_name": "cube", "support_fins": True,
         "profile_snapshot": {"machine": MACHINE_REL, "process": PROCESS_REL,
-                             "filament": FILAMENT_REL,
-                             "options": {"auto_orient": True, "shrink_to_fit": True,
-                                         "supports": False, "brim": False,
-                                         "hide_profiles": False}},
+                             "filament": FILAMENT_REL, "options": options},
+        "pinned_presets": pin_current(jobs / jid, options),
     }))
     calls: list[list[str]] = []
     record_slice(monkeypatch, calls)
@@ -1121,6 +1156,8 @@ def staged_job(jobs: Path, jid: str = "fadedcab1234") -> str:
                              "filament": FILAMENT_REL,
                              "options": {"supports": False, "brim": False,
                                          "hide_profiles": False}},
+        "pinned_presets": minimal_pins(jobs / jid, {"supports": False, "brim": False,
+                                                    "hide_profiles": False}),
     }))
     return jid
 
@@ -1144,6 +1181,48 @@ def test_a_fins_upload_is_staged_not_queued(storage, api_client, queue_watch, mo
     assert "queue_position" not in body      # staged: the dialog's *Slice it* is the entry
     assert queue_watch.empty()
     assert read_job(jobs, body["id"])["status"] == "awaiting_confirm"
+
+
+def test_upload_pins_survive_later_parent_edits(storage, api_client, switchable, monkeypatch, cube_stl):
+    jobs, _sliced = storage
+    jid = upload(api_client, cube_stl).json()["id"]
+    filament = switchable.datadir / FILAMENT_REL
+    data = json.loads(filament.read_text())
+    data["filament_max_volumetric_speed"] = ["99"]
+    filament.write_text(json.dumps(data))
+    seen = {}
+
+    def fake_run(cmd, **kwargs):
+        seen["filament"] = json.loads(Path(cmd[cmd.index("--load-filaments") + 1]).read_text())
+        (Path(kwargs["cwd"]) / "out" / "cube.gcode").write_text("; total filament used [g] = 1\n")
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(main.subprocess, "run", fake_run)
+    main.run_slice(jid)
+    assert seen["filament"]["filament_max_volumetric_speed"] != ["99"]
+
+
+def test_confirm_uses_captured_pins_without_live_selection(storage, api_client, queue_watch):
+    jobs, _sliced = storage
+    jid = staged_job(jobs)
+    if main.CONFIG.profile_file.exists():
+        main.CONFIG.profile_file.unlink()
+    response = api_client.post(f"/api/jobs/{jid}/slice")
+    assert response.status_code == 200, response.text
+
+
+def test_legacy_job_without_pins_fails_closed(storage, switchable):
+    jobs, _sliced = storage
+    jid = "1e6ac7000001"
+    (jobs / jid / "upload").mkdir(parents=True)
+    (jobs / jid / "upload" / "cube.stl").write_text("solid cube\n")
+    (jobs / jid / "job.json").write_text(json.dumps({
+        "id": jid, "status": "queued", "filename": "cube.stl", "output_name": "cube",
+        "profile_snapshot": {"machine": MACHINE_REL, "process": PROCESS_REL,
+                             "filament": FILAMENT_REL},
+    }))
+    main.run_slice(jid)
+    assert "pinned presets" in read_job(jobs, jid)["error"]
 
 
 def test_confirming_a_staged_job_queues_it_exactly_once(storage, api_client, queue_watch):

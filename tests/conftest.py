@@ -52,6 +52,11 @@ os.environ.update({
     "MACHINE_SLOT": "",
 })
 
+# Tests never consult a host Orca installation; these small synthetic parents make
+# the trimmed historical presets resolvable and keep the suite deterministic.
+import profiles
+profiles.ORCA_PROFILES = FIXTURES / "orca-resources"
+
 
 @pytest.fixture(scope="session")
 def data_dir() -> Path:
