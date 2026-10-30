@@ -1316,18 +1316,19 @@ def test_the_fins_flag_is_sent_only_when_the_box_is_ticked(page):
     assert "Adding support fins: ${file.name}" in body
 
 
-def test_a_staged_upload_opens_the_preview_instead_of_queueing(page):
-    """The fins decision point is the dialog, so upload() must stop before the queue.
+def test_a_staged_upload_stays_on_the_card_instead_of_opening_the_preview(page):
+    """Fins stay staged, but the dialog must not open itself.
 
-    A mutation that drops the branch (or that calls /slice from here) turns the preview into a
-    decoration: the model would be queued before the operator ever saw the fins.
+    Preview and Slice it on the card are the decision. Calling /slice from upload() would queue
+    the model before the operator chose.
     """
     body = function_body(page, "upload")
     branch = slice_between(body, 'if (j.status === "awaiting_confirm") {', "return;")
 
     assert "setUploadWait(null)" in branch            # keep the slicer bar for the real queue
     assert "setUploadLatest(j)" in branch
-    assert "openPreview(j.id)" in branch
+    assert "openPreview(" not in branch
+    assert "refresh();" in branch
     assert "/slice" not in body                       # nothing is queued from an upload
     # and it is checked before the queued path takes over
     assert body.index('if (j.status === "awaiting_confirm")') < \
@@ -1475,11 +1476,11 @@ def test_closing_keeps_the_job_and_discarding_asks_first(page):
     assert "refresh();" in discard
 
 
-def test_the_last_job_block_previews_a_staged_job_instead_of_slicing_it(page):
-    """M10: the "Latest" shortcut must open the dialog, not queue the job.
+def test_the_last_job_block_offers_preview_and_slice_for_a_staged_job(page):
+    """A finned upload lands on the card with both actions, and neither fires by itself.
 
-    The button is static markup (the poll only re-aims it), and it is routed through the row
-    handler's `preview` arm, so there is exactly one preview implementation and one fetch.
+    Both buttons are static markup (the poll only re-aims them) and share the row handler, so
+    there is one preview path and one slice path.
     """
     card = upload_card(page)
     tag = card[card.rindex("<button", 0, card.index('id="uploadLatestPreview"')):]
@@ -1488,16 +1489,29 @@ def test_the_last_job_block_previews_a_staged_job_instead_of_slicing_it(page):
     assert "hidden" in tag                              # only a staged job shows it
     assert "aria-label=" in tag
     assert "Preview fins" in card[card.index('id="uploadLatestPreview"'):]
+    slice_tag = card[card.rindex("<button", 0, card.index('id="uploadLatestSlice"')):]
+    slice_tag = slice_tag[:slice_tag.index(">")]
+    assert 'data-act="slice"' in slice_tag
+    assert "btn-primary" in slice_tag
+    assert "hidden" in slice_tag
+    assert "aria-label=" in slice_tag
+    assert card.index('id="uploadLatestPreview"') < card.index('id="uploadLatestSlice"')
+    assert "Slice it" in card[card.index('id="uploadLatestSlice"'):card.index('id="uploadLatestReslice"')]
 
     latest = function_body(page, "setUploadLatest")
     assert 'const staged = job.status === "awaiting_confirm" && !job.error;' in latest
     assert "preview.hidden = !staged;" in latest
     assert 'preview.dataset.ref = staged ? job.id : "";' in latest
     assert "preview.setAttribute(\"aria-label\", `Preview the support fins on ${name}`);" in latest
+    assert 'const sliceable = staged && job.kind !== "reslice";' in latest
+    assert "slice.hidden = !sliceable;" in latest
+    assert 'slice.dataset.ref = sliceable ? job.id : "";' in latest
 
     handler = function_body(page, "onJobAction")
     assert 'btn.dataset.act === "preview"' in handler
     assert "openPreview(btn.dataset.ref)" in handler
+    assert 'btn.dataset.act === "slice"' in handler
+    assert "confirmSlice(btn.dataset.ref)" in handler
     assert '$("#uploadLatest").addEventListener("click", onJobAction);' in page
     assert page.count("/preview`") == 1                 # one dialog, one request path
 
