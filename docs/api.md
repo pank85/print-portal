@@ -144,6 +144,8 @@ Full pipeline: [presets.md](presets.md).
 | POST | `/api/profile/upload` | import `.orca_printer` / `.zip` / `.json` | 200 `{imported:[{type,name,label,file,path,rebased_on}],notes,ok}` · 400 unreadable bundle · 413 > 20 MB · **500** when no machine preset resolves | 200 `{…,"registered":true}` · 400 unreadable bundle **or name collision** · 413 > 20 MB |
 | POST | `/api/profile/select` | choose the active presets | 200 · 400 not-a-preset / `nothing to select` / not permitted · **500** when no machine resolves | 200 · 400 same · **409 `no_printer_profile`** |
 | POST | `/api/profile/options` | set `supports` / `brim` / `hide_profiles` / `auto_orient` / `shrink_to_fit` | 200 · 400 `options must be an object` / `unknown option: <key>` / `<key> must be true or false` / `nothing to update` | identical |
+| GET | `/api/profile/parent-candidates?child=<rel>` | list same-name parents without recommending one | 200 `{child,type,inherits,candidates}` · 400 invalid child or no inherits | not present |
+| PUT | `/api/profile/parent-mappings` | bind `{child,candidate,inherits,sha256}`; no selection change | 200 `{child,bound,resolved}` · 400 not a candidate or chain still unresolved · 422 wrong body | not present |
 
 `POST /api/upload` differs the same way: A answers **500** when no machine preset resolves (the raise
 happens inside `profile_snapshot()`, after the job dir exists — the `BaseException` handler removes it);

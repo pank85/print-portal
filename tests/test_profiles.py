@@ -200,9 +200,15 @@ def test_clamp_area_edge_cases():
     assert prof.clamp_area(["0x0", "350x0", "350x350", "0x350"], (300.0, 300.0)) == [
         "0x0", "300x0", "300x300", "0x300"]
     assert prof.clamp_area(["0x0", "300x0", "300x300", "0x300"], (300.0, 300.0)) is None
-    # 1 mm of tolerance is allowed before clamping
-    assert prof.clamp_area(["0x0", "221x0", "221x221", "0x221"], (220.0, 220.0)) is None
+    assert prof.clamp_area(["0x0", "221x0", "221x221", "0x221"], (220.0, 220.0)) == [
+        "0x0", "220x0", "220x220", "0x220"]
     assert prof.clamp_area(["nonsense"], (220.0, 220.0)) is None
+    assert prof.clamp_area(["0x0", "300x0", "300x100", "0x100"], (220.0, 220.0)) == [
+        "0x0", "220x0", "220x100", "0x100"]
+    assert prof.clamp_area(["10x20", "310x20", "310x120", "10x120"], (220.0, 220.0)) == [
+        "10x20", "230x20", "230x120", "10x120"]
+    with pytest.raises(prof.ProfileError, match='non-convex'):
+        prof.clamp_area(["0x0", "300x0", "300x40", "40x40", "40x100", "0x100"], (220.0, 220.0))
 
 
 def test_a_dangling_inherits_is_kept_verbatim():

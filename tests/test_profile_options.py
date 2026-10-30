@@ -7,6 +7,7 @@ into the session datadir or into ``presets/``.
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import json
 import subprocess
 from pathlib import Path
@@ -187,7 +188,7 @@ def test_generated_process_encodes_supports_and_brim(datadir):
     assert data["enable_support"] == "1"
     assert data["brim_type"] == "outer_only"
     assert data["brim_width"] == "5"            # inherited from fdm_process_common.json
-    assert data["inherits"] == "fdm_process_klipper_common"
+    assert "inherits" not in data
     assert data["layer_height"] == "0.2"
 
     prof.write_derived_process(selected, datadir,
@@ -284,7 +285,12 @@ def test_derivation_failure_marks_job_failed_without_slicing(client, jobs_dir: P
     assert job["error"].startswith("profile: ProfileError")
 
 
-def test_upload_preserves_options(client, isolated_profile: Path):
+def test_upload_preserves_options(client, isolated_profile: Path, datadir: Path):
+    # Make the existing process universal so the imported machine is a permitted pair.
+    process = datadir / SELECTED_PROCESS
+    data = json.loads(process.read_text())
+    data['compatible_printers'] = []
+    process.write_text(json.dumps(data))
     assert client.post("/api/profile/options",
                        json={"supports": True}).status_code == 200
 
@@ -310,14 +316,31 @@ def test_run_slice_uses_single_generated_process_path(jobs_dir: Path, datadir: P
     upload = jobs_dir / jid / "upload"
     upload.mkdir(parents=True)
     (upload / "cube.stl").write_bytes(cube_stl)
+    options = prof.read_options({})
+    paths = {kind: datadir / rel for kind, rel in prof.DEFAULT_PROFILE.items()}
+    machine = prof.effective_preset(paths["machine"], "machine", datadir)
+    prof.clamp_machine(machine, main.CONFIG.bed_size)
+    values = {"machine": machine,
+              "process": prof.derived_process_data(paths["process"], datadir, options),
+              "filament": prof.effective_preset(paths["filament"], "filament", datadir)}
+    pinned = jobs_dir / jid / "pinned"
+    pinned.mkdir()
+    hashes = {}
+    for kind, value in values.items():
+        raw = json.dumps(value, indent=2).encode()
+        (pinned / f"{kind}.json").write_bytes(raw)
+        hashes[kind] = hashlib.sha256(raw).hexdigest()
     (jobs_dir / jid / "job.json").write_text(json.dumps(
-        {"id": jid, "status": "queued", "filename": "cube.stl"}))
+        {"id": jid, "status": "queued", "filename": "cube.stl",
+         "pinned_presets": {"version": 1, "sha256": hashes, "options": options}}))
     monkeypatch.setattr(main, "JOBS", jobs_dir)
 
     captured: dict[str, list[str]] = {}
 
     def fake_run(cmd, **kwargs):
         captured["cmd"] = cmd
+        entries = cmd[cmd.index("--load-settings") + 1].split(";")
+        captured["process"] = json.loads(Path(entries[1]).read_text())
         return subprocess.CompletedProcess(args=cmd, returncode=0, stdout="", stderr="")
 
     monkeypatch.setattr(main.subprocess, "run", fake_run)
@@ -327,8 +350,10 @@ def test_run_slice_uses_single_generated_process_path(jobs_dir: Path, datadir: P
     cmd = captured["cmd"]
     entries = cmd[cmd.index("--load-settings") + 1].split(";")
     assert len(entries) == 2                     # machine;derived_process, never a third
-    assert entries[1] == str(datadir / prof.PORTAL_PROCESS_REL)
-    assert (datadir / prof.PORTAL_PROCESS_REL).is_file()
+    assert Path(entries[1]).name == "process.json"
+    assert captured["process"]["brim_width"] == "5"
+    assert "inherits" not in captured["process"]
+    assert not Path(entries[1]).exists()  # the private per-job copy is removed
 
 
 # ---------------------------------------------------------------- UI wiring

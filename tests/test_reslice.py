@@ -332,6 +332,48 @@ def test_settings_and_scale_compete_on_revision(setup):
     assert client.get(f'/api/jobs/{child}').json()['revision'] == 1
 
 
+def test_existing_pins_are_replaced_and_restored_if_publish_fails(setup, monkeypatch):
+    client, jobs, datadir = setup
+    child = fork(client, source(jobs)).json()['id']
+    preset_dir = datadir / 'local-replace'
+    preset_dir.mkdir()
+    refs = {}
+    for kind in ('machine', 'process', 'filament'):
+        path = preset_dir / f'{kind}.json'
+        data = {'name': kind, 'type': kind}
+        if kind == 'process':
+            data['compatible_printers'] = ['machine']
+        path.write_text(json.dumps(data))
+        refs[kind] = path.relative_to(datadir).as_posix()
+    assert client.patch(f'/api/jobs/{child}/settings', json={'revision': 0, 'profile': refs}).status_code == 200
+    previous = jobs / child / 'pinned'
+    previous.mkdir()
+    (previous / 'machine.json').write_text('{"keep": true}')
+    (previous / 'process.json').write_text('{"keep": true}')
+    (previous / 'filament.json').write_text('{"keep": true}')
+    before = {path.name: path.read_bytes() for path in previous.iterdir()}
+    job_before = (jobs / child / 'job.json').read_bytes()
+    original_write = main.write_job
+
+    def fail_write(jid, **fields):
+        raise OSError('publish failed')
+
+    monkeypatch.setattr(main, 'write_job', fail_write)
+    quiet = TestClient(main.app, raise_server_exceptions=False)
+    failed = quiet.post(f'/api/jobs/{child}/slice', json={'revision': 1})
+    assert failed.status_code == 500
+    assert {path.name: path.read_bytes() for path in (jobs / child / 'pinned').iterdir()} == before
+    assert (jobs / child / 'job.json').read_bytes() == job_before
+    assert not list((jobs / child).glob('.pinned-*'))
+
+    monkeypatch.setattr(main, 'write_job', original_write)
+    ok = client.post(f'/api/jobs/{child}/slice', json={'revision': 1})
+    assert ok.status_code == 200, ok.text
+    pinned = jobs / child / 'pinned'
+    assert json.loads((pinned / 'machine.json').read_text())['name'] == 'machine'
+    assert not list((jobs / child).glob('.pinned-*'))
+
+
 def test_reslice_slice_profile_never_falls_back_to_globals(setup, monkeypatch):
     client, jobs, _ = setup
     child = fork(client, source(jobs)).json()['id']
@@ -350,12 +392,15 @@ def test_confirm_pins_presets_once_and_worker_uses_pins(setup, monkeypatch):
     preset_dir = datadir / 'local-confirm'
     preset_dir.mkdir()
     refs = {}
+    parent = datadir / 'system/Custom/process/reslice-test-parent.json'
+    parent.parent.mkdir(parents=True, exist_ok=True)
+    parent.write_text(json.dumps({'name': 'reslice-test-parent', 'type': 'process', 'brim_width': '7'}))
     for kind in ('machine', 'process', 'filament'):
         path = preset_dir / f'{kind}.json'
         data = {'name': kind, 'type': kind}
         if kind == 'process':
             data['compatible_printers'] = ['machine']
-            data['brim_width'] = '7'
+            data['inherits'] = 'reslice-test-parent'
         path.write_text(json.dumps(data))
         refs[kind] = path.relative_to(datadir).as_posix()
     r = client.patch(f'/api/jobs/{child}/settings', json={'revision': 0, 'profile': refs})
@@ -370,6 +415,7 @@ def test_confirm_pins_presets_once_and_worker_uses_pins(setup, monkeypatch):
     assert all(p.parent == jobs / child / 'pinned' for p in paths.values())
     before = {k: p.read_bytes() for k, p in paths.items()}
     assert json.loads(before['process'])['brim_width'] == '7'
+    parent.write_text(json.dumps({'name': 'reslice-test-parent', 'type': 'process', 'brim_width': '19'}))
     for rel in refs.values():
         (datadir / rel).unlink()
     assert {k: p.read_bytes() for k, p in main.slice_profile(job)[0].items()} == before
@@ -378,15 +424,18 @@ def test_confirm_pins_presets_once_and_worker_uses_pins(setup, monkeypatch):
     seen = {}
     def run(cmd, **kwargs):
         seen['cmd'] = cmd
+        machine, process = cmd[cmd.index('--load-settings') + 1].split(';')
+        names = {'machine': machine, 'process': process,
+                 'filament': cmd[cmd.index('--load-filaments') + 1]}
+        seen['presets'] = {kind: json.loads(Path(path).read_text()) for kind, path in names.items()}
         (Path(kwargs['cwd']) / 'out' / 'part.gcode').write_text('; generated')
         return SimpleNamespace(returncode=0, stdout='', stderr='')
     monkeypatch.setattr(main.subprocess, 'run', run)
     monkeypatch.setattr(main, 'SLICED', jobs.parent / 'sliced')
     assert main.claim_queued_job(child)
     main.run_slice(child)
-    cmd = seen['cmd']
-    assert cmd[cmd.index('--load-settings') + 1] == f"{paths['machine']};{paths['process']}"
-    assert cmd[cmd.index('--load-filaments') + 1] == str(paths['filament'])
+    assert seen['presets'] == {kind: json.loads(blob) for kind, blob in before.items()}
+    assert all('inherits' not in preset for preset in seen['presets'].values())
     assert main.read_job(child)['status'] == 'sliced'
     assert not main.CONFIG.profile_file.exists()
     assert client.post(f'/api/jobs/{child}/scale/reset', json={'revision': 2}).status_code == 409
