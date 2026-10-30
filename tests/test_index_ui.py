@@ -1723,3 +1723,29 @@ global.fetch = async (url, opts) => opts ? {ok:true, json:async()=>({id:'child',
 })().catch(e => {console.error(e); process.exit(1);});
 '''
     subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
+
+
+def test_from_layer_dialog_and_actions_are_wired(page):
+    dlg = slice_between(page, '<dialog id="fromLayerDlg"', "</dialog>")
+    assert 'aria-labelledby="fromLayerTitle"' in dlg
+    assert 'aria-describedby="fromLayerHint"' in dlg
+    assert 'id="fromLayerInput"' in dlg
+    assert 'id="fromLayerZ"' in dlg
+    assert 'id="fromLayerSummary"' in dlg
+    assert 'id="fromLayerError" class="err" role="alert" hidden' in dlg
+    assert 'id="fromLayerDownload"' in dlg
+    assert 'id="fromLayerPrint"' in dlg
+
+    row = function_body(page, "renderJobRow")
+    assert 'data-act="from-layer"' in row
+    assert "Print from layer…" in row
+    latest = function_body(page, "setUploadLatest")
+    assert 'fromLayer = $("#uploadLatestFromLayer")' in latest
+    assert "fromLayer.hidden = !printable;" in latest
+    handler = function_body(page, "onJobAction")
+    assert 'btn.dataset.act === "from-layer"' in handler
+    assert "openFromLayer(btn.dataset.ref, btn)" in handler
+    assert 'ev.target.closest("article.job")' in handler
+    assert "openFromLayer(fromBtn.dataset.ref, fromBtn)" in handler
+    summary = function_body(page, "updateFromLayerSummary")
+    assert "Print from layer ${entry.layer} and on" in summary

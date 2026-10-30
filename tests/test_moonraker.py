@@ -397,3 +397,26 @@ def test_printer_state_offline(monkeypatch) -> None:
     out = c.printer_state()
     assert out == {"ok": False, "state": "offline", "error": out["error"]}
     assert "unreachable" in out["error"].lower() or "refused" in out["error"].lower()
+
+
+def test_saved_layer_info_reads_save_variables_and_falls_back_to_print_stats(monkeypatch) -> None:
+    captured = {}
+    status = {
+        "save_variables": {"variables": {"current_layer": 96, "current_bed_temp": 55.0}},
+        "print_stats": {"state": "paused", "filename": "/gcodes/part.gcode", "info": {"current_layer": 12}},
+    }
+
+    def handler(req, timeout=None):
+        captured["url"] = req.get_full_url()
+        return FakeResponse(b'{"result": {"status": ' + __import__("json").dumps(status).encode() + b"}}")
+
+    _patch_urlopen(monkeypatch, handler)
+    c = moonraker.MoonrakerClient("http://x:7125", "secret")
+    info = c.saved_layer_info()
+    assert captured["url"] == "http://x:7125/printer/objects/query?save_variables&print_stats"
+    assert info == {"current_layer": 96, "filename": "part.gcode", "state": "paused"}
+
+    # Fallback when save_variables has no current_layer
+    status["save_variables"] = {"variables": {}}
+    info2 = c.saved_layer_info()
+    assert info2["current_layer"] == 12

@@ -1360,3 +1360,61 @@ def test_queue_claim_is_atomic_and_stale_entries_are_ignored(storage):
     assert sorted(results) == [False, True]
     assert read_job(jobs, jid)["status"] == "slicing"
     assert not main.claim_queued_job("aaaaaaaaaaaa")
+
+
+def test_job_layers_and_from_layer_gcode_and_print(storage, api_client, monkeypatch):
+    jobs, sliced = storage
+    jid = "decafbad1234"
+    sliced_job(jobs, sliced, jid=jid)
+    gcode_file = sliced / jid / "Benchy v2.gcode"
+    gcode_file.write_text(
+        "PRINT_START BED=55 EXTRUDER=210\n"
+        "M106 S0\n"
+        ";LAYER_CHANGE\n;Z:0.28\n;HEIGHT:0.28\nBEFORE_LAYER_CHANGE LAYER=0\n"
+        "G1 X10 Y10 Z0.28\nG1 X20 Y10 E0.5\n"
+        ";LAYER_CHANGE\n;Z:0.48\n;HEIGHT:0.2\nBEFORE_LAYER_CHANGE LAYER=1\n"
+        "G1 X20 Y20 Z0.88\nG1 Z0.48\nG1 E1.2 F1800\nG1 X30 Y20 E0.5\n"
+        ";LAYER_CHANGE\n;Z:0.68\n;HEIGHT:0.2\nBEFORE_LAYER_CHANGE LAYER=2\n"
+        "G1 X30 Y30 Z1.08\nG1 Z0.68\nG1 E1.2 F1800\nG1 X40 Y30 E0.5\n"
+        "PRINT_END\n",
+        encoding="utf-8",
+    )
+
+    uploaded = {}
+
+    class LayerStubClient(StubClient):
+        def saved_layer_info(self):
+            return {"current_layer": 2, "filename": "portal_decafbad1234_Benchy v2.gcode", "state": "standby"}
+
+        def upload(self, path, remote_name=None):
+            uploaded["path"] = Path(path)
+            uploaded["content"] = Path(path).read_text(encoding="utf-8")
+            uploaded["remote_name"] = remote_name
+            return super().upload(path, remote_name)
+
+    monkeypatch.setattr(main, "current_client", LayerStubClient)
+
+    # 1. GET /api/jobs/{jid}/layers
+    res_layers = api_client.get(f"/api/jobs/{jid}/layers")
+    assert res_layers.status_code == 200
+    payload = res_layers.json()
+    assert payload["total_layers"] == 3
+    assert payload["printer_current_layer"] == 2
+    assert [l["layer"] for l in payload["layers"]] == [0, 1, 2]
+
+    # 2. GET /api/jobs/{jid}/gcode?from_layer=2
+    res_dl = api_client.get(f"/api/jobs/{jid}/gcode?from_layer=2")
+    assert res_dl.status_code == 200
+    assert "BEFORE_LAYER_CHANGE LAYER=0" in res_dl.text
+    assert ";Z:0.2\n" in res_dl.text
+
+    # 3. POST /api/jobs/{jid}/print-from-layer with auto-detected printer current_layer (2)
+    res_print = api_client.post(f"/api/jobs/{jid}/print-from-layer", json={})
+    assert res_print.status_code == 200
+    p_json = res_print.json()
+    assert p_json["started"] is True
+    assert p_json["start_layer"] == 2
+    assert p_json["bed_z"] == 0.2
+    assert p_json["z_offset"] == 0.48
+    assert "_from_layer2_on_bed.gcode" in p_json["remote_file"]
+    assert "BEFORE_LAYER_CHANGE LAYER=0" in uploaded["content"]
