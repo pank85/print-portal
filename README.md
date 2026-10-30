@@ -207,13 +207,14 @@ the checkbox is offered only when it is.
 A finned upload is staged, not queued:
 
 - The CLI runs during the upload, so the job comes back `awaiting_confirm` instead of `queued`. Nothing
-  enters the queue until you confirm.
-- The dialog shows what the CLI did (`"14 walls, 24 tines"`, overhang regions, fin/tine/brace counts)
-  and a **local** 3D preview of the finned 3MF: drag to orbit, wheel to zoom, arrows when the canvas is
+  enters the queue until you confirm. The preview does not open by itself.
+- The last-job card and the job row offer **Preview fins** and **Slice it**. Preview is optional: it
+  shows what the CLI did (`"14 walls, 24 tines"`, overhang regions, fin/tine/brace counts) and a
+  **local** 3D preview of the finned 3MF: drag to orbit, wheel to zoom, arrows when the canvas is
   focused, chips to show/hide the part and the supports. No geometry, no upload and no font ever leaves
   the container.
-- **Slice it** queues the job (`POST /api/jobs/{id}/slice`), **Close** leaves it staged (the job row's
-  **Review** button reopens the dialog), **Discard** deletes it.
+- **Slice it** (on the card, the row, or inside the preview) queues the job (`POST /api/jobs/{id}/slice`).
+  **Keep for later** leaves it staged. **Discard** deletes it.
 - A CLI failure is a `400 support fins failed: <cli text>` and the job directory is removed, so a broken
   upload leaves nothing behind.
 

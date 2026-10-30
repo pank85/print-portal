@@ -635,6 +635,10 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
               Preview fins
             </button>
+            <button type="button" class="btn btn-primary" id="uploadLatestSlice"
+                    data-act="slice" aria-label="Slice the finned model" hidden>
+              Slice it
+            </button>
             <button type="button" class="btn" id="uploadLatestReslice" data-act="reslice" hidden>Reslice…</button>
             <button type="button" class="btn btn-danger" id="uploadLatestDelete"
                     data-act="delete" aria-label="Delete the last job">
@@ -1404,12 +1408,15 @@ async function upload(file) {
         toast(`Profile switched to ${printerName} / ${presetName("process", j.threemf.process) || "—"}`, 6000);
       }
     }
-    /* With fins the job stops here: the model is staged, nothing is queued, and the preview is
-       the decision point. Slicing resumes from #previewConfirm or a row's Slice it button. */
+    /* With fins the job stops here: staged, not queued. Do not open the preview —
+       Preview and Slice it on the card are the decision. Slicing is a click, not the upload. */
     if (j.status === "awaiting_confirm") {
       setUploadWait(null);
       setUploadLatest(j);
-      openPreview(j.id);
+      toast("Fins added. Preview them, or slice now.", 5000);
+      refresh();
+      const sliceBtn = $("#uploadLatestSlice");
+      if (sliceBtn && !sliceBtn.hidden) sliceBtn.focus();
       return;
     }
     setUploadWait({status: "queued", filename: file.name});
@@ -1597,13 +1604,13 @@ function renderJobRow(j) {
       </article>`;
 }
 /* The Slice card's "Last job" block reads the poll's first row, so a reload mid-slice lands here
-   too. Only the text body is rewritten; the three actions are static elements that are shown or
+   too. Only the text body is rewritten; the actions are static elements that are shown or
    hidden and re-pointed, because re-parsing them on every poll would throw away the keyboard
-   focus resting on Print. */
+   focus resting on Print or Slice it. */
 function setUploadLatest(job) {
   const box = $("#uploadLatest"), body = $("#uploadLatestBody"),
         print = $("#uploadLatestPrint"), gcode = $("#uploadLatestGcode"),
-        preview = $("#uploadLatestPreview"),
+        preview = $("#uploadLatestPreview"), slice = $("#uploadLatestSlice"),
         remove = $("#uploadLatestDelete");
   if (!job) { box.hidden = true; return; }
   box.hidden = false;
@@ -1623,6 +1630,11 @@ function setUploadLatest(job) {
   preview.setAttribute("aria-label", `Preview the support fins on ${name}`);
   preview.textContent = job.kind === "reslice" ? "Resume reslice" : "Preview fins";
   if (job.kind === "reslice") preview.setAttribute("aria-label", `Resume reslice of ${name}`);
+  /* reslice still has to open the draft; a finned upload can be sliced without the preview */
+  const sliceable = staged && job.kind !== "reslice";
+  slice.hidden = !sliceable;
+  slice.dataset.ref = sliceable ? job.id : "";
+  slice.setAttribute("aria-label", `Slice ${name}`);
   const reslice = $("#uploadLatestReslice");
   reslice.hidden = !job.reslice?.eligible;
   reslice.dataset.ref = job.id;
