@@ -41,7 +41,10 @@ sequenceDiagram
     F->>F: reject_oversize → suffix check → require_machine()
     F->>D: jobs/<jid>/upload/<name>
     F->>F: profile_snapshot() (machine/process/filament + options)
-    F->>D: jobs/<jid>/job.json {"status":"queued", ...}
+    F->>D: jobs/<jid>/job.json {"status":"awaiting_confirm", ...}
+    F-->>B: 200 {"id","status":"awaiting_confirm"}
+    B->>F: POST /api/jobs/{jid}/slice (options, fins, resize)
+    F->>D: re-pin options, apply resize/fins, job.json {"status":"queued"}
     F->>Q: job_queue.put(jid)
     F-->>B: 200 {"id","status":"queued","queue_position"}
     Q->>S: orca-slicer --load-settings <machine>;<derived process> --load-filaments <filament>
@@ -64,9 +67,9 @@ sequenceDiagram
    in the job dir, the extracted member is what gets sliced.
 3. A `.3mf` goes through `prepare_3mf` (`main.py:914`): match the file's printer/process against local
    presets, select the matching printer, and rewrite the identity into `upload/slice-<stem>.3mf`.
-4. `job.json` is written with `status: "queued"` (or `"awaiting_confirm"` when support fins are on —
-   see *Staged jobs* below), the upload name, `profile_snapshot` and — when
-   relevant — `archive`, `threemf`, `slicer_input`. The id is then queued.
+4. `job.json` is written with `status: "awaiting_confirm"`, the upload name, `profile_snapshot`,
+   `pinned_presets`, and — when relevant — `archive`, `threemf`, `slicer_input`. Slicing happens
+   only when explicitly confirmed via `POST /api/jobs/{jid}/slice`.
 5. The worker thread (`worker`, `main.py:692`) pops the id and runs `run_slice` (`main.py:615`).
 6. `run_slice` sets `status: "slicing"`, resolves the presets (`slice_profile` trusts a job snapshot
    only when all three paths still resolve inside the datadir, `main.py:593`), writes the derived
@@ -94,9 +97,8 @@ sequenceDiagram
 
 ```mermaid
 stateDiagram-v2
-    [*] --> awaiting_confirm: fin upload or reslice fork
+    [*] --> awaiting_confirm: POST /api/upload or reslice fork
     awaiting_confirm --> queued: explicit slice confirmation
-    [*] --> queued: POST /api/upload
     queued --> slicing: worker pops the id
     slicing --> sliced: gcode produced and moved
     slicing --> failed: timeout, no gcode, profile error, any exception
@@ -110,9 +112,8 @@ active one (`main.py:710-722`).
 
 ### Staged jobs (support fins and reslice)
 
-`POST /api/upload` with `support_fins=true` is the one upload that does not end in `queued`: the CLI
-runs inside the request (`supportfins.fin_model`, serialised on `_RUN_LOCK`) and the job is written as
-`awaiting_confirm`, not enqueued. `POST /api/jobs/{jid}/slice` performs the only
+Every successful upload is staged with `status: "awaiting_confirm"`, and `support_fins` on the upload form
+is ignored. Support fins run at slice time when requested. `POST /api/jobs/{jid}/slice` performs the only
 `awaiting_confirm → queued` transition, under `STAGE_LOCK`, so a double click is a 409 rather than a
 second queue entry. The 3MF is prepared (`prepare_3mf`) *before* finning, because the CLI's output
 carries no OrcaSlicer identity metadata; the rewritten copy is then deleted, so a finned job has

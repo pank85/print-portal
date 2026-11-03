@@ -1261,8 +1261,6 @@ async def api_upload(request: Request, file: UploadFile = File(...),
 
     record = None
     slicer_input = None
-    fins = None
-    original = model_path.name
     try:
         # Prepare the upload *itself* before finning it: the CLI's output 3MF carries no
         # OrcaSlicer metadata, so preparing that copy could never match a printer/process.
@@ -1286,32 +1284,14 @@ async def api_upload(request: Request, file: UploadFile = File(...),
                     raw = json.dumps(value, indent=2).encode()
                     (pinned / f"{kind}.json").write_bytes(raw)
                     hashes[kind] = hashlib.sha256(raw).hexdigest()
-                return prepared, snapshot, {"version": 1, "sha256": hashes, "options": options}
+                pin_options = {k: options[k] for k in ("supports", "brim", "auto_orient", "shrink_to_fit") if k in options}
+                return prepared, snapshot, {"version": 1, "sha256": hashes, "options": pin_options}
 
         try:
             (record, slicer_input), captured_profile, pinned_presets = await asyncio.to_thread(prepare_and_snapshot)
         except prof.ProfileError as exc:
             raise HTTPException(409, f"profile: {exc}") from exc
-        if support_fins:
-            finned = d / "upload" / f"fins-{model_path.stem}.3mf"
-            try:
-                fins = await asyncio.to_thread(supportfins.fin_model, model_path, finned,
-                                               timeout=CONFIG.support_fins_timeout)
-            except supportfins.SupportFinsError as exc:
-                shutil.rmtree(d, ignore_errors=True)
-                raise HTTPException(400, f"support fins failed: {exc}") from exc
-            # The finned 3MF is the slicer input and needs no identity rewrite, so drop the
-            # prepared copy rather than leave a slice-*.3mf in the job dir that nothing reads.
-            if slicer_input is not None:
-                (model_path.parent / slicer_input).unlink(missing_ok=True)
-                slicer_input = None
-            if record is not None:
-                record["rewrite"] = "discarded"
-                record.setdefault("notes", []).append(
-                    "support fins rebuilt the 3MF; the rewritten identity copy was discarded")
-            model_path = finned
-
-        status = "awaiting_confirm" if support_fins else "queued"
+        status = "awaiting_confirm"
         fields = {"status": status, "filename": model_path.name, "output_name": name,
                   "upload_bytes": size, "model_bytes": model_path.stat().st_size,
                   "profile_snapshot": captured_profile, "pinned_presets": pinned_presets,
@@ -1322,8 +1302,6 @@ async def api_upload(request: Request, file: UploadFile = File(...),
             fields["threemf"] = record
         if slicer_input is not None:
             fields["slicer_input"] = slicer_input
-        if support_fins:
-            fields.update({"original": original, "fins": fins, "support_fins": True})
         write_job(jid, **fields)
     except BaseException:
         # The job dir exists from here on but the job was never queued: a failed upload must
@@ -1332,12 +1310,6 @@ async def api_upload(request: Request, file: UploadFile = File(...),
         shutil.rmtree(d, ignore_errors=True)
         raise
     body = {"id": jid, "status": status}
-    if support_fins:
-        # Staged, not queued: the preview dialog's "Slice it" is what enters the queue.
-        body.update({"fins": fins, "original": original})
-    else:
-        job_queue.put(jid)
-        body["queue_position"] = job_queue.qsize()
     if archive is not None:
         body["archive"] = archive
     if record is not None:
@@ -1450,8 +1422,10 @@ def api_reslice(jid: str, body: dict):
 
 @app.patch("/api/jobs/{jid}/settings")
 def api_reslice_settings(jid: str, body: dict):
-    if set(body) - {"revision", "profile", "options"} or type(body.get("revision")) is not int:
+    if set(body) - {"revision", "profile", "options", "pending_support_fins"} or type(body.get("revision")) is not int:
         raise HTTPException(422, "expected revision and optional profile and options")
+    if "pending_support_fins" in body and type(body["pending_support_fins"]) is not bool:
+        raise HTTPException(422, "pending_support_fins must be a boolean")
     profile = body.get("profile", {})
     options = body.get("options", {})
     if not isinstance(profile, dict) or set(profile) - {"machine", "process", "filament"}:
@@ -1487,8 +1461,79 @@ def api_reslice_settings(jid: str, body: dict):
             _reject_unpermitted_pair({"machine": merged["machine"]}, merged)
         snapshot.update(merged)
         snapshot["options"] = {**snapshot.get("options", {}), **options}
-        updated = write_job(jid, profile_snapshot=snapshot, revision=job["revision"] + 1)
+        write_kwargs = {"profile_snapshot": snapshot, "revision": job["revision"] + 1}
+        if "pending_support_fins" in body:
+            write_kwargs["pending_support_fins"] = body["pending_support_fins"]
+        updated = write_job(jid, **write_kwargs)
         return _job_capabilities(updated)
+
+
+def uniform_max_factor(size: list[float], maxima: dict[str, float]) -> float:
+    """size is bbox size [x, y, z]. maxima keys subset of max_width, max_length, max_height.
+    Returns min(maximum / current) over the provided axes.
+    Raises HTTPException 400/422 on an empty maxima, a non-finite or out-of-range value,
+    a zero-extent axis, or a factor <= 0 or > 100.
+    """
+    if not isinstance(maxima, dict) or not maxima:
+        raise HTTPException(422, "maxima must be a non-empty object")
+    allowed_keys = {"max_width", "max_length", "max_height"}
+    if set(maxima) - allowed_keys:
+        raise HTTPException(422, f"invalid maxima keys: {', '.join(sorted(set(maxima) - allowed_keys))}")
+    axis_map = {"max_width": 0, "max_length": 1, "max_height": 2}
+    ratios: list[float] = []
+    for key, val in maxima.items():
+        if type(val) not in (int, float):
+            raise HTTPException(422, f"{key} must be a number")
+        try:
+            val_f = float(val)
+        except (TypeError, ValueError, OverflowError):
+            raise HTTPException(422, f"{key} must be a finite number")
+        if not math.isfinite(val_f) or not (0 < val_f <= 10000):
+            raise HTTPException(422, f"{key} must be finite, positive and at most 10000 mm")
+        idx = axis_map[key]
+        try:
+            current = float(size[idx])
+        except (IndexError, TypeError, ValueError):
+            raise HTTPException(400, "invalid geometry size")
+        if not math.isfinite(current) or current <= 0:
+            raise HTTPException(400, "cannot scale a zero-size model")
+        ratio = val_f / current
+        ratios.append(ratio)
+    factor = min(ratios)
+    if not math.isfinite(factor) or not (0 < factor <= 100):
+        raise HTTPException(400, "resulting scale is out of range")
+    return factor
+
+
+def _apply_support_fins(jid: str, job: dict) -> dict:
+    model_path = _canonical_model(jid, job)
+    finned = model_path.parent / f"fins-{model_path.stem}.3mf"
+    try:
+        fins = supportfins.fin_model(model_path, finned, timeout=CONFIG.support_fins_timeout)
+    except supportfins.SupportFinsError as exc:
+        finned.unlink(missing_ok=True)
+        raise HTTPException(400, f"support fins failed: {exc}") from exc
+    original = job.get("original") or model_path.name
+    old_slicer_input = job.get("slicer_input")
+    if old_slicer_input:
+        (model_path.parent / old_slicer_input).unlink(missing_ok=True)
+    updates = {
+        "filename": finned.name,
+        "original": original,
+        "fins": fins,
+        "support_fins": True,
+        "model_bytes": finned.stat().st_size,
+        "slicer_input": None,
+    }
+    record = job.get("threemf")
+    if record is not None:
+        new_record = dict(record)
+        new_record["rewrite"] = "discarded"
+        new_record.setdefault("notes", []).append(
+            "support fins rebuilt the 3MF; the rewritten identity copy was discarded"
+        )
+        updates["threemf"] = new_record
+    return write_job(jid, **updates)
 
 
 @app.post("/api/jobs/{jid}/slice")
@@ -1500,10 +1545,144 @@ def api_confirm_slice(jid: str, body: dict | None = None):
             if not isinstance(body, dict) or set(body) != {"revision"} or type(body.get("revision")) is not int:
                 raise HTTPException(422, "expected revision")
             _reslice_revision(job, body)
+
     if not is_reslice:
         with STAGE_LOCK:
             job = read_job(jid)
             if job.get("kind") == "reslice" or job.get("status") != "awaiting_confirm":
+                raise HTTPException(409, f"job is '{job.get('status')}', not awaiting confirmation")
+            if not body:
+                try:
+                    slice_profile(job)
+                except prof.ProfileError as exc:
+                    raise HTTPException(409, str(exc)) from exc
+                write_job(jid, status="queued")
+                job_queue.put(jid)
+                return {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
+
+        # Staged slice with body
+        if not isinstance(body, dict):
+            raise HTTPException(422, "body must be an object")
+        allowed_keys = {"options", "support_fins", "resize"}
+        if set(body) - allowed_keys:
+            raise HTTPException(422, f"body keys must be a subset of {', '.join(sorted(allowed_keys))}")
+
+        if "options" in body:
+            if not isinstance(body["options"], dict):
+                raise HTTPException(422, "options must be an object")
+            allowed_options = {"supports", "brim", "auto_orient", "shrink_to_fit"}
+            if set(body["options"]) - allowed_options:
+                raise HTTPException(422, "invalid options keys")
+            if body["options"]:
+                try:
+                    prof.validate_options(body["options"])
+                except prof.ProfileError as exc:
+                    raise HTTPException(422, str(exc)) from exc
+
+        if "support_fins" in body and type(body["support_fins"]) is not bool:
+            raise HTTPException(422, "support_fins must be a boolean")
+
+        if "resize" in body:
+            if not isinstance(body["resize"], dict) or not body["resize"]:
+                raise HTTPException(422, "resize requires at least one maximum")
+            allowed_resize = {"max_height", "max_width", "max_length"}
+            if set(body["resize"]) - allowed_resize:
+                raise HTTPException(422, f"resize keys must be a subset of {', '.join(sorted(allowed_resize))}")
+            for rk, rv in body["resize"].items():
+                if type(rv) not in (int, float):
+                    raise HTTPException(422, f"{rk} must be a number")
+                try:
+                    rv_f = float(rv)
+                except (TypeError, ValueError, OverflowError):
+                    raise HTTPException(422, f"{rk} must be a finite number")
+                if not math.isfinite(rv_f) or not (0 < rv_f <= 10000):
+                    raise HTTPException(422, f"{rk} must be a finite number > 0 and <= 10000")
+
+        with STAGE_LOCK:
+            job = read_job(jid)
+            if job.get("status") != "awaiting_confirm":
+                raise HTTPException(409, f"job is '{job.get('status')}', not awaiting confirmation")
+
+        # 1. Re-pin options
+        pinned_presets = dict(job.get("pinned_presets") or {})
+        current_options = dict(pinned_presets.get("options") or {})
+        options_update = body.get("options", {})
+        merged_options = {**current_options, **options_update}
+        merged_options = prof.read_options({"options": merged_options})
+        if (merged_options.get("supports") != current_options.get("supports") or
+                merged_options.get("brim") != current_options.get("brim")):
+            snapshot = dict(job.get("profile_snapshot") or {})
+            process_rel = snapshot.get("process")
+            if not process_rel or not isinstance(process_rel, str):
+                raise HTTPException(409, "process preset reference unavailable")
+            process_path = _preset_path(process_rel)
+            if process_path is None or not process_path.is_file():
+                raise HTTPException(409, "selected process preset unavailable")
+            with DERIVED_LOCK:
+                derived = prof.derived_process_data(process_path, CONFIG.orca_datadir, merged_options)
+                raw = json.dumps(derived, indent=2).encode()
+                pinned_dir = job_dir(jid) / "pinned"
+                (pinned_dir / "process.json").write_bytes(raw)
+                pinned_presets.setdefault("sha256", {})["process"] = hashlib.sha256(raw).hexdigest()
+        pinned_presets["options"] = {k: merged_options[k] for k in ("supports", "brim", "auto_orient", "shrink_to_fit")}
+        job = write_job(jid, pinned_presets=pinned_presets)
+
+        # 2. Resize, if requested
+        if "resize" in body:
+            canonical_path = _canonical_model(jid, job)
+            scene = preview.read_scene(canonical_path)
+            factor = uniform_max_factor(scene["bbox"]["size"], body["resize"])
+            stat_before = canonical_path.stat()
+            snapshot_size = stat_before.st_size
+            snapshot_mtime = stat_before.st_mtime_ns
+            snapshot_ino = stat_before.st_ino
+            unique_token = uuid.uuid4().hex
+            out_tmp = canonical_path.with_name(
+                f"{canonical_path.stem}.{jid}.{unique_token}.scaled_tmp{canonical_path.suffix}"
+            )
+            try:
+                preview.scale_file(canonical_path, factor, out_tmp)
+                with STAGE_LOCK:
+                    job = read_job(jid)
+                    if job.get("status") != "awaiting_confirm":
+                        raise HTTPException(409, f"job is '{job.get('status')}', not awaiting confirmation")
+                    try:
+                        curr_stat = canonical_path.stat()
+                        if (curr_stat.st_size != snapshot_size
+                                or curr_stat.st_mtime_ns != snapshot_mtime
+                                or curr_stat.st_ino != snapshot_ino):
+                            raise HTTPException(409, "model geometry changed during resize")
+                    except OSError:
+                        raise HTTPException(409, "retained geometry unavailable")
+                    os.replace(out_tmp, canonical_path)
+                    job = write_job(jid, model_bytes=canonical_path.stat().st_size)
+            finally:
+                out_tmp.unlink(missing_ok=True)
+
+        # 3. Support fins
+        run_fins = bool(body.get("support_fins")) and not bool(job.get("fins"))
+        if run_fins:
+            job = _apply_support_fins(jid, job)
+
+        # 4. Guard checks
+        effective_options = prof.read_options({"options": job.get("pinned_presets", {}).get("options")})
+        fins_will_be_used = bool(job.get("fins") or job.get("support_fins") or body.get("support_fins"))
+        if fins_will_be_used and effective_options.get("shrink_to_fit"):
+            raise HTTPException(409, "support fins cannot be combined with shrink to fit")
+        if fins_will_be_used:
+            if effective_options.get("auto_orient") is not False:
+                pinned = dict(job.get("pinned_presets") or {})
+                pinned.setdefault("options", {})["auto_orient"] = False
+                job = write_job(jid, pinned_presets=pinned)
+                effective_options["auto_orient"] = False
+        canonical_path = _canonical_model(jid, job)
+        if effective_options.get("shrink_to_fit") and canonical_path.suffix.lower() == ".3mf":
+            raise HTTPException(409, "shrink to fit is unavailable for 3MF or support fins")
+
+        # 5. Queue once under STAGE_LOCK
+        with STAGE_LOCK:
+            job = read_job(jid)
+            if job.get("status") != "awaiting_confirm":
                 raise HTTPException(409, f"job is '{job.get('status')}', not awaiting confirmation")
             try:
                 slice_profile(job)
@@ -1520,6 +1699,8 @@ def api_confirm_slice(jid: str, body: dict | None = None):
         with STAGE_LOCK:
             job = read_job(jid)
             _reslice_revision(job, body)
+            if job.get("pending_support_fins") and not job.get("fins"):
+                job = _apply_support_fins(jid, job)
             model = _canonical_model(jid, job)
             model_copy = temp / ("model" + model.suffix.lower())
             if model_copy.suffix == ".3mf" and model.stat().st_size > threemf.IDENTITY_SOURCE_MAX_BYTES:
@@ -1542,6 +1723,8 @@ def api_confirm_slice(jid: str, body: dict | None = None):
                 if raw_options:
                     prof.validate_options(raw_options)
                 options = prof.read_options(snapshot)
+                if job.get("support_fins"):
+                    options["auto_orient"] = False
                 if options["shrink_to_fit"] and (model_copy.suffix == ".3mf" or job.get("support_fins")):
                     raise prof.ProfileError("shrink to fit is unavailable for 3MF or support fins")
                 machine = prof.effective_preset(paths["machine"], "machine", CONFIG.orca_datadir)
@@ -1587,9 +1770,10 @@ def api_confirm_slice(jid: str, body: dict | None = None):
                 installed = True
                 if prepared_path is not None:
                     os.replace(model_copy, prepared_path)
+                pin_options = {k: options[k] for k in ("supports", "brim", "auto_orient", "shrink_to_fit") if k in options}
                 write_job(jid, status="queued", revision=job["revision"] + 1,
                           slicer_input=prepared_name, identity_rewrite=outcome,
-                          pinned_presets={"version": 1, "sha256": hashes, "options": options})
+                          pinned_presets={"version": 1, "sha256": hashes, "options": pin_options})
             except Exception:
                 if replaced and (backup.exists() or backup.is_symlink()):
                     if target.exists() or target.is_symlink():
@@ -1759,6 +1943,39 @@ def _commit_reslice_geometry(jid: str, job: dict, path: Path, candidate: Path,
 def _scale_reslice(jid: str, job: dict, payload: dict) -> dict:
     _reslice_revision(job, payload)
     axes = {"width": 0, "depth": 1, "height": 2}
+    has_maxima = "maxima" in payload
+    has_axis = bool(set(payload) & set(axes))
+    if has_maxima and has_axis:
+        raise HTTPException(422, "cannot provide both axis and maxima")
+    if not has_maxima and not has_axis:
+        raise HTTPException(422, "provide exactly one of width, depth or height, or maxima")
+
+    if has_maxima:
+        if set(payload) != {"revision", "maxima"}:
+            raise HTTPException(422, "unexpected fields in payload")
+        if not isinstance(payload.get("maxima"), dict) or not payload["maxima"]:
+            raise HTTPException(422, "maxima must be a non-empty object")
+        path = _canonical_model(jid, job)
+        candidate = None
+        try:
+            scene = preview.read_scene(path)
+            factor = uniform_max_factor(scene["bbox"]["size"], payload["maxima"])
+            cumulative = job.get("manual_scale", 1.0) * factor
+            if not math.isfinite(cumulative) or cumulative <= 0:
+                raise HTTPException(400, "resulting scale is out of range")
+            with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as f:
+                candidate = Path(f.name)
+            preview.scale_file(path, factor, candidate)
+            size = preview.read_scene(candidate)["bbox"]["size"]
+            updated = _commit_reslice_geometry(jid, job, path, candidate, cumulative)
+            return {"job": jid, "filename": path.name, "factor": factor, "size": size,
+                    "revision": updated["revision"], "manual_scale": cumulative, "unit": "millimeter"}
+        except (preview.PreviewError, OSError) as exc:
+            raise HTTPException(409, f"resize unavailable: {exc}") from exc
+        finally:
+            if candidate is not None:
+                candidate.unlink(missing_ok=True)
+
     selected = set(payload) - {"revision"}
     if len(selected) != 1 or not selected <= axes.keys():
         raise HTTPException(422, "provide exactly one of width, depth or height")

@@ -54,14 +54,9 @@ def test_profile_card_shows_supports_and_brim(page):
 
 # ---------------------------------------------------------------- printer card
 def test_profile_edit_controls_live_in_the_printer_card(page):
-    """The printer and the things you change about it are one card.
-
-    Order inside the Printer card is the tab order (DOM order drives it): machine → process →
-    filament → supports → brim → auto-orient → shrink to fit → upload → notes. The old Profile
-    card keeps the read-only summary only; it is now the last card of the `.cards` cluster, below
-    the upload card.
-    """
+    """The printer and its selectors are in the Printer card; print options are in #printOptions in the upload card."""
     printer = page.index('id="printerCardTitle"')
+    upload = page.index('id="uploadTitle"')
     profile = page.index('id="profCardTitle"')
     settings = page.index('id="viewSettings"')
 
@@ -71,12 +66,6 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
         'id="selMachine"',
         'id="selProcess"',
         'id="selFilament"',
-        'id="profOptions"',
-        'id="optSupports"',
-        'id="optBrim"',
-        'id="optAutoOrient"',
-        'id="optShrinkFit"',
-        'id="fitHint"',
         'for="profFile"',
         'id="profFile"',
         'id="profNotes"',
@@ -84,15 +73,16 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
     marks = [page.index(needle) for needle in order]
     assert printer < min(marks), "the edit controls belong to the Printer card"
     assert marks == sorted(marks), f"wrong control order inside the Printer card: {order}"
-    assert max(marks) < profile, "the Profile card is the read-only summary only"
+    assert max(marks) < upload, "the Printer card precedes the upload card"
 
-    # containment, not just order — two regressions the order list above cannot see:
-    # (a) #profOptions nested inside #profileSelectors would make hide_profiles start hiding
-    #     Supports/Brim, so the selectors wrapper must open and close before the options open
-    seg = page[page.index('id="profileSelectors"'):page.index('id="profOptions"')]
-    assert seg.count("<div") == seg.count("</div>")   # selectors wrapper closed before options open
-    # (b) .subgroup nested deeper than a direct child of the Printer <section> would silently
-    #     kill the `.card > .subgroup` rule at app/index.html:136
+    # print options are inside #printOptions in the upload card
+    print_options = slice_between(page, 'id="printOptions"', 'id="profCardTitle"')
+    for opt_id in ('id="profOptions"', 'id="optSupports"', 'id="optBrim"', 'id="optAutoOrient"', 'id="optShrinkFit"', 'id="fitHint"'):
+        assert opt_id in print_options, opt_id
+        assert page.count(opt_id) == 1, f"each id occurs once: {opt_id}"
+
+    # .subgroup nested deeper than a direct child of the Printer <section> would silently
+    # kill the `.card > .subgroup` rule at app/index.html:136
     between = page[page.index('id="printerFile"'):page.index('<div id="profileSelectors"')]
     assert between.count("<div") == 1 and "</div>" not in between   # .subgroup is the card's direct child
 
@@ -100,9 +90,7 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
     assert '<h3 id="profileGroupTitle">Profile</h3>' in page
     assert 'role="group" aria-labelledby="profileGroupTitle"' in page
 
-    # the Profile card is now the LAST card of the .cards cluster — bound it by its own tag, not by
-    # whatever card happens to follow (the upload card moved above it, see
-    # test_dashboard_source_order_and_desktop_grid)
+    # the Profile card keeps only the read-only summary
     summary = slice_between(page, 'id="profCardTitle"', "</section>")
     for kept in ('id="profSource"', 'id="profInfo"', 'id="profWarning"', 'id="profCompat"'):
         assert kept in summary, kept
@@ -113,8 +101,10 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
     for elem in ("printerCardTitle", "printerInfo", "progTrack", "progBar", "printerFile",
                  "profileGroupTitle", "profCardTitle", "profSource", "profInfo", "profWarning",
                  "profCompat", "profileSelectors", "selMachine", "selProcess", "selFilament",
+                 "printOptions", "printOptionsTitle", "printOptionsJob", "printOptionsError",
+                 "printOptionsSlice", "resizeOptions", "maxHeight", "maxWidth", "maxLength",
                  "profOptions", "optSupports", "optBrim", "optAutoOrient", "optShrinkFit",
-                 "fitHint", "profFile", "profNotes"):
+                 "fitHint", "supportFins", "profFile", "profNotes"):
         assert page.count(f'id="{elem}"') == 1, elem
 
     # Settings keeps only the visibility toggle, under the renamed heading
@@ -230,12 +220,8 @@ def test_fit_options_reach_the_options_endpoint_and_a_real_scale_shows_in_the_ro
     # both keys survive into the in-memory options the error path restores from
     assert "auto_orient: orient, shrink_to_fit: shrink" in apply
 
-    for sel, key in (("#optAutoOrient", "auto_orient"), ("#optShrinkFit", "shrink_to_fit")):
-        assert (f'$("{sel}").addEventListener("change", '
-                f'ev => saveOption("{key}", ev.target.value === "yes"));') in page, key
-
     # the hint is one muted paragraph inside the options grid, after both selects
-    options = slice_between(page, 'id="profOptions"', 'class="acts"')
+    options = slice_between(page, 'id="profOptions"', 'id="supportFins"')
     assert '<p class="hint" id="fitHint">' in options
     assert options.index('id="optAutoOrient"') < options.index('id="fitHint"')
     assert options.index('id="optShrinkFit"') < options.index('id="fitHint"')
@@ -1021,9 +1007,9 @@ def test_aria_valuenow_only_while_bytes_move(page):
     assert "track.classList.add(\"is-determinate\")" in progress
     assert "track.classList.remove(\"is-determinate\")" in progress
 
-    # the moment the job exists the box becomes indeterminate, and the poll's takeover strips
-    # every value attribute it inherited from the transfer
-    assert "setUploadWait({status: \"queued\", filename: file.name});" in function_body(page, "upload")
+    # staged upload leaves the wait bar alone; queueing happens on Slice it in slicePrintOptions
+    assert 'setUploadWait({status: "queued"' not in function_body(page, "upload")
+    assert "setUploadWait(queuedJob);" in function_body(page, "slicePrintOptions")
     wait = function_body(page, "setUploadWait")
     assert "resetUploadTrack()" in wait
     reset = function_body(page, "resetUploadTrack")
@@ -1292,28 +1278,27 @@ def test_switching_the_active_printer_reframes_the_tab(page):
 # ---------------------------------------------------------------- support fins: upload
 def test_the_upload_card_offers_the_fins_checkbox_off_by_default(page):
     card = upload_card(page)
-    start = card.rindex("<input", 0, card.index('id="supportFins"'))
-    tag = card[start:card.index(">", start)]
+    opts = card[card.index('id="printOptions"'):]
+    start = opts.rindex("<input", 0, opts.index('id="supportFins"'))
+    tag = opts[start:opts.index(">", start)]
 
     assert 'id="supportFins"' in tag
     assert 'name="support_fins"' in tag
     assert 'type="checkbox"' in tag
     assert 'value="true"' in tag
     assert "checked" not in tag                       # forced landing, opt-in feature
-    assert "Add designed-in support fins" in card and "(off by default)" in card
+    assert "Use support fins" in opts
     # the hint says what it costs: the upload is finned locally, the original is untouched
-    assert "leaves the original file untouched" in card
+    assert "leaves the original file untouched" in opts
 
 
 def test_the_fins_flag_is_sent_only_when_the_box_is_ticked(page):
     body = function_body(page, "upload")
+    assert "support_fins" not in body
 
-    assert 'const fins = !!$("#supportFins")?.checked;' in body
-    assert 'if (fins) fd.append("support_fins", "true");' in body
-    assert body.index('const fins = !!$("#supportFins")?.checked;') < \
-        body.index('fd.append("support_fins", "true")')
-    # a finning upload takes long enough to deserve its own wording before the bar moves
-    assert "Adding support fins: ${file.name}" in body
+    slice_body = function_body(page, "slicePrintOptions")
+    assert 'const fins = !!$("#supportFins")?.checked;' in slice_body
+    assert "support_fins: fins" in slice_body
 
 
 def test_a_staged_upload_stays_on_the_card_instead_of_opening_the_preview(page):
@@ -1327,12 +1312,12 @@ def test_a_staged_upload_stays_on_the_card_instead_of_opening_the_preview(page):
 
     assert "setUploadWait(null)" in branch            # keep the slicer bar for the real queue
     assert "setUploadLatest(j)" in branch
+    assert "setPrintOptions(j)" in branch
     assert "openPreview(" not in branch
     assert "refresh();" in branch
+    assert "setPrintOptions(printOptionsJob);" in branch
     assert "/slice" not in body                       # nothing is queued from an upload
-    # and it is checked before the queued path takes over
-    assert body.index('if (j.status === "awaiting_confirm")') < \
-        body.index('setUploadWait({status: "queued"')
+    assert 'setUploadWait({status: "queued"' not in body
 
 
 # ---------------------------------------------------------------- support fins: dialog
@@ -1362,16 +1347,16 @@ def test_the_preview_dialog_is_a_labelled_modal_with_a_fallback(page):
 
 def test_the_dialog_actions_put_the_decision_last(page):
     dlg = preview_dialog(page)
-    order = ['id="previewDiscard"', 'id="previewClose"', 'id="previewConfirm"']
+    order = ['id="previewDiscard"', 'id="previewClose"']
 
     assert [dlg.index(needle) for needle in order] == sorted(dlg.index(n) for n in order)
-    for needle, label in zip(order, ("Discard", "Keep for later", "Slice it")):
+    for needle, label in zip(order, ("Discard", "Keep for later")):
         start = dlg.rindex("<button", 0, dlg.index(needle))
         tag = dlg[start:dlg.index(">", start)]
         assert 'type="button"' in tag, needle          # inside a dialog: never a submit
         assert label in dlg[dlg.index(needle):dlg.index("</button>", dlg.index(needle))]
-    confirm = dlg[dlg.rindex("<button", 0, dlg.index('id="previewConfirm"')):]
-    assert "btn-primary" in confirm[:confirm.index(">")]
+    assert 'id="previewConfirm"' not in dlg
+    assert "Slice it" not in dlg
 
 
 def test_the_dialog_fits_a_phone_and_keeps_the_decision_visible(page):
@@ -1441,7 +1426,6 @@ def test_a_preview_failure_still_leaves_the_job_queueable(page):
     err = function_body(page, "showPreviewError")
 
     assert "The job is still staged" in err
-    assert '$("#previewConfirm").disabled = false;' in err   # Slice it survives a dead preview
     assert '$("#previewCanvas").hidden = true;' in function_body(page, "previewFallbackText")
 
     open_ = function_body(page, "openPreview")
@@ -1451,15 +1435,14 @@ def test_a_preview_failure_still_leaves_the_job_queueable(page):
 
 
 def test_slice_it_queues_exactly_once_and_hands_the_card_back(page):
-    body = function_body(page, "confirmSlice")
+    body = function_body(page, "slicePrintOptions")
 
-    assert 'fetch(`/api/jobs/${encodeURIComponent(id)}/slice`, { method: "POST" })' in body
-    assert 'if (btn.dataset.busy === "true") return;' in body   # a double click queues once
+    assert 'fetch(`/api/jobs/${encodeURIComponent(job.id)}/slice`' in body
+    assert 'if (!btn || btn.dataset.busy === "true") return;' in body   # a double click queues once
     assert "btn.disabled = true;" in body
-    # close, then repaint the card from the response, so the wait bar is right before the poll
-    assert body.index("closePreview();") < body.index("setUploadWait(job)")
-    assert "setUploadLatest(job)" in body
-    assert 'toast(j.queue_position ? `Queued for slice (#${j.queue_position})`' in body
+    assert body.index("setUploadWait(queuedJob)") < body.index("refresh();")
+    assert "setUploadLatest(queuedJob)" in body
+    assert 'toast(sliceResult.queue_position ? `Queued for slice (#${sliceResult.queue_position})`' in body
     assert '"Could not queue the slice: " + e.message' in body
 
 
@@ -1477,10 +1460,9 @@ def test_closing_keeps_the_job_and_discarding_asks_first(page):
 
 
 def test_the_last_job_block_offers_preview_and_slice_for_a_staged_job(page):
-    """A finned upload lands on the card with both actions, and neither fires by itself.
+    """A finned upload lands on the card with preview, but no slice button.
 
-    Both buttons are static markup (the poll only re-aims them) and share the row handler, so
-    there is one preview path and one slice path.
+    Print options owns the single Slice it button.
     """
     card = upload_card(page)
     tag = card[card.rindex("<button", 0, card.index('id="uploadLatestPreview"')):]
@@ -1489,29 +1471,20 @@ def test_the_last_job_block_offers_preview_and_slice_for_a_staged_job(page):
     assert "hidden" in tag                              # only a staged job shows it
     assert "aria-label=" in tag
     assert "Preview fins" in card[card.index('id="uploadLatestPreview"'):]
-    slice_tag = card[card.rindex("<button", 0, card.index('id="uploadLatestSlice"')):]
-    slice_tag = slice_tag[:slice_tag.index(">")]
-    assert 'data-act="slice"' in slice_tag
-    assert "btn-primary" in slice_tag
-    assert "hidden" in slice_tag
-    assert "aria-label=" in slice_tag
-    assert card.index('id="uploadLatestPreview"') < card.index('id="uploadLatestSlice"')
-    assert "Slice it" in card[card.index('id="uploadLatestSlice"'):card.index('id="uploadLatestReslice"')]
+    assert 'id="uploadLatestSlice"' not in card
 
     latest = function_body(page, "setUploadLatest")
     assert 'const staged = job.status === "awaiting_confirm" && !job.error;' in latest
     assert "preview.hidden = !staged;" in latest
     assert 'preview.dataset.ref = staged ? job.id : "";' in latest
     assert "preview.setAttribute(\"aria-label\", `Preview the support fins on ${name}`);" in latest
-    assert 'const sliceable = staged && job.kind !== "reslice";' in latest
-    assert "slice.hidden = !sliceable;" in latest
-    assert 'slice.dataset.ref = sliceable ? job.id : "";' in latest
 
     handler = function_body(page, "onJobAction")
     assert 'btn.dataset.act === "preview"' in handler
     assert "openPreview(btn.dataset.ref)" in handler
-    assert 'btn.dataset.act === "slice"' in handler
-    assert "confirmSlice(btn.dataset.ref)" in handler
+    assert 'btn.dataset.act === "options"' in handler
+    assert "openJobOptions(btn.dataset.ref)" in handler
+    assert 'btn.dataset.act === "slice"' not in handler
     assert '$("#uploadLatest").addEventListener("click", onJobAction);' in page
     assert page.count("/preview`") == 1                 # one dialog, one request path
 
@@ -1521,9 +1494,10 @@ def test_a_staged_row_offers_both_preview_and_slice_it(page):
     staged = slice_between(row, "const staged =", ': "";')
 
     assert 'data-act="preview"' in staged
-    assert 'data-act="slice"' in staged
-    assert staged.index('data-act="preview"') < staged.index('data-act="slice"')
-    assert "Preview fins" in staged and "Slice it" in staged
+    assert 'data-act="options"' in staged
+    assert 'data-act="slice"' not in staged
+    assert staged.index('data-act="preview"') < staged.index('data-act="options"')
+    assert "Preview fins" in staged and "Print options" in staged
     # a failed or finished job gets neither: neither can be reviewed or queued any more
     assert 'j.status === "awaiting_confirm" && !j.error' in row
 
@@ -1538,7 +1512,6 @@ def test_the_preview_wires_every_input_and_tears_down_on_close(page):
                      'canvas.addEventListener("wheel", previewZoom, { passive: false })',
                      'canvas.addEventListener("keydown", previewKey)',
                      '$("#previewLegend").addEventListener("click", previewToggle)',
-                     '$("#previewConfirm").addEventListener("click", () => withPreviewBusy(',
                      '$("#previewClose").addEventListener("click", keepPreview)',
                      '$("#previewDiscard").addEventListener("click", () => withPreviewBusy('):
         assert listener in init, listener
@@ -1577,30 +1550,34 @@ def test_reslice_uses_idempotent_token_and_local_revisioned_mutations(page):
     assert '/settings`' in save and 'revision:previewJob.revision' in save
     assert 'method:"PATCH"' in save
     assert '/api/profile/select' not in save and '/api/profile/options' not in save
-    assert 'revision:previewJob.revision' in function_body(page, "confirmSlice")
-    assert 'revision:previewJob.revision' in function_body(page, "resetPreviewScale")
+    slice_body = function_body(page, "slicePrintOptions")
+    assert 'revision: rev' in slice_body
+    assert 'printOptionsJob.revision = rev' in slice_body
 
 
 def test_reslice_scale_submits_only_last_edited_axis(page):
-    follow = function_body(page, "previewScaleFollow")
-    apply = function_body(page, "applyPreviewScale")
-    assert 'previewAxis = src' in follow
-    assert 'const axis = previewAxis' in apply
-    assert '[apiAxis === "length" ? "depth" : apiAxis]:value' in apply
-    assert 'Number.isFinite(value)' in apply
-    assert 'filled.length' not in apply
+    body = function_body(page, "slicePrintOptions")
+    assert '/scale`' in body
+    assert 'revision: rev, maxima: resize' in body
+    assert 'sliceBody = { revision: rev };' in body
+    assert 'printOptionsJob.revision = rev' in body
+    assert 'options' in body
+    assert 'support_fins: fins' in body
+    assert 'resize' in body
 
 
 def test_reslice_settings_preview_and_errors_are_independent(page):
     dlg = preview_dialog(page)
-    for id_ in ("resliceMachine", "resliceProcess", "resliceFilament", "resliceSupports", "resliceBrim", "resliceOrient", "resliceFit", "resliceCopy", "resliceSave", "scaleReset"):
+    for id_ in ("resliceMachine", "resliceProcess", "resliceFilament", "resliceCopy", "resliceSave"):
         assert f'id="{id_}"' in dlg
     assert 'role="alert"' in dlg
     open_ = function_body(page, "openPreview")
     assert 'previewJob = job' in open_
     assert 'p.job ||' not in open_
-    assert 'settings can still be saved and sliced' in open_
+    assert 'settings can still be saved' in open_
     assert 'previewReturnFocus' in function_body(page, "closePreview")
+    assert 'if (job.status === "awaiting_confirm") {\n        setPrintOptions(job);' in open_
+    assert open_.index("setPrintOptions(job);") < open_.index("savedResliceValues = JSON.stringify(resliceValues())")
 
 
 def test_reslice_keep_saves_before_close_and_recovers_stale_edits(page):
@@ -1611,7 +1588,7 @@ def test_reslice_keep_saves_before_close_and_recovers_stale_edits(page):
     node = shutil.which("node")
     if not node:
         pytest.skip("node is unavailable")
-    names = ("withPreviewBusy", "rememberDimensions", "resliceValues", "saveResliceSettings",
+    names = ("withPreviewBusy", "resliceValues", "saveResliceSettings",
              "keepPreview", "reloadResliceRevision", "previewActionError")
     functions = []
     for name in names:
@@ -1623,24 +1600,25 @@ def test_reslice_keep_saves_before_close_and_recovers_stale_edits(page):
 const assert = require('assert');
 const elements = {};
 for (const id of ['previewDlg','previewBusy','resliceMachine','resliceProcess','resliceFilament',
- 'resliceSupports','resliceBrim','resliceOrient','resliceFit','reslicePresetError','resliceReload',
- 'previewError','scaleHeight','scaleWidth','scaleLength']) {
+ 'optSupports','optBrim','optAutoOrient','optShrinkFit','reslicePresetError','resliceReload',
+ 'previewError']) {
  elements[id] = {value:'', checked:false, hidden:true, textContent:'', inert:false, focus(){},
  setAttribute(){}, removeAttribute(){}};
 }
 elements.previewDlg.children = [elements.resliceMachine, elements.previewBusy];
 const $ = s => elements[s.slice(1)];
 const document = {getElementById: id => elements[id]};
-let previewBusy = false, savedResliceValues = null, previewAxis = 'scaleWidth';
+let previewBusy = false, savedResliceValues = null;
 let previewJob = {id:'abc', kind:'reslice', status:'awaiting_confirm', revision:0};
-const pendingDimensions = new Map();
 let closed = 0;
 function closePreview() { closed++; }
+function toast() {}
 ''' + "\n".join(functions) + r'''
 (async () => {
  for (const id of ['resliceMachine','resliceProcess','resliceFilament']) elements[id].value = id;
+ elements.optBrim.value = 'no';
  savedResliceValues = JSON.stringify(resliceValues());
- elements.resliceBrim.checked = true; elements.scaleWidth.value = '80';
+ elements.optBrim.value = 'yes';
  let resolveFetch;
  global.fetch = () => new Promise(resolve => { resolveFetch = resolve; });
  const closing = keepPreview();
@@ -1648,17 +1626,16 @@ function closePreview() { closed++; }
  await keepPreview(); assert.equal(closed, 0);
  resolveFetch({ok:false, status:409, json:async()=>({detail:'stale revision'})});
  await closing;
- assert.equal(closed, 0); assert.equal(elements.resliceBrim.checked, true);
+ assert.equal(closed, 0); assert.equal(elements.optBrim.value, 'yes');
  assert.equal(elements.resliceReload.hidden, false); assert.match(elements.previewError.textContent, /not closed/);
  assert.equal(previewBusy, false);
  global.fetch = async () => ({ok:true, json:async()=>({id:'abc',kind:'reslice',status:'awaiting_confirm',revision:4})});
  await reloadResliceRevision();
- assert.equal(previewJob.revision, 4); assert.equal(elements.resliceBrim.checked, true);
+ assert.equal(previewJob.revision, 4); assert.equal(elements.optBrim.value, 'yes');
  let body;
  global.fetch = async (url, options) => {body=JSON.parse(options.body); return {ok:true, json:async()=>({id:'abc',kind:'reslice',revision:5})};};
  await keepPreview();
  assert.equal(body.revision, 4); assert.equal(body.options.brim, true); assert.equal(closed, 1);
- assert.deepEqual(pendingDimensions.get('abc'), {axis:'scaleWidth', values:['','80','']});
 })().catch(e => {console.error(e); process.exit(1);});
 '''
     subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
@@ -1667,16 +1644,18 @@ function closePreview() { closed++; }
 def test_reslice_cancel_and_mutations_are_guarded(page):
     init = function_body(page, "initPreview")
     assert 'ev.preventDefault(); if (!previewBusy) keepPreview();' in init
-    for label in ("Loading dashboard settings", "Loading compatible presets", "Applying size", "Resetting size", "Queuing slice", "Discarding draft"):
+    for label in ("Loading dashboard settings", "Loading compatible presets", "Discarding draft"):
         assert label in init
-    assert 'resliceResponseError(r, j)' in function_body(page, "applyPreviewScale")
-    assert 'resliceResponseError(r, result)' in function_body(page, "resetPreviewScale")
-    assert 'pendingDimensions.get(id)' in function_body(page, "openPreview")
-    assert "Apply the entered size or clear it before slicing" in function_body(page, "confirmSlice")
 
 
 def test_create_reslice_restores_focus_after_refresh_replaces_trigger(page):
-    """Run the real create/open/close handlers with a refresh that detaches the trigger."""
+    """createReslice binds the options panel instead of opening the preview."""
+    create = function_body(page, "createReslice")
+    assert "setPrintOptions(job);" in create
+    assert 'const optSupports = $("#optSupports");' in create
+    assert "optSupports.focus();" in create
+    assert "openPreview(" not in create
+
     import shutil
     import subprocess
 
@@ -1684,7 +1663,7 @@ def test_create_reslice_restores_focus_after_refresh_replaces_trigger(page):
     if not node:
         pytest.skip("node is unavailable")
     functions = []
-    for name in ("createReslice", "openPreview", "closePreview"):
+    for name in ("openPreview", "closePreview"):
         functions.append(("async " if name != "closePreview" else "") + function_body(page, name) + "\n}")
     js = r'''
 const assert = require('assert');
@@ -1699,30 +1678,65 @@ const elements = new Proxy({}, {get(target, id) {
 }});
 const $ = s => s === '#jobsTitle' ? heading : elements[s.slice(1)];
 const document = {activeElement:button, getElementById: id => elements[id]};
-const resliceTokens = new Map(), reslicePending = new Set();
-const newRequestId = () => 'token';
-let previewBusy = false, previewReturnFocus, previewJob, previewAxis, previewScene, previewDrag, previewHidden, previewView;
+let previewBusy = false, previewReturnFocus, previewJob, previewScene, previewDrag, previewHidden, previewView;
 const withPreviewBusy = async (_, action) => action();
-const refresh = async () => {button.isConnected = false; document.activeElement = body;};
 const toast = () => {};
 const showPreviewError = () => {};
 global.fetch = async (url, opts) => opts ? {ok:true, json:async()=>({id:'child',status:'awaiting_confirm'})}
  : {ok:false, statusText:'unavailable', json:async()=>({})};
 ''' + "\n".join(functions) + r'''
 (async () => {
- await createReslice('source', button);
- assert.equal(previewReturnFocus, button);
- assert.equal(elements.previewDlg.open, true);
- closePreview();
- assert.equal(focused, 'heading');
  button.isConnected = true;
  document.activeElement = button;
- await openPreview('child');
+ await openPreview('child', button);
+ assert.equal(elements.previewDlg.open, true);
  closePreview();
  assert.equal(focused, 'button');
+ button.isConnected = false;
+ document.activeElement = body;
+ await openPreview('child', button);
+ closePreview();
+ assert.equal(focused, 'heading');
 })().catch(e => {console.error(e); process.exit(1);});
 '''
     subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
+
+
+def test_print_options_panel_contract(page):
+    """The print-options panel lives in the upload card, is initially hidden,
+    has three bounded max inputs, exactly one Slice it button in the UI, and slicePrintOptions
+    is the sole sender of /slice."""
+    import re
+    card = upload_card(page)
+    assert '<div class="subgroup" id="printOptions" role="group" aria-labelledby="printOptionsTitle" hidden>' in card
+    assert '<h3 id="printOptionsTitle">Print options</h3>' in card
+    assert '<p class="hint" id="printOptionsJob">' in card
+
+    # Resize options
+    assert 'id="resizeOptions"' in card
+    for axis, label in (("maxHeight", "Max height (mm)"), ("maxWidth", "Max width (mm)"), ("maxLength", "Max length (mm)")):
+        start = card.rindex("<input", 0, card.index(f'id="{axis}"'))
+        tag = card[start:card.index(">", start)]
+        assert f'id="{axis}"' in tag
+        assert 'type="number"' in tag
+        assert 'step="0.1"' in tag
+        assert 'min="0.1"' in tag
+        assert 'max="10000"' in tag
+        assert 'inputmode="decimal"' in tag
+        assert label in card
+
+    # Exactly one Slice it button
+    btn_matches = [m.start() for m in re.finditer(r'>Slice it<', page)]
+    assert len(btn_matches) == 1
+    assert 'id="printOptionsSlice"' in card
+    slice_start = card.rindex("<button", 0, card.index('id="printOptionsSlice"'))
+    slice_tag = card[slice_start:card.index(">", slice_start)]
+    assert "btn-primary" in slice_tag
+    assert 'data-act="slice"' not in slice_tag
+
+    # slicePrintOptions is the only POST /slice caller
+    assert page.count("/slice`") == 1
+    assert function_body(page, "slicePrintOptions").count("/slice`") == 1
 
 
 def test_from_layer_dialog_and_actions_are_wired(page):
