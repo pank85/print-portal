@@ -11,6 +11,7 @@ import dataclasses
 import hashlib
 import io
 import json
+import os
 import queue
 import threading
 import zipfile
@@ -397,6 +398,7 @@ def test_upload_zip_queues_the_extracted_model(storage, api_client, switchable, 
     response = upload(api_client, archive, filename="parts.zip")
 
     assert response.status_code == 200, response.text
+    assert "jobs" not in response.json()
     jid = response.json()["id"]
     queue_res = queue_staged(api_client, jid)
     assert queue_res.status_code == 200
@@ -418,13 +420,22 @@ def test_upload_zip_reports_candidates_and_skipped(storage, api_client, switchab
 
     body = upload(api_client, archive, filename="parts.zip").json()
 
-    record = read_job(jobs, body["id"])["archive"]
+    assert [item["id"] for item in body["jobs"]][0] == body["id"]
+    assert len(body["jobs"]) == 2
+    assert all("jobs" not in item and "queue_position" not in item for item in body["jobs"])
+    stored = [read_job(jobs, item["id"]) for item in body["jobs"]]
+    assert [job["archive"]["member"] for job in stored] == ["a/cube.stl", "b/part.obj"]
+    assert [job["filename"] for job in stored] == ["cube.stl", "part.obj"]
+    assert [job["status"] for job in stored] == ["awaiting_confirm", "awaiting_confirm"]
+    record = stored[0]["archive"]
     assert record["name"] == "parts.zip"
-    assert record["member"] == "a/cube.stl"
     assert record["candidates"] == ["a/cube.stl", "b/part.obj"]
-    assert record["skipped"] == ["notes.txt", "b/part.obj"]     # shallowest first
+    assert record["skipped"] == ["notes.txt"]
     assert record["members"] == 3
+    assert stored[1]["archive"]["skipped"] == ["notes.txt"]
     assert body["archive"] == record
+    assert (jobs / body["id"] / "upload" / "parts.zip").is_file()
+    assert not (jobs / body["jobs"][1]["id"] / "upload" / "parts.zip").exists()
 
 
 def test_upload_zip_traversal_is_a_400_without_a_job_dir(storage, api_client, switchable,
@@ -465,6 +476,7 @@ def test_upload_zip_with_3mf_runs_the_switch_pipeline(storage, api_client, switc
     response = upload(api_client, archive, filename="benchy-pack.zip")
 
     assert response.status_code == 200, response.text
+    assert "jobs" not in response.json()
     jid = response.json()["id"]
     job = read_job(jobs, jid)
     assert job["archive"]["member"] == "models/benchy.3mf"
@@ -1143,6 +1155,264 @@ def test_upload_zip_oversize_member_is_a_413_without_a_job_dir(storage, api_clie
     assert response.status_code == 413
     assert "expands to more than" in response.json()["detail"]
     assert list(jobs.iterdir()) == []
+
+
+def _tree_bytes(directory: Path) -> dict[str, bytes]:
+    return {path.relative_to(directory).as_posix(): path.read_bytes()
+            for path in sorted(directory.rglob("*")) if path.is_file()}
+
+
+def _forbid_slicer(monkeypatch: pytest.MonkeyPatch) -> None:
+    def explode(*_args, **_kwargs):
+        raise AssertionError("slicer or fin CLI invoked during upload")
+
+    monkeypatch.setattr(main.subprocess, "run", explode)
+    if hasattr(main.supportfins, "fin_model"):
+        monkeypatch.setattr(main.supportfins, "fin_model", explode)
+
+
+def test_upload_mixed_zip_stages_every_member(storage, api_client, switchable, zip_bytes,
+                                              three_mf_bytes, queue_watch, monkeypatch):
+    """Each printable member is a durable job. The HTTP body is not the storage."""
+    jobs, _sliced = storage
+    _forbid_slicer(monkeypatch)
+    add_printer(api_client, "Generic Klipper 0.4 nozzle")
+    stl, obj, plate = b"solid stl\n", b"o mesh\n", three_mf_bytes()
+    archive = zip_bytes({"mesh.obj": obj, "part.stl": stl, "plate.3mf": plate, "notes.txt": b"n"})
+
+    response = upload(api_client, archive, filename="pack.zip")
+
+    assert response.status_code == 200, response.text
+    body = response.json()
+    assert len(body["jobs"]) == 3
+    assert body["jobs"][0]["id"] == body["id"]
+    assert all("jobs" not in item and "queue_position" not in item for item in body["jobs"])
+    ids = [item["id"] for item in body["jobs"]]
+    assert len(set(ids)) == 3
+    assert queue_watch.empty()
+    stored = [read_job(jobs, jid) for jid in ids]
+    assert [job["archive"]["member"] for job in stored] == ["mesh.obj", "part.stl", "plate.3mf"]
+    assert [job["filename"] for job in stored] == ["mesh.obj", "part.stl", "plate.3mf"]
+    assert [job["model_bytes"] for job in stored] == [len(obj), len(stl), len(plate)]
+    assert [job["upload_bytes"] for job in stored] == [len(archive)] * 3
+    assert [job["status"] for job in stored] == ["awaiting_confirm"] * 3
+    assert all(job["archive"]["skipped"] == ["notes.txt"] for job in stored)
+    assert all("jobs" not in job for job in stored)
+    payloads = {"mesh.obj": obj, "part.stl": stl, "plate.3mf": plate}
+    for job, jid in zip(stored, ids):
+        model = jobs / jid / "upload" / job["filename"]
+        assert model.read_bytes() == payloads[job["filename"]]
+        for kind in ("machine", "process", "filament"):
+            raw = (jobs / jid / "pinned" / f"{kind}.json").read_bytes()
+            assert hashlib.sha256(raw).hexdigest() == job["pinned_presets"]["sha256"][kind]
+        assert job["pinned_presets"]["options"]["supports"] is False
+    assert (jobs / ids[0] / "upload" / "pack.zip").read_bytes() == archive
+    assert not (jobs / ids[1] / "upload" / "pack.zip").exists()
+    assert not (jobs / ids[2] / "upload" / "pack.zip").exists()
+    assert stored[2]["slicer_input"] == "slice-plate.3mf"
+    assert "threemf" not in stored[0] and "threemf" not in stored[1]
+
+    fresh = TestClient(main.app)
+    listed = fresh.get("/api/jobs").json()
+    assert {item["id"] for item in listed} == set(ids)
+    one = fresh.get(f"/api/jobs/{ids[1]}").json()
+    assert one["id"] == ids[1]
+    assert one["status"] == "awaiting_confirm"
+    assert one["archive"]["member"] == "part.stl"
+    assert "jobs" not in one
+    assert queue_watch.empty()
+
+
+def test_zip_members_confirm_independently(storage, api_client, switchable, zip_bytes,
+                                           queue_watch):
+    jobs, _sliced = storage
+    archive = zip_bytes({"a.stl": b"aaa", "b.stl": b"bbb", "c.stl": b"ccc"})
+    body = upload(api_client, archive, filename="three.zip").json()
+    ids = [item["id"] for item in body["jobs"]]
+    sibling = _tree_bytes(jobs / ids[1])
+    other = _tree_bytes(jobs / ids[2])
+
+    first = api_client.post(f"/api/jobs/{ids[0]}/slice", json={"options": {"supports": True}})
+
+    assert first.status_code == 200, first.text
+    assert first.json()["status"] == "queued"
+    assert queue_watch.qsize() == 1
+    assert queue_watch.get_nowait() == ids[0]
+    assert read_job(jobs, ids[0])["pinned_presets"]["options"]["supports"] is True
+    assert read_job(jobs, ids[1])["status"] == "awaiting_confirm"
+    assert read_job(jobs, ids[2])["status"] == "awaiting_confirm"
+    assert _tree_bytes(jobs / ids[1]) == sibling
+    assert _tree_bytes(jobs / ids[2]) == other
+
+    for jid in ids[1:]:
+        response = queue_staged(api_client, jid)
+        assert response.status_code == 200, response.text
+        assert queue_watch.get_nowait() == jid
+    assert queue_watch.empty()
+    again = queue_staged(api_client, ids[0])
+    assert again.status_code == 409
+    assert queue_watch.empty()
+
+
+def test_mixed_3mf_order_pins_each_turn(storage, api_client, switchable, zip_bytes,
+                                        three_mf_bytes, queue_watch, monkeypatch):
+    jobs, _sliced = storage
+    _forbid_slicer(monkeypatch)
+    fine = add_process_preset(switchable.datadir, "fine.json", "0.12mm Fine @Generic Klipper",
+                              compatible=["Generic Klipper 0.4 nozzle"])
+    switchable.profile_file.write_text(json.dumps({
+        "machine": MACHINE_REL, "process": fine, "filament": FILAMENT_REL,
+    }))
+    voron = add_printer(api_client, "Voron 2.4")
+    klipper = add_printer(api_client, "Generic Klipper 0.4 nozzle")
+    api_client.post(f"/api/printers/{voron}/select")
+    standard = three_mf_bytes(process="0.20mm Standard @Generic Klipper")
+    fine_plate = three_mf_bytes(process="0.12mm Fine @Generic Klipper")
+    archive = zip_bytes({"1.stl": b"stl", "2.3mf": standard, "3.obj": b"obj", "4.3mf": fine_plate})
+
+    response = upload(api_client, archive, filename="ordered.zip")
+
+    assert response.status_code == 200, response.text
+    ids = [item["id"] for item in response.json()["jobs"]]
+    stored = [read_job(jobs, jid) for jid in ids]
+    assert [job["archive"]["member"] for job in stored] == ["1.stl", "2.3mf", "3.obj", "4.3mf"]
+    assert [job["profile_snapshot"]["process"] for job in stored] == [
+        fine, PROCESS_REL, PROCESS_REL, fine]
+    assert stored[0]["pinned_presets"]["sha256"]["process"] == stored[3]["pinned_presets"]["sha256"]["process"]
+    assert stored[1]["pinned_presets"]["sha256"]["process"] == stored[2]["pinned_presets"]["sha256"]["process"]
+    assert stored[0]["pinned_presets"]["sha256"]["process"] != stored[1]["pinned_presets"]["sha256"]["process"]
+    assert "threemf" not in stored[0] and "threemf" not in stored[2]
+    assert stored[1]["threemf"]["printer"] == klipper
+    assert stored[3]["threemf"]["printer"] == klipper
+    assert stored[1]["threemf"]["rewrite"] == "identity"
+    assert stored[3]["threemf"]["rewrite"] == "identity"
+    standard_id = three_mf_member((jobs / ids[1] / "upload" / "slice-2.3mf").read_bytes())
+    fine_id = three_mf_member((jobs / ids[3] / "upload" / "slice-4.3mf").read_bytes())
+    assert standard_id["print_settings_id"] == ["0.20mm Standard @Generic Klipper"]
+    assert fine_id["print_settings_id"] == ["0.12mm Fine @Generic Klipper"]
+    assert stored_profile(switchable.profile_file)["process"] == fine
+    assert selected_id(api_client) == klipper
+    assert queue_watch.empty()
+
+
+def test_later_pin_failure_leaves_no_batch(storage, api_client, switchable, zip_bytes,
+                                           queue_watch, monkeypatch):
+    jobs, _sliced = storage
+    unrelated = make_job(jobs, "abc123abc123", "sliced")
+    calls = {"n": 0}
+    real = main._pin_model_locked
+
+    def flaky(model_path, job_directory):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise OSError("pin failed")
+        return real(model_path, job_directory)
+
+    monkeypatch.setattr(main, "_pin_model_locked", flaky)
+    archive = zip_bytes({"a.stl": b"aaa", "b.stl": b"bbb"})
+
+    with pytest.raises(OSError, match="pin failed"):
+        upload(api_client, archive, filename="batch.zip")
+
+    assert calls["n"] == 2
+    assert {path.name for path in jobs.iterdir()} == {"abc123abc123"}
+    assert unrelated.is_dir()
+    assert queue_watch.empty()
+
+
+def test_publication_failure_rolls_the_batch_back(storage, api_client, switchable, zip_bytes,
+                                                  queue_watch, monkeypatch):
+    jobs, _sliced = storage
+    make_job(jobs, "abc123abc123", "sliced")
+    calls = {"n": 0}
+    real = main._commit_published_job
+
+    def flaky(directory, meta):
+        calls["n"] += 1
+        if calls["n"] >= 2:
+            raise OSError("publish failed")
+        return real(directory, meta)
+
+    monkeypatch.setattr(main, "_commit_published_job", flaky)
+    archive = zip_bytes({"a.stl": b"aaa", "b.stl": b"bbb"})
+
+    with pytest.raises(OSError, match="publish failed"):
+        upload(api_client, archive, filename="batch.zip")
+
+    assert calls["n"] == 2
+    assert {path.name for path in jobs.iterdir()} == {"abc123abc123"}
+    assert queue_watch.empty()
+    assert list(jobs.rglob("job.json")) == [jobs / "abc123abc123" / "job.json"]
+
+
+def test_hostile_later_entry_keeps_unrelated_jobs(storage, api_client, switchable, zip_bytes_with):
+    jobs, _sliced = storage
+    make_job(jobs, "abc123abc123", "sliced")
+    archive = zip_bytes_with({"a.stl": b"aaa", "b.stl": b"bbb"}, traversal_name="../evil.stl")
+
+    response = upload(api_client, archive, filename="evil.zip")
+
+    assert response.status_code == 400
+    assert "not safe" in response.json()["detail"]
+    assert {path.name for path in jobs.iterdir()} == {"abc123abc123"}
+    assert list(jobs.parent.rglob("evil.stl")) == []
+
+
+def test_zip_names_suffixes_and_deleting_provenance(storage, api_client, switchable, zip_bytes,
+                                                    queue_watch):
+    jobs, _sliced = storage
+    archive = zip_bytes({"a/cube.stl": b"aaa", "b/cube.stl": b"bbb"})
+    explicit = upload(api_client, archive, filename="named.zip", output_name="Benchy").json()
+    named = [read_job(jobs, item["id"])["output_name"] for item in explicit["jobs"]]
+    assert named == ["Benchy-01", "Benchy-02"]
+
+    default = upload(api_client, archive, filename="default.zip").json()
+    stems = [read_job(jobs, item["id"])["output_name"] for item in default["jobs"]]
+    assert stems == ["cube-01", "cube-02"]
+    copies = [read_job(jobs, item["id"]) for item in default["jobs"]]
+    assert (jobs / default["jobs"][0]["id"] / "upload" / "cube.stl").read_bytes() == b"aaa"
+    assert (jobs / default["jobs"][1]["id"] / "upload" / "cube.stl").read_bytes() == b"bbb"
+
+    wide = "N" * 60
+    capped = upload(api_client, archive, filename="wide.zip", output_name=wide).json()
+    wide_names = [read_job(jobs, item["id"])["output_name"] for item in capped["jobs"]]
+    assert wide_names == ["N" * 57 + "-01", "N" * 57 + "-02"]
+    assert all(len(name) == 60 for name in wide_names)
+
+    first, second = default["jobs"][0]["id"], default["jobs"][1]["id"]
+    deleted = api_client.delete(f"/api/jobs/{first}")
+    assert deleted.status_code == 200, deleted.text
+    assert not (jobs / first).exists()
+    confirmed = queue_staged(api_client, second)
+    assert confirmed.status_code == 200, confirmed.text
+    assert read_job(jobs, second)["status"] == "queued"
+    assert (jobs / second / "upload" / "cube.stl").read_bytes() == b"bbb"
+    assert queue_watch.get_nowait() == second
+
+
+def test_staged_zip_members_survive_prune(storage, api_client, switchable, zip_bytes):
+    jobs, _sliced = storage
+    assert main.CONFIG.keep_jobs == 5
+    finished = []
+    for index in range(6):
+        jid = f"{index:012x}"
+        path = make_job(jobs, jid, "sliced")
+        os.utime(path, (1, 1 + index))
+        finished.append(jid)
+    archive = zip_bytes({f"m{index}.stl": f"m{index}".encode() for index in range(6)})
+
+    body = upload(api_client, archive, filename="kept.zip").json()
+
+    ids = [item["id"] for item in body["jobs"]]
+    assert len(ids) == 6
+    main.prune()
+    for jid in ids:
+        assert (jobs / jid).is_dir()
+        assert read_job(jobs, jid)["status"] == "awaiting_confirm"
+        assert (jobs / jid / "upload").is_dir()
+    remaining = [jid for jid in finished if (jobs / jid).exists()]
+    assert remaining == finished[1:]
+    assert (jobs / ids[0] / "upload" / "kept.zip").is_file()
 
 
 # ---------------------------------------------------------------- staged (support fins) jobs

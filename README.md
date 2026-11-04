@@ -30,7 +30,10 @@ config and web console, which the portal frames for you.
 ## What it does
 
 1. **Upload** — `.stl`, `.3mf`, `.obj` or `.zip`. A `.zip` is unpacked fail-closed (traversal, symlink
-   and entry-count rules) and one model is picked; a `.3mf` is read for its printer/process identity.
+   and entry-count rules) and every printable member becomes its own staged job; nothing is sliced
+   until that job is confirmed. A `.3mf` is read for its printer/process identity. In a zip, members
+   are matched in archive order and each job keeps the presets from its own turn; the dashboard
+   selection ends on the last `.3mf`.
 2. **Match** — the presets named inside a `.3mf` are matched against your imported presets and a
    job-local copy is re-identified so OrcaSlicer accepts it. STL and OBJ skip this step.
 3. **Slice** — one background worker runs the OrcaSlicer CLI with the active machine, process and
@@ -148,7 +151,7 @@ Every variable has a working default, and a printer can arrive entirely through 
 | `MOONRAKER_ROOT` | `gcodes` | Moonraker file root for uploads |
 | `DATA_DIR` | `/data` | jobs, presets, printer store, slicer `HOME` |
 | `SLICED_DIR` | `$DATA_DIR/sliced` | second copy of every gcode, for the host |
-| `MAX_UPLOAD_MB` | `150` | upload cap, also per unpacked archive member |
+| `MAX_UPLOAD_MB` | `150` | upload cap, and the combined uncompressed size of models extracted from one zip |
 | `KEEP_JOBS` | `25` | job directories kept before the oldest are pruned |
 | `SLICE_TIMEOUT` | `900` | seconds before a slice is killed |
 | `SUPPORT_FINS_TIMEOUT` | `300` | seconds one support-fins run may take (runs are serialised) |
@@ -200,13 +203,13 @@ Every failure mode with the exact message it produces: [docs/troubleshooting.md]
 
 Opt-in (default OFF) in the staged job's **Print options** panel: tick **Use support fins** and, when you click **Slice it**, the portal runs the
 bundled [support-fins](#acknowledgements) CLI locally on the upload, then slices the finned 3MF instead
-of the original. STL, 3MF and OBJ are accepted (a ZIP is unpacked first) and the output is always a 3MF;
+of the original. STL, 3MF and OBJ are accepted (a ZIP is unpacked first; each printable member is its own staged job) and the output is always a 3MF;
 the original upload stays on disk. `GET /api/support-fins` reports whether the runtime is present; the
 checkbox is shown on the staged panel and disabled, with the reason in the hint, when the CLI is absent.
 
 Every upload is staged, not queued:
 
-- Uploads come back `awaiting_confirm` and bind the **Print options** panel on the upload card. Nothing
+- Uploads come back `awaiting_confirm` and bind the **Print options** panel on the upload card. A zip with more than one model returns a `jobs` array and stages each member separately; confirm each one. Nothing
   enters the queue until you click **Slice it**. The preview dialog does not open by itself.
 - Staged jobs offer **Print options** on the row to bind that job to the options panel, and **Preview fins**. Preview is optional: it
   shows what the CLI did (`"14 walls, 24 tines"`, overhang regions, fin/tine/brace counts) and a

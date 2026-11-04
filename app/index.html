@@ -1463,16 +1463,29 @@ async function upload(file) {
     /* The job exists now: the same box becomes the indeterminate slice wait, and the poll
        (refresh → setUploadWait) takes over from here. */
     transferPhase = false;
-    if (j.threemf) {
+    const createdJobs = Array.isArray(j.jobs) ? j.jobs : [j];
+    const hasThreeMf = createdJobs.some(job => !!job.threemf);
+    if (hasThreeMf) {
       /* the 3MF switch rewrote profile.json and possibly the selected printer, so both
          cards are stale by now */
       await loadPrinters();
       await loadProfile();
-      if (j.threemf.printer || j.threemf.process) {
-        const printer = printers.find(p => p.id === j.threemf.printer);
-        const printerName = printer ? printer.name : (j.threemf.printer ? String(j.threemf.printer) : "—");
-        toast(`Profile switched to ${printerName} / ${presetName("process", j.threemf.process) || "—"}`, 6000);
+      if (createdJobs.length === 1 && j.threemf) {
+        if (j.threemf.printer || j.threemf.process) {
+          const printer = printers.find(p => p.id === j.threemf.printer);
+          const printerName = printer ? printer.name : (j.threemf.printer ? String(j.threemf.printer) : "—");
+          toast(`Profile switched to ${printerName} / ${presetName("process", j.threemf.process) || "—"}`, 6000);
+        }
       }
+    }
+    if (createdJobs.length > 1) {
+      setUploadWait(null);
+      setPrintOptions(null);
+      await refresh();
+      toast(`Found ${createdJobs.length} printable models in ${file.name}; saved ${createdJobs.length} jobs. Nothing sliced. Open Print options for each job.`, 6000);
+      const jobsTitle = $("#jobsTitle");
+      if (jobsTitle) jobsTitle.focus();
+      return;
     }
     /* Every successful upload is staged (awaiting_confirm). Bind the print options panel.
        Slicing is a click on the Slice it button in Print options. */
@@ -1481,8 +1494,7 @@ async function upload(file) {
       setUploadLatest(j);
       setPrintOptions(j);
       if (j.archive) {
-        const total = Math.max(1, (j.archive.candidates || []).length);
-        toast(`Slicing ${j.archive.member} (1 of ${total} model files)`, 5000);
+        toast(`Saved ${j.archive.member}; awaiting confirmation.`, 5000);
       }
       await refresh();
       if (printOptionsJobId === j.id && printOptionsJob && printOptionsJob.status === "awaiting_confirm") {
@@ -1779,6 +1791,7 @@ function renderJobBody(j, withWait = true) {
       <span class="mono">${fmtBytes(j.upload_bytes)}</span>
       <span>${fmtDate(j.created)}</span>
       ${out}
+      ${j.archive && j.archive.member ? `<span class="mono" title="${esc(j.archive.name ? `archive member from ${j.archive.name}` : "archive member")}">from ${esc(j.archive.member)}</span>` : ""}
       ${j.support_fins ? `<span title="${esc((j.fins && j.fins.report) || "designed-in support fins")}">fins: ${esc(finsSummary(j))}</span>` : ""}
       ${j.original && j.original !== j.filename ? `<span class="mono" title="uploaded as">from ${esc(j.original)}</span>` : ""}
       ${j.kind === "reslice" ? `<span>Reslice of <a href="#job-${esc(j.source_job_id)}">${esc(j.source_job_id)}</a>${j.status === "awaiting_confirm" ? " · awaiting settings / reslice draft" : ""}</span>` : ""}
@@ -2436,7 +2449,12 @@ function setPrintOptions(job) {
   printOptionsJob = job;
   panel.hidden = false;
   const jobLabel = $("#printOptionsJob");
-  if (jobLabel) jobLabel.textContent = job.filename || "";
+  if (jobLabel) {
+    const member = job.archive && job.archive.member;
+    jobLabel.textContent = member && member !== job.filename
+      ? `${job.filename} (${member})`
+      : (job.filename || member || "");
+  }
 
   const opts = (job.profile_snapshot && job.profile_snapshot.options) || profileOptions || {};
   const optSupports = $("#optSupports");
