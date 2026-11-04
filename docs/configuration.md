@@ -19,7 +19,7 @@ environment; it is never printed or logged.
 | `DATA_DIR` | `/data` | jobs, uploads, `profile.json`, `printers.json`, Qt `HOME` | none (not `~`/`$VAR`-expanded) |
 | `ORCA_BIN` | `/opt/orca/bin/orca-slicer` | slicer binary inside the image | none |
 | `ORCA_DATADIR` | `$DATA_DIR/orca-datadir` | writable slicer datadir (seed copy + imported presets) | `~` / `$VAR` / `${VAR}` expanded |
-| `MAX_UPLOAD_MB` | `150` | upload cap in MiB; also bounds an unpacked archive member | positive integer |
+| `MAX_UPLOAD_MB` | `150` | upload cap in MiB; also the combined uncompressed size of models extracted from one zip (each member and the sum) | positive integer |
 | `KEEP_JOBS` | `25` | finished job directories retained before the oldest are pruned | positive integer |
 | `SLICE_TIMEOUT` | `900` | seconds before a slice is killed | positive integer |
 | `SUPPORT_FINS_TIMEOUT` | `300` | seconds one support-fins run may take (`node app/support_fins.mjs …`). Fin runs are serialised, so a second finned upload waits for the first | positive number; fractions allowed. `0`, negatives, `nan`, `inf` and garbage are startup errors (`_positive_float`, `config.py:143`) |

@@ -546,18 +546,20 @@ def test_the_printer_list_delegates_the_pairing_action(page):
 def test_upload_accepts_zip_and_reports_the_archive_member(page):
     assert 'accept=".stl,.3mf,.obj,.zip"' in page
     assert "j.archive" in page
-    assert "Slicing ${j.archive.member} (1 of ${total} model files)" in page
-    assert "j.archive.candidates" in page
+    assert "Saved ${j.archive.member}; awaiting confirmation." in page
+    assert "Found ${createdJobs.length} printable models in ${file.name}; saved ${createdJobs.length} jobs. Nothing sliced. Open Print options for each job." in page
+    assert "from ${esc(j.archive.member)}" in page
 
 
 def test_upload_reports_a_profile_switch(page):
-    switch = slice_between(page, "if (j.threemf) {", "refresh();")
-    assert "j.threemf.printer" in switch and "j.threemf.process" in switch
-    assert "Profile switched to ${printerName} / " in switch
-    # the switch rewrote profile.json (and maybe the active printer), so both cards refresh
-    assert "await loadPrinters();" in switch
-    assert "await loadProfile();" in switch
-    assert switch.index("await loadProfile();") < switch.index("Profile switched to")
+    body = function_body(page, "upload")
+    assert "const hasThreeMf = createdJobs.some(job => !!job.threemf);" in body
+    assert "await loadPrinters();" in body
+    assert "await loadProfile();" in body
+    assert "Profile switched to ${printerName} / " in body
+    assert body.index("await loadProfile();") < body.index("Profile switched to")
+    # For a multi-job batch, do not claim the first job's 3MF is the final active profile
+    assert "if (createdJobs.length === 1 && j.threemf)" in body
 
 
 def test_dashboard_source_order_and_desktop_grid(page):
@@ -1763,3 +1765,320 @@ def test_from_layer_dialog_and_actions_are_wired(page):
     assert "openFromLayer(fromBtn.dataset.ref, fromBtn)" in handler
     summary = function_body(page, "updateFromLayerSummary")
     assert "Print from layer ${entry.layer} and on" in summary
+
+
+def test_upload_async_handler_and_shared_rendering_in_node(page):
+    """Exercise production upload handler and shared metadata escaping in Node.js."""
+    import shutil
+    import subprocess
+
+    node = shutil.which("node")
+    if not node:
+        pytest.skip("node is unavailable")
+
+    upload_fn = "async " + function_body(page, "upload") + "\n}"
+    set_print_options = function_body(page, "setPrintOptions") + "\n}"
+    render_job_body = function_body(page, "renderJobBody") + "\n}"
+    fins_summary = function_body(page, "finsSummary") + "\n}"
+    esc_fn = page[page.index("const esc ="):page.index("const toast =")].strip()
+    fmt_fns = page[page.index("const fmtBytes ="):page.index("const kv =")].strip()
+    labels = slice_between(page, "const SLICE_LABELS =", "\n\n/* ---------------- routing").strip()
+
+    js = f"""
+const assert = require("assert");
+
+{esc_fn}
+{fmt_fns}
+{labels}
+{fins_summary}
+
+let focused = null;
+const makeEl = id => ({{
+  id,
+  value: "",
+  checked: false,
+  hidden: false,
+  textContent: "",
+  classes: new Set(),
+  classList: {{
+    add(c) {{ this.parent.classes.add(c); }},
+    remove(c) {{ this.parent.classes.delete(c); }},
+    contains(c) {{ return this.parent.classes.has(c); }}
+  }},
+  setAttribute(k, v) {{ this[k] = String(v); }},
+  removeAttribute(k) {{ delete this[k]; }},
+  getAttribute(k) {{ return this[k] ?? null; }},
+  focus() {{ focused = id; }},
+  firstElementChild: {{ style: {{}} }},
+  closest() {{ return null; }}
+}});
+
+const elements = {{}};
+for (const id of [
+  "outputName", "drop", "uploadWait", "uploadWaitLabel", "uploadWaitModel", "uploadWaitTrack",
+  "printOptions", "printOptionsJob", "printOptionsError", "optSupports", "optBrim", "optAutoOrient",
+  "optShrinkFit", "supportFins", "jobsTitle", "jobs", "jobCount", "btnDeleteAll", "uploadLatest",
+  "uploadLatestBody", "maxHeight", "maxWidth", "maxLength"
+]) {{
+  elements[id] = makeEl(id);
+  elements[id].classList.parent = elements[id];
+}}
+
+const $ = s => elements[s.slice(1)] || (elements[s.slice(1)] = makeEl(s.slice(1)));
+const drop = elements.drop;
+
+let toasts = [];
+function toast(m, ms = 2800) {{ toasts.push({{ msg: m, ms }}); }};
+
+let uploadWaitCalls = [];
+function setUploadWait(job) {{
+  uploadWaitCalls.push(job);
+  elements.uploadWait.hidden = !job;
+}}
+
+let uploadLatestCalls = [];
+function setUploadLatest(job) {{
+  uploadLatestCalls.push(job);
+  elements.uploadLatest.hidden = !job;
+}}
+
+let printOptionsJobId = null;
+let printOptionsJob = null;
+let profileOptions = {{}};
+let supportFinsAvailable = true;
+let supportFinsUnavailableReason = "";
+function applyPrintOptionsConstraints() {{}}
+
+let refreshCalls = 0;
+let latestJobs = [];
+async function refresh() {{
+  refreshCalls++;
+}}
+
+let loadPrintersCalls = 0;
+async function loadPrinters() {{ loadPrintersCalls++; }}
+
+let loadProfileCalls = 0;
+async function loadProfile() {{ loadProfileCalls++; }}
+
+let printers = [{{ id: "custom", name: "Custom Printer" }}];
+function presetName(type, id) {{ return id; }}
+
+let progressCalls = [];
+function setUploadProgress(sent, total) {{ progressCalls.push({{ sent, total }}); }}
+
+let clearUploadWaitCalls = 0;
+function clearUploadWait() {{ clearUploadWaitCalls++; elements.uploadWait.hidden = true; }}
+
+let sliceCalls = [];
+let resliceCalls = [];
+let printCalls = [];
+global.fetch = async (url, opts) => {{
+  if (url.includes("/slice")) sliceCalls.push({{ url, opts }});
+  if (url.includes("/reslice")) resliceCalls.push({{ url, opts }});
+  if (url.includes("/print")) printCalls.push({{ url, opts }});
+  return {{ ok: true, json: async () => ({{}}) }};
+}};
+
+class FormData {{
+  constructor() {{ this.entries = {{}}; }}
+  append(k, v) {{ this.entries[k] = v; }}
+}}
+global.FormData = FormData;
+
+let nextXhrResponse = null;
+let nextXhrStatus = 200;
+let nextXhrError = false;
+let xhrProgressTrigger = null;
+
+class XMLHttpRequest {{
+  constructor() {{
+    this.upload = {{}};
+    this.status = 200;
+    this.responseText = "";
+  }}
+  open(method, url) {{
+    this.method = method;
+    this.url = url;
+  }}
+  send(fd) {{
+    if (this.upload.onprogress && xhrProgressTrigger) {{
+      this.upload.onprogress(xhrProgressTrigger);
+    }}
+    if (nextXhrError) {{
+      if (this.onerror) this.onerror();
+      return;
+    }}
+    this.status = nextXhrStatus;
+    this.responseText = typeof nextXhrResponse === "string" ? nextXhrResponse : JSON.stringify(nextXhrResponse);
+    if (this.onload) this.onload();
+  }}
+}}
+global.XMLHttpRequest = XMLHttpRequest;
+
+let uploading = false;
+let transferPhase = false;
+let lastPaint = 0;
+
+{set_print_options}
+{render_job_body}
+{upload_fn}
+
+(async () => {{
+  // 1. Single job upload (direct or single zip)
+  nextXhrStatus = 200;
+  nextXhrError = false;
+  nextXhrResponse = {{
+    id: "job001",
+    status: "awaiting_confirm",
+    filename: "single.stl",
+    archive: {{ member: "single.stl", name: "single.zip" }}
+  }};
+  toasts = [];
+  focused = null;
+  refreshCalls = 0;
+  sliceCalls = [];
+  resliceCalls = [];
+  printCalls = [];
+
+  await upload({{ name: "single.zip", size: 1024 }});
+
+  assert.equal(toasts.some(t => t.msg === "Saved single.stl; awaiting confirmation." && t.ms === 5000), true);
+  assert.equal(printOptionsJobId, "job001");
+  assert.equal(focused, "optSupports");
+  assert.equal(refreshCalls, 1);
+  assert.equal(sliceCalls.length, 0);
+  assert.equal(resliceCalls.length, 0);
+  assert.equal(printCalls.length, 0);
+  assert.equal(elements.drop.getAttribute("aria-disabled"), "false");
+  assert.equal(elements.drop.classList.contains("is-busy"), false);
+
+  // 2. Multi-job upload
+  nextXhrStatus = 200;
+  const batchJobs = [
+    {{ id: "j1", status: "awaiting_confirm", filename: "cube.stl", archive: {{ member: "a/cube.stl", name: "pack.zip" }} }},
+    {{ id: "j2", status: "awaiting_confirm", filename: "cube.stl", archive: {{ member: "b/cube.stl", name: "pack.zip" }} }},
+    {{ id: "j3", status: "awaiting_confirm", filename: "gear.stl", archive: {{ member: "c/gear.stl", name: "pack.zip" }} }}
+  ];
+  nextXhrResponse = {{
+    ...batchJobs[0],
+    jobs: batchJobs
+  }};
+  toasts = [];
+  focused = null;
+  refreshCalls = 0;
+  uploadWaitCalls = [];
+  sliceCalls = [];
+  resliceCalls = [];
+  printCalls = [];
+
+  await upload({{ name: "pack.zip", size: 4096 }});
+
+  assert.equal(toasts.some(t => t.msg === "Found 3 printable models in pack.zip; saved 3 jobs. Nothing sliced. Open Print options for each job." && t.ms === 6000), true);
+  assert.equal(printOptionsJobId, null);
+  assert.equal(elements.printOptions.hidden, true);
+  assert.equal(focused, "jobsTitle");
+  assert.equal(refreshCalls, 1);
+  assert.equal(uploadWaitCalls.includes(null), true);
+  assert.equal(sliceCalls.length, 0);
+  assert.equal(resliceCalls.length, 0);
+  assert.equal(printCalls.length, 0);
+
+  // 3. Batch where later result (not first) has 3MF
+  nextXhrStatus = 200;
+  const batchWithLater3mf = [
+    {{ id: "j1", status: "awaiting_confirm", filename: "model.stl" }},
+    {{ id: "j2", status: "awaiting_confirm", filename: "plate.3mf", threemf: {{ printer: "custom", process: "0.20mm" }} }}
+  ];
+  nextXhrResponse = {{
+    ...batchWithLater3mf[0],
+    jobs: batchWithLater3mf
+  }};
+  loadPrintersCalls = 0;
+  loadProfileCalls = 0;
+  toasts = [];
+
+  await upload({{ name: "mixed.zip", size: 5000 }});
+
+  assert.equal(loadPrintersCalls, 1);
+  assert.equal(loadProfileCalls, 1);
+  assert.equal(toasts.some(t => t.msg.includes("Profile switched to")), false);
+  assert.equal(toasts.some(t => t.msg === "Found 2 printable models in mixed.zip; saved 2 jobs. Nothing sliced. Open Print options for each job."), true);
+
+  // 4. Single upload with 3MF
+  nextXhrStatus = 200;
+  nextXhrResponse = {{
+    id: "j1",
+    status: "awaiting_confirm",
+    filename: "plate.3mf",
+    threemf: {{ printer: "custom", process: "0.20mm" }}
+  }};
+  loadPrintersCalls = 0;
+  loadProfileCalls = 0;
+  toasts = [];
+
+  await upload({{ name: "plate.3mf", size: 2000 }});
+
+  assert.equal(loadPrintersCalls, 1);
+  assert.equal(loadProfileCalls, 1);
+  assert.equal(toasts.some(t => t.msg.includes("Profile switched to Custom Printer / 0.20mm")), true);
+
+  // 5. Upload error / busy / progress regressions
+  nextXhrError = true;
+  clearUploadWaitCalls = 0;
+  toasts = [];
+
+  await upload({{ name: "broken.stl", size: 100 }});
+
+  assert.equal(clearUploadWaitCalls >= 1, true);
+  assert.equal(toasts.some(t => t.msg.includes("Error: network error")), true);
+  assert.equal(uploading, false);
+  assert.equal(elements.drop.getAttribute("aria-disabled"), "false");
+  assert.equal(elements.drop.classList.contains("is-busy"), false);
+
+  // Concurrent upload while uploading=true returns early
+  uploading = true;
+  let concurrentStarted = false;
+  try {{
+    upload({{ name: "concurrent.stl", size: 50 }});
+    concurrentStarted = true;
+  }} finally {{
+    uploading = false;
+  }}
+  assert.equal(concurrentStarted, true);
+
+  // Progress regression
+  xhrProgressTrigger = {{ loaded: 500, lengthComputable: true, total: 1000 }};
+  nextXhrError = false;
+  nextXhrResponse = {{ id: "p1", status: "awaiting_confirm", filename: "p.stl" }};
+  progressCalls = [];
+  await upload({{ name: "p.stl", size: 1000 }});
+  assert.equal(progressCalls.some(p => p.sent === 500 && p.total === 1000), true);
+
+  // 6. Archive member escaping through shared rendering
+  const hostileJob = {{
+    id: "h1",
+    status: "awaiting_confirm",
+    filename: "xss.stl",
+    output_name: "xss-01",
+    archive: {{
+      member: "<script>alert(\\\"member\\\")</script>",
+      name: "\\\" onload=\\\"alert(1)"
+    }},
+    upload_bytes: 100,
+    created: "2026-11-04T12:00:00Z"
+  }};
+  const html = renderJobBody(hostileJob);
+  assert.equal(html.includes("<script>"), false);
+  assert.equal(html.includes("&lt;script&gt;alert(&quot;member&quot;)&lt;/script&gt;"), true);
+  assert.equal(html.includes("&quot; onload=&quot;alert(1)"), true);
+  assert.equal(html.includes("→ xss-01.gcode"), true);
+
+  setPrintOptions(hostileJob);
+  assert.equal(elements.printOptionsJob.textContent, "xss.stl (<script>alert(\\\"member\\\")</script>)");
+}})().catch(err => {{
+  console.error(err);
+  process.exit(1);
+}});
+"""
+    subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)

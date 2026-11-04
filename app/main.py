@@ -1216,6 +1216,246 @@ def _prepare_3mf_locked(model_path: Path) -> tuple[dict, str | None]:
     return record, slicer_input
 
 
+def _pin_model_locked(model_path: Path, job_directory: Path):
+    """Pin the active presets into ``job_directory``. Caller holds ``DERIVED_LOCK``.
+
+    Calls :func:`prepare_3mf` (rather than the locked helper) so a 3MF still switches the
+    global selection and tests that patch ``prepare_3mf`` still see the call. Does not take
+    ``STAGE_LOCK``.
+    """
+    prepared = prepare_3mf(model_path) if model_path.suffix.lower() == ".3mf" else (None, None)
+    snapshot = profile_snapshot()
+    options = prof.read_options(snapshot)
+    paths = {kind: _preset_path(snapshot.get(kind)) for kind in ("machine", "process", "filament")}
+    if any(path is None for path in paths.values()):
+        raise prof.ProfileError("selected presets are unavailable; select profiles and retry")
+    machine = prof.effective_preset(paths["machine"], "machine", CONFIG.orca_datadir)
+    prof.clamp_machine(machine, CONFIG.bed_size)
+    values = {"machine": machine,
+              "process": prof.derived_process_data(paths["process"], CONFIG.orca_datadir, options),
+              "filament": prof.effective_preset(paths["filament"], "filament", CONFIG.orca_datadir)}
+    pinned = job_directory / "pinned"
+    pinned.mkdir()
+    hashes = {}
+    for kind, value in values.items():
+        raw = json.dumps(value, indent=2).encode()
+        (pinned / f"{kind}.json").write_bytes(raw)
+        hashes[kind] = hashlib.sha256(raw).hexdigest()
+    pin_options = {k: options[k] for k in ("supports", "brim", "auto_orient", "shrink_to_fit") if k in options}
+    return prepared, snapshot, {"version": 1, "sha256": hashes, "options": pin_options}
+
+
+def _prepare_models(pairs: list[tuple[Path, Path]]):
+    """Prepare every model under one ``DERIVED_LOCK`` hold, in list order. No ``STAGE_LOCK``."""
+    with DERIVED_LOCK:
+        return [_pin_model_locked(model, directory) for model, directory in pairs]
+
+
+async def _await_prepare(fn, *args):
+    """Run ``fn`` off the event loop and do not return until that thread has finished.
+
+    Cancelling the request must not leave the worker writing into a directory the caller
+    is about to delete.
+    """
+    box: dict = {}
+
+    def target() -> None:
+        try:
+            box["result"] = fn(*args)
+        except BaseException as exc:
+            box["error"] = exc
+
+    thread = threading.Thread(target=target, name="upload-prepare")
+    thread.start()
+    try:
+        await asyncio.to_thread(thread.join)
+    except BaseException:
+        thread.join()
+        raise
+    if "error" in box:
+        raise box["error"]
+    return box["result"]
+
+
+def _commit_published_job(directory: Path, meta: dict) -> None:
+    """Write job.json into an already-published job directory. Holds no lock of its own."""
+    prof.write_json_atomic(directory / "job.json", meta)
+
+
+def _publish_upload_batch(entries: list[tuple[str, Path, dict]]) -> None:
+    """Rename staged dirs into ``JOBS`` and write their metadata, or roll the batch back.
+
+    Holds ``STAGE_LOCK`` for the whole publish so a reader never sees a partial batch and a
+    failure cannot leave a renamed directory behind. Does not await, and must not be called
+    while ``DERIVED_LOCK`` is held.
+    """
+    published: list[Path] = []
+    with STAGE_LOCK:
+        try:
+            for jid, staging, meta in entries:
+                target = JOBS / jid
+                if target.exists() or target.is_symlink():
+                    raise OSError(f"job id collision: {jid}")
+                os.rename(staging, target)
+                published.append(target)
+                _commit_published_job(target, meta)
+        except BaseException:
+            for path in reversed(published):
+                shutil.rmtree(path, ignore_errors=True)
+            raise
+
+
+def _batch_output_name(raw: object, member_stem: str, index: int) -> str:
+    """``base-NN`` within the 60-character stem limit. ``index`` is 1-based."""
+    base = normalise_output_name(raw, member_stem)
+    suffix = f"-{index:02d}"
+    room = OUTPUT_NAME_MAX - len(suffix)
+    trimmed = base[:room].rstrip(" .")
+    if not trimmed:
+        trimmed = "model"[:room]
+    return _validated_output_name(trimmed + suffix)
+
+
+def _allocate_job_id(reserved: set[str]) -> str:
+    while True:
+        jid = uuid.uuid4().hex[:12]
+        if jid not in reserved and not (JOBS / jid).exists():
+            reserved.add(jid)
+            return jid
+
+
+async def _read_upload(file: UploadFile, dest: Path) -> int:
+    size = 0
+    limit = CONFIG.max_upload_bytes
+    with dest.open("wb") as fh:
+        while chunk := await file.read(1 << 20):
+            size += len(chunk)
+            if size > limit:
+                raise HTTPException(413, f"file larger than {limit // (1024 * 1024)} MB")
+            fh.write(chunk)
+    return size
+
+
+def _upload_body(jid: str, archive: dict | None, record: dict | None) -> dict:
+    body = {"id": jid, "status": "awaiting_confirm"}
+    if archive is not None:
+        body["archive"] = archive
+    if record is not None:
+        body["threemf"] = record
+    return body
+
+
+async def _upload_model(file: UploadFile, upload_name: str, output_name: str | None) -> dict:
+    name = normalise_output_name(output_name, Path(upload_name).stem)
+    jid = uuid.uuid4().hex[:12]
+    directory = JOBS / jid
+    (directory / "upload").mkdir(parents=True)
+    dest = directory / "upload" / upload_name
+    record = None
+    try:
+        size = await _read_upload(file, dest)
+        prepared = await _await_prepare(_prepare_models, [(dest, directory)])
+        (record, slicer_input), snapshot, pins = prepared[0]
+        fields = {"status": "awaiting_confirm", "filename": dest.name, "output_name": name,
+                  "upload_bytes": size, "model_bytes": dest.stat().st_size,
+                  "profile_snapshot": snapshot, "pinned_presets": pins,
+                  "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
+        if record is not None:
+            fields["threemf"] = record
+        if slicer_input is not None:
+            fields["slicer_input"] = slicer_input
+        write_job(jid, **fields)
+    except prof.ProfileError as exc:
+        shutil.rmtree(directory, ignore_errors=True)
+        raise HTTPException(409, f"profile: {exc}") from exc
+    except BaseException:
+        # The job dir exists from here on but the job was never queued: a failed upload must
+        # not leave an orphan behind (MemoryError included, and `BaseException` so an
+        # interrupted request is cleaned up too). The rejection still reaches the client.
+        shutil.rmtree(directory, ignore_errors=True)
+        raise
+    return _upload_body(jid, None, record)
+
+
+async def _upload_zip(file: UploadFile, upload_name: str, output_name: str | None) -> dict:
+    """Stage every printable member, then publish the batch or leave nothing behind.
+
+    The scratch tree is a hidden ``JOBS/.upload-*`` directory with no root ``job.json``,
+    so a listing or prune cannot treat it as a job. Preparation finishes, and its thread
+    is joined, before ``STAGE_LOCK`` is taken.
+    """
+    scratch = Path(tempfile.mkdtemp(prefix=".upload-", dir=JOBS))
+    try:
+        incoming = scratch / "incoming"
+        incoming.mkdir()
+        archive_path = incoming / upload_name
+        size = await _read_upload(file, archive_path)
+        extract_root = scratch / "extract"
+        extract_root.mkdir()
+        try:
+            selections = archives.extract_models(
+                archive_path, extract_root, allowed=ALLOWED,
+                max_uncompressed=CONFIG.max_upload_bytes)
+        except archives.ArchiveError as exc:
+            raise HTTPException(exc.status, str(exc)) from exc
+
+        reserved: set[str] = set()
+        staged: list[dict] = []
+        for index, selection in enumerate(selections):
+            jid = _allocate_job_id(reserved)
+            stage = scratch / "stage" / jid
+            upload_dir = stage / "upload"
+            upload_dir.mkdir(parents=True)
+            model_path = upload_dir / selection.written.name
+            shutil.copyfile(selection.written, model_path)
+            os.chmod(model_path, 0o644)
+            if index == 0:
+                # provenance lives on the first job only; siblings keep their own model copy
+                zip_copy = upload_dir / upload_name
+                shutil.copyfile(archive_path, zip_copy)
+                os.chmod(zip_copy, 0o644)
+            if len(selections) == 1:
+                if not (output_name or "").strip():
+                    name = normalise_output_name(None, model_path.stem)
+                else:
+                    name = normalise_output_name(output_name, model_path.stem)
+            else:
+                name = _batch_output_name(output_name, model_path.stem, index + 1)
+            archive = {"name": upload_name, "member": selection.member,
+                       "candidates": list(selection.candidates),
+                       "skipped": list(selection.skipped), "members": selection.members}
+            staged.append({"jid": jid, "stage": stage, "model_path": model_path,
+                           "name": name, "archive": archive})
+
+        prepared = await _await_prepare(
+            _prepare_models, [(item["model_path"], item["stage"]) for item in staged])
+        now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        entries: list[tuple[str, Path, dict]] = []
+        bodies: list[dict] = []
+        for item, prepared_one in zip(staged, prepared):
+            (record, slicer_input), snapshot, pins = prepared_one
+            model_path = item["model_path"]
+            meta = {"id": item["jid"], "status": "awaiting_confirm",
+                    "filename": model_path.name, "output_name": item["name"],
+                    "upload_bytes": size, "model_bytes": model_path.stat().st_size,
+                    "profile_snapshot": snapshot, "pinned_presets": pins,
+                    "created": now, "updated": now, "archive": item["archive"]}
+            if record is not None:
+                meta["threemf"] = record
+            if slicer_input is not None:
+                meta["slicer_input"] = slicer_input
+            entries.append((item["jid"], item["stage"], meta))
+            bodies.append(_upload_body(item["jid"], item["archive"], record))
+        _publish_upload_batch(entries)
+    except prof.ProfileError as exc:
+        raise HTTPException(409, f"profile: {exc}") from exc
+    finally:
+        shutil.rmtree(scratch, ignore_errors=True)
+    if len(bodies) == 1:
+        return bodies[0]
+    return {**bodies[0], "jobs": bodies}
+
+
 @app.post("/api/upload")
 async def api_upload(request: Request, file: UploadFile = File(...),
                      output_name: str | None = Form(None),
@@ -1225,96 +1465,14 @@ async def api_upload(request: Request, file: UploadFile = File(...),
     suffix = Path(file.filename or "").suffix.lower()
     if suffix not in ALLOWED:
         raise HTTPException(400, f"unsupported file type '{suffix}' (allowed: {', '.join(sorted(ALLOWED))})")
-    require_selection()        # before the job dir exists, so a 409 leaves nothing behind
+    require_selection()        # before any directory exists, so a 409 leaves nothing behind
     upload_name = Path(file.filename or f"model{suffix}").name
-    name = normalise_output_name(output_name, Path(upload_name).stem)
-    jid = uuid.uuid4().hex[:12]
-    d = JOBS / jid
-    (d / "upload").mkdir(parents=True)
-    dest = d / "upload" / upload_name
-    size = 0
-    with dest.open("wb") as fh:
-        while chunk := await file.read(1 << 20):
-            size += len(chunk)
-            if size > CONFIG.max_upload_bytes:
-                shutil.rmtree(d, ignore_errors=True)
-                raise HTTPException(413, f"file larger than {CONFIG.max_upload_bytes // (1024*1024)} MB")
-            fh.write(chunk)
-
-    model_path = dest
-    archive = None
+    if (output_name or "").strip():
+        normalise_output_name(output_name, Path(upload_name).stem)
+    # support_fins is accepted and ignored: fins run at confirmation, not at upload
     if suffix == ".zip":
-        # the archive itself stays in the job dir: it is what the operator uploaded, and
-        # the extracted member is what gets sliced
-        try:
-            selection = archives.extract_model(dest, d / "upload", allowed=ALLOWED,
-                                               max_uncompressed=CONFIG.max_upload_bytes)
-        except archives.ArchiveError as exc:
-            shutil.rmtree(d, ignore_errors=True)
-            raise HTTPException(exc.status, str(exc)) from exc
-        model_path = selection.written
-        archive = {"name": upload_name, "member": selection.member,
-                   "candidates": selection.candidates, "skipped": selection.skipped,
-                   "members": selection.members}
-        if not (output_name or "").strip():
-            name = normalise_output_name(None, model_path.stem)
-
-    record = None
-    slicer_input = None
-    try:
-        # Prepare the upload *itself* before finning it: the CLI's output 3MF carries no
-        # OrcaSlicer metadata, so preparing that copy could never match a printer/process.
-        def prepare_and_snapshot():
-            with DERIVED_LOCK:
-                prepared = prepare_3mf(model_path) if model_path.suffix.lower() == ".3mf" else (None, None)
-                snapshot = profile_snapshot()
-                options = prof.read_options(snapshot)
-                paths = {kind: _preset_path(snapshot.get(kind)) for kind in ("machine", "process", "filament")}
-                if any(path is None for path in paths.values()):
-                    raise prof.ProfileError("selected presets are unavailable; select profiles and retry")
-                machine = prof.effective_preset(paths["machine"], "machine", CONFIG.orca_datadir)
-                prof.clamp_machine(machine, CONFIG.bed_size)
-                values = {"machine": machine,
-                          "process": prof.derived_process_data(paths["process"], CONFIG.orca_datadir, options),
-                          "filament": prof.effective_preset(paths["filament"], "filament", CONFIG.orca_datadir)}
-                pinned = d / "pinned"
-                pinned.mkdir()
-                hashes = {}
-                for kind, value in values.items():
-                    raw = json.dumps(value, indent=2).encode()
-                    (pinned / f"{kind}.json").write_bytes(raw)
-                    hashes[kind] = hashlib.sha256(raw).hexdigest()
-                pin_options = {k: options[k] for k in ("supports", "brim", "auto_orient", "shrink_to_fit") if k in options}
-                return prepared, snapshot, {"version": 1, "sha256": hashes, "options": pin_options}
-
-        try:
-            (record, slicer_input), captured_profile, pinned_presets = await asyncio.to_thread(prepare_and_snapshot)
-        except prof.ProfileError as exc:
-            raise HTTPException(409, f"profile: {exc}") from exc
-        status = "awaiting_confirm"
-        fields = {"status": status, "filename": model_path.name, "output_name": name,
-                  "upload_bytes": size, "model_bytes": model_path.stat().st_size,
-                  "profile_snapshot": captured_profile, "pinned_presets": pinned_presets,
-                  "created": datetime.now(timezone.utc).isoformat(timespec="seconds")}
-        if archive is not None:
-            fields["archive"] = archive
-        if record is not None:
-            fields["threemf"] = record
-        if slicer_input is not None:
-            fields["slicer_input"] = slicer_input
-        write_job(jid, **fields)
-    except BaseException:
-        # The job dir exists from here on but the job was never queued: a failed upload must
-        # not leave an orphan behind (MemoryError included, and `BaseException` so an
-        # interrupted request is cleaned up too). The rejection still reaches the client.
-        shutil.rmtree(d, ignore_errors=True)
-        raise
-    body = {"id": jid, "status": status}
-    if archive is not None:
-        body["archive"] = archive
-    if record is not None:
-        body["threemf"] = record
-    return body
+        return await _upload_zip(file, upload_name, output_name)
+    return await _upload_model(file, upload_name, output_name)
 
 
 def _canonical_model(jid: str, job: dict) -> Path:

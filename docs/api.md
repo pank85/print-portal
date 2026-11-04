@@ -61,7 +61,7 @@ A pairing is a complete statement about a printer, not a patch: a slot the body 
 
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
-| POST | `/api/upload` | multipart `file` (`.stl` `.3mf` `.obj` `.zip`) + optional `output_name`, form field `support_fins` ignored → stage the job | 200 `{id,status:"awaiting_confirm"}` (nothing queued) · 400 unsupported suffix / invalid `output_name` · **409 `no_printer_profile`** · 413 larger than `MAX_UPLOAD_MB` (from `Content-Length` or the streaming count) · archives: `ArchiveError.status`, 400 or 413 |
+| POST | `/api/upload` | multipart `file` (`.stl` `.3mf` `.obj` `.zip`) + optional `output_name`, form field `support_fins` ignored → stage the job. A zip of several models also returns `jobs` | 200 `{id,status:"awaiting_confirm"}` (nothing queued) · 400 unsupported suffix / invalid `output_name` · **409 `no_printer_profile`** · 413 larger than `MAX_UPLOAD_MB` (from `Content-Length`, the streaming count, or the combined uncompressed models in a zip) · archives: `ArchiveError.status`, 400 or 413 |
 | GET | `/api/jobs` | job list, newest first (every `job.json` that parses) | 200 |
 | GET | `/api/jobs/{jid}` | one job: status, stats, error, `threemf`, `archive`, and for a finned job `original`, `fins`, `support_fins` | 200 · 404 (`jid` must be 12 lowercase hex) |
 | GET | `/api/jobs/{jid}/gcode` | download the sliced gcode | 200 file · 409 `not sliced yet` · 404 |
@@ -72,6 +72,17 @@ A pairing is a complete statement about a printer, not a patch: a slot the body 
 `/api/upload` calls `require_machine()` **before** creating the job directory, so a 409 leaves nothing
 on disk (`main.py:997`). `output_name` rules: no path separators, not a Windows reserved device name,
 at most 60 characters, `[A-Za-z0-9 ._-]` only (`_validated_output_name`, `main.py:891`).
+
+A `.zip` is extracted fail-closed. Every printable member (`.stl`, `.3mf`, `.obj`, any case) becomes
+its own `awaiting_confirm` job; non-models are skipped, not staged. Nothing is queued. One model keeps
+today's body (no `jobs` key) and an unsuffixed `output_name`. Several models add `jobs`: the same N
+result objects, including the first, with no nested `jobs` and no `queue_position`. Names are the
+explicit `output_name` or the member stem, plus `-01`, `-02`, …, truncated so the result is at most 60
+characters. The original zip is kept only on the first job (`upload/<zip name>`); each job stores its
+own model copy, `model_bytes`, and `archive.member`. `upload_bytes` is the zip size on every job.
+3MF members are matched in that same order; each job's pins and snapshot are from its own turn, and
+the dashboard selection ends on the last 3MF. `MAX_UPLOAD_MB` bounds the upload and the combined
+uncompressed size of the extracted models. Confirm each job with `POST /api/jobs/{jid}/slice`.
 
 A job object (`GET /api/jobs`, `GET /api/jobs/{jid}` and the SSE stream) also carries the slicing
 decisions: `auto_orient`, `auto_orient_used` (true when orient actually ran, e.g. because a shrink
