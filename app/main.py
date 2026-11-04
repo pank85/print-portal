@@ -44,6 +44,7 @@ import threading
 import tempfile
 import time
 import uuid
+import zipfile
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1951,9 +1952,16 @@ def api_confirm_slice(jid: str, body: dict | None = None):
     return {"id": jid, "status": "queued", "queue_position": job_queue.qsize()}
 
 
+CORNER_VIEWS = ["front_left", "front_right", "rear_left", "rear_right"]
+SHOT_VIEWS = {
+    "front_left", "front_right", "rear_left", "rear_right",
+    "back_left", "back_right", "front", "side",
+}
+
+
 @app.get("/api/jobs/{jid}/preview")
-def api_preview(jid: str):
-    """Geometry of the job's finned 3MF, or still pictures when that mesh is too large."""
+def api_preview(jid: str, mode: str | None = None):
+    """Screenshots from the 4 bed corners, or scene geometry when requested."""
     with STAGE_LOCK:
         job = read_job(jid)
         if job.get("kind") == "reslice":
@@ -1981,22 +1989,32 @@ def api_preview(jid: str):
     if size > shot.SHOT_MAX_BYTES:
         raise HTTPException(
             409, f"preview unavailable: {name} is {size} bytes; the picture cap is {shot.SHOT_MAX_BYTES}")
-    if size > preview.MAX_BYTES:
-        return {"mode": "shots", "views": ["front", "side"], "job": jid,
-                "bytes": size, "fins": job.get("fins"), "original": job.get("original")}
     try:
-        scene = preview.read_scene(path)
-    except preview.PreviewError as exc:
-        raise HTTPException(409, f"preview unavailable: {exc}") from exc
-    return {"job": jid, "mode": "scene", **scene, "fins": job.get("fins"),
-            "original": job.get("original")}
+        with zipfile.ZipFile(path) as archive:
+            if "3D/3dmodel.model" not in archive.namelist():
+                raise HTTPException(409, f"preview unavailable: {name} is not a readable 3MF archive")
+    except (OSError, zipfile.BadZipFile, KeyError) as exc:
+        raise HTTPException(409, f"preview unavailable: {name} is not a readable 3MF archive") from exc
+    if mode == "scene":
+        if size > preview.MAX_BYTES:
+            return {"mode": "shots", "views": CORNER_VIEWS, "job": jid,
+                    "bytes": size, "fins": job.get("fins"), "original": job.get("original")}
+        try:
+            scene = preview.read_scene(path)
+        except preview.PreviewError as exc:
+            raise HTTPException(409, f"preview unavailable: {exc}") from exc
+        return {"job": jid, "mode": "scene", **scene, "fins": job.get("fins"),
+                "original": job.get("original")}
+    return {"mode": "shots", "views": CORNER_VIEWS, "job": jid,
+            "bytes": size, "fins": job.get("fins"), "original": job.get("original")}
 
 
 @app.get("/api/jobs/{jid}/preview-shot")
-def api_preview_shot(jid: str, view: str = "front"):
-    """One cached still picture. ``view`` is ``front`` or ``side``."""
-    if view not in ("front", "side"):
-        raise HTTPException(400, "view must be front or side")
+def api_preview_shot(jid: str, view: str = "front_left"):
+    """One cached still picture. ``view`` is one of the four bed corners or legacy views."""
+    view_norm = {"back_right": "rear_right", "back_left": "rear_left"}.get(view, view)
+    if view_norm not in SHOT_VIEWS:
+        raise HTTPException(400, "view must be front_left, front_right, rear_left, rear_right, front, or side")
     job = read_job(jid)
     if job.get("kind") == "reslice" or not job.get("support_fins"):
         raise HTTPException(409, "preview unavailable: still pictures only support legacy fin jobs")
