@@ -47,3 +47,6 @@ def test_render_paints_the_fins_green(tmp_path: Path, monkeypatch):
     assert out["front"].read_bytes().startswith(b"\x89PNG")
     assert bytes(shot._FINS) in seen["rgb"]
     assert out["side"].stat().st_size > 100
+    for corner in ("front_left", "front_right", "rear_right", "rear_left"):
+        assert out[corner].stat().st_size > 100
+        assert out[corner].read_bytes().startswith(b"\x89PNG")

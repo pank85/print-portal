@@ -679,11 +679,21 @@ def test_preview_of_a_staged_job_returns_the_scene(client, monkeypatch, cube_stl
     assert response.status_code == 200
     body = response.json()
     assert body["job"] == jid
-    assert body["unit"] == "millimeter"
-    assert {obj["role"] for obj in body["objects"]} == {"part", "supports"}
+    assert body["mode"] == "shots"
+    assert body["views"] == ["front_left", "front_right", "rear_left", "rear_right"]
     assert body["original"] == "cube.stl"
     assert body["fins"]["stats"]["tines"] == 2
-    assert body["bbox"]["size"] == [10.0, 10.0, 0.0]
+
+    # Requesting explicit scene mode still returns the geometry scene
+    scene_res = client.get(f"/api/jobs/{jid}/preview?mode=scene")
+    assert scene_res.status_code == 200
+    scene_body = scene_res.json()
+    assert scene_body["job"] == jid
+    assert scene_body["unit"] == "millimeter"
+    assert {obj["role"] for obj in scene_body["objects"]} == {"part", "supports"}
+    assert scene_body["original"] == "cube.stl"
+    assert scene_body["fins"]["stats"]["tines"] == 2
+    assert scene_body["bbox"]["size"] == [10.0, 10.0, 0.0]
 
 
 def test_preview_of_a_queued_job_is_a_409(client, cube_stl):
@@ -716,16 +726,14 @@ def test_an_oversized_finned_mesh_returns_pictures(client, jobs_dir, cube_stl, f
     assert listed.status_code == 200, listed.text
     body = listed.json()
     assert body["mode"] == "shots"
-    assert body["views"] == ["front", "side"]
+    assert body["views"] == ["front_left", "front_right", "rear_left", "rear_right"]
     assert body["bytes"] == (jobs_dir / jid / "upload" / "fins-cube.3mf").stat().st_size
 
-    picture = client.get(f"/api/jobs/{jid}/preview-shot?view=front")
-    assert picture.status_code == 200
-    assert picture.headers["content-type"].startswith("image/png")
-    assert picture.content.startswith(b"\x89PNG")
-    again = client.get(f"/api/jobs/{jid}/preview-shot?view=side")
-    assert again.status_code == 200
-    assert again.content.startswith(b"\x89PNG")
+    for view in ("front_left", "front_right", "rear_left", "rear_right", "front", "side"):
+        picture = client.get(f"/api/jobs/{jid}/preview-shot?view={view}")
+        assert picture.status_code == 200
+        assert picture.headers["content-type"].startswith("image/png")
+        assert picture.content.startswith(b"\x89PNG")
 
 
 def test_preview_of_an_unknown_job_is_404(client):
