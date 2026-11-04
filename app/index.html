@@ -321,11 +321,14 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 .btn[aria-busy="true"]{ cursor:progress; }
 .icon{ width:18px; height:18px; flex:0 0 auto; }
 
-#resliceSettings .preview-scale, #previewScale { display:flex; flex-wrap:wrap; gap:var(--space-2); align-items:end; }
-#previewScale[hidden], #resliceSettings[hidden] { display:none; }
-#resliceSettings label, #previewScale label { display:grid; gap:var(--space-1); }
+#resliceSettings .preview-scale { display:flex; flex-wrap:wrap; gap:var(--space-2); align-items:end; }
+#resliceSettings[hidden] { display:none; }
+#resliceSettings label { display:grid; gap:var(--space-1); }
 #resliceSettings input[type="checkbox"] { min-width:20px; min-height:20px; }
-#previewScale input { width:7rem; min-height:var(--target-min); font-size:var(--text-base); }
+#printOptions[hidden]{ display:none; }
+#resizeOptions{ display:grid; gap:var(--space-3); grid-template-columns:repeat(3,minmax(0,1fr)); }
+@media (max-width:500px){ #resizeOptions{ grid-template-columns:1fr; } }
+.check-label{ display:inline-flex; align-items:center; gap:var(--space-2); min-height:var(--target-min); cursor:pointer; }
 
 /* ---------- drop zone ---------- */
 #drop.is-busy{ opacity:.6; cursor:progress; }
@@ -581,37 +584,6 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
               <select id="selFilament"></select>
             </div>
           </div>
-          <div id="profOptions">
-            <div class="field">
-              <label for="optSupports">Supports</label>
-              <select id="optSupports">
-                <option value="no">No</option>
-                <option value="yes">Yes</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="optBrim">Brim</label>
-              <select id="optBrim">
-                <option value="no">No</option>
-                <option value="yes">Yes</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="optAutoOrient">Auto-orient</label>
-              <select id="optAutoOrient">
-                <option value="no">No</option>
-                <option value="yes">Yes</option>
-              </select>
-            </div>
-            <div class="field">
-              <label for="optShrinkFit">Shrink to fit</label>
-              <select id="optShrinkFit">
-                <option value="no">No</option>
-                <option value="yes">Yes</option>
-              </select>
-            </div>
-            <p class="hint" id="fitHint">Shrink to fit scales the model by one uniform factor to fit the selected printer's bed; it also orients it. Auto-orient alone is safe for a model that already fits.</p>
-          </div>
           <div class="acts">
             <label class="btn" for="profFile">
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -633,10 +605,6 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
           <p class="hint" id="outputNameHint">Saved as <span class="mono">&lt;name&gt;.gcode</span> — letters, digits, spaces, dot, dash, underscore. Empty uses the model name.</p>
         </div>
         <label for="file" class="sr-only">Model file to slice</label>
-        <div class="field">
-          <label><input id="supportFins" name="support_fins" type="checkbox" value="true"> Add designed-in support fins (off by default)</label>
-          <p class="hint">Runs the bundled support-fins CLI locally on the upload; leaves the original file untouched.</p>
-        </div>
         <input id="file" type="file" accept=".stl,.3mf,.obj,.zip" hidden>
         <div id="drop" role="button" tabindex="0" aria-disabled="false">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
@@ -676,10 +644,6 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
               Preview fins
             </button>
-            <button type="button" class="btn btn-primary" id="uploadLatestSlice"
-                    data-act="slice" aria-label="Slice the finned model" hidden>
-              Slice it
-            </button>
             <button type="button" class="btn" id="uploadLatestReslice" data-act="reslice" hidden>Reslice…</button>
             <button type="button" class="btn btn-danger" id="uploadLatestDelete"
                     data-act="delete" aria-label="Delete the last job">
@@ -687,6 +651,63 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M3 6h18"/><path d="M8 6V4h8v2"/><path d="m6 6 1 14h10l1-14"/></svg>
               Delete
             </button>
+          </div>
+        </div>
+        <div class="subgroup" id="printOptions" role="group" aria-labelledby="printOptionsTitle" hidden>
+          <h3 id="printOptionsTitle">Print options</h3>
+          <p class="hint" id="printOptionsJob"></p>
+          <div id="profOptions">
+            <div class="field">
+              <label for="optSupports">Supports</label>
+              <select id="optSupports">
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="optBrim">Brim</label>
+              <select id="optBrim">
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="optAutoOrient">Auto-orient</label>
+              <select id="optAutoOrient">
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+              </select>
+            </div>
+            <div class="field">
+              <label for="optShrinkFit">Shrink to fit</label>
+              <select id="optShrinkFit">
+                <option value="no">No</option>
+                <option value="yes">Yes</option>
+              </select>
+            </div>
+            <p class="hint" id="fitHint">Shrink to fit scales the model by one uniform factor to fit the selected printer's bed; it also orients it. Auto-orient alone is safe for a model that already fits. Support fins cannot shrink or auto-orient.</p>
+          </div>
+          <div class="field">
+            <label for="supportFins" class="check-label"><input id="supportFins" name="support_fins" type="checkbox" value="true"> Use support fins</label>
+            <p class="hint">Runs the bundled support-fins CLI locally on the upload; leaves the original file untouched.</p>
+          </div>
+          <div id="resizeOptions">
+            <div class="field">
+              <label for="maxHeight">Max height (mm)</label>
+              <input id="maxHeight" type="number" inputmode="decimal" step="0.1" min="0.1" max="10000" placeholder="Unset">
+            </div>
+            <div class="field">
+              <label for="maxWidth">Max width (mm)</label>
+              <input id="maxWidth" type="number" inputmode="decimal" step="0.1" min="0.1" max="10000" placeholder="Unset">
+            </div>
+            <div class="field">
+              <label for="maxLength">Max length (mm)</label>
+              <input id="maxLength" type="number" inputmode="decimal" step="0.1" min="0.1" max="10000" placeholder="Unset">
+            </div>
+          </div>
+          <p id="printOptionsError" class="err" role="alert" hidden></p>
+          <div class="job-actions">
+            <button type="button" class="btn btn-primary" id="printOptionsSlice">Slice it</button>
           </div>
         </div>
       </section>
@@ -889,16 +910,9 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
       <label>Filament <select id="resliceFilament"></select></label>
     </div>
     <p id="reslicePresetError" class="err" role="status"></p>
-    <div class="preview-scale">
-      <label><input type="checkbox" id="resliceSupports"> Supports</label>
-      <label><input type="checkbox" id="resliceBrim"> Brim</label>
-      <label><input type="checkbox" id="resliceOrient"> Auto-orient</label>
-      <label><input type="checkbox" id="resliceFit"> Shrink to fit</label>
-    </div>
-    <p class="hint">Manual size is applied before optional automatic fit. Resizing a finned model scales its fins too. Auto-fit is unavailable for 3MF; fin models cannot auto-orient.</p>
     <button type="button" class="btn" id="resliceCopy">Use current dashboard settings</button>
     <button type="button" class="btn" id="resliceSave">Save settings</button>
-    <p class="hint">Closing saves settings. Unapplied dimensions are kept only in this browser tab; apply them to save the size.</p>
+    <p class="hint">Closing saves settings.</p>
     <button type="button" class="btn" id="resliceReload" hidden>Reload draft revision</button>
   </div>
   <div class="preview-stage">
@@ -908,22 +922,12 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
     <p id="previewFallback" hidden></p>
   </div>
   <p id="previewStats" class="mono"></p>
-  <div id="previewScale" class="preview-scale">
-    <span class="mono" id="previewSizeNow"></span>
-    <label>Height <input type="number" id="scaleHeight" step="0.1" min="0.1"></label>
-    <label>Width <input type="number" id="scaleWidth" step="0.1" min="0.1"></label>
-    <label>Length <input type="number" id="scaleLength" step="0.1" min="0.1"></label>
-    <button type="button" class="btn" id="scaleApply">Apply size</button>
-    <button type="button" class="btn" id="scaleReset" hidden>Reset size</button>
-    <span class="mono" id="previewSizeAfter"></span>
-  </div>
   <div id="previewLegend" class="preview-legend" role="group" aria-label="Objects in the preview"></div>
   <p id="previewError" class="err" role="alert" hidden></p>
   <p id="previewBusy" role="status" aria-live="polite" hidden></p>
   <div class="dialog-actions preview-actions">
     <button type="button" class="btn btn-danger" id="previewDiscard">Discard</button>
     <button type="button" class="btn" id="previewClose">Keep for later</button>
-    <button type="button" class="btn btn-primary" id="previewConfirm">Slice it</button>
   </div>
 </dialog>
 
@@ -1438,10 +1442,7 @@ async function upload(file) {
   fd.append("file", file);
   const name = ($("#outputName").value || "").trim();
   if (name) fd.append("output_name", name);
-  const fins = !!$("#supportFins")?.checked;
-  if (fins) fd.append("support_fins", "true");
-  /* the fins run happens on the server before anything is queued, so say what is happening */
-  toast(fins ? `Adding support fins: ${file.name}` : `Uploading: ${file.name}`);
+  toast(`Uploading: ${file.name}`);
   setUploadProgress(0, file.size);
   try {
     const j = await new Promise((resolve, reject) => {
@@ -1473,25 +1474,25 @@ async function upload(file) {
         toast(`Profile switched to ${printerName} / ${presetName("process", j.threemf.process) || "—"}`, 6000);
       }
     }
-    /* With fins the job stops here: staged, not queued. Do not open the preview —
-       Preview and Slice it on the card are the decision. Slicing is a click, not the upload. */
+    /* Every successful upload is staged (awaiting_confirm). Bind the print options panel.
+       Slicing is a click on the Slice it button in Print options. */
     if (j.status === "awaiting_confirm") {
       setUploadWait(null);
       setUploadLatest(j);
-      toast("Fins added. Preview them, or slice now.", 5000);
-      refresh();
-      const sliceBtn = $("#uploadLatestSlice");
-      if (sliceBtn && !sliceBtn.hidden) sliceBtn.focus();
+      setPrintOptions(j);
+      if (j.archive) {
+        const total = Math.max(1, (j.archive.candidates || []).length);
+        toast(`Slicing ${j.archive.member} (1 of ${total} model files)`, 5000);
+      }
+      await refresh();
+      if (printOptionsJobId === j.id && printOptionsJob && printOptionsJob.status === "awaiting_confirm") {
+        setPrintOptions(printOptionsJob);
+      }
+      const optSupports = $("#optSupports");
+      if (optSupports) optSupports.focus();
       return;
     }
-    setUploadWait({status: "queued", filename: file.name});
-    setUploadLatest({id: j.id, status: "queued", filename: file.name});
-    if (j.archive) {
-      const total = Math.max(1, (j.archive.candidates || []).length);
-      toast(`Slicing ${j.archive.member} (1 of ${total} model files)`, 5000);
-    } else {
-      toast("Queued for slice");
-    }
+    setUploadLatest(j);
     refresh();
   } catch (e) {
     toast("Error: " + e.message, 5000);
@@ -1558,7 +1559,7 @@ function onJobAction(ev) {
   else if (btn.dataset.act === "delete") del(btn.dataset.ref);
   else if (btn.dataset.act === "preview") openPreview(btn.dataset.ref);
   else if (btn.dataset.act === "reslice") createReslice(btn.dataset.ref, btn);
-  else if (btn.dataset.act === "slice") confirmSlice(btn.dataset.ref);
+  else if (btn.dataset.act === "options") openJobOptions(btn.dataset.ref);
 }
 
 let fromLayerState = { jid: null, layers: [], printerLayer: null, trigger: null };
@@ -1804,13 +1805,13 @@ function renderJobRow(j) {
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
             Gcode
           </a>` : "";
-  /* a staged job has nothing to print yet, but it can still be reviewed or queued from here */
-  const staged = j.kind === "reslice" && j.status === "awaiting_confirm" ? `<button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">Resume reslice</button>` : j.status === "awaiting_confirm" && !j.error ? `
+  /* a staged job has nothing to print yet, but it can still be reviewed or configured from here */
+  const staged = j.status === "awaiting_confirm" && !j.error ? `
           <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">
-            Preview fins
+            ${j.kind === "reslice" ? "Resume reslice" : "Preview fins"}
           </button>
-          <button type="button" class="btn btn-primary" data-act="slice" data-ref="${esc(j.id)}">
-            Slice it
+          <button type="button" class="btn" data-act="options" data-ref="${esc(j.id)}">
+            Print options
           </button>` : "";
   return `<article class="job" id="job-${esc(j.id)}">
         <div>${renderJobBody(j)}</div>
@@ -1834,7 +1835,7 @@ function setUploadLatest(job) {
   const box = $("#uploadLatest"), body = $("#uploadLatestBody"),
         print = $("#uploadLatestPrint"), gcode = $("#uploadLatestGcode"),
         fromLayer = $("#uploadLatestFromLayer"),
-        preview = $("#uploadLatestPreview"), slice = $("#uploadLatestSlice"),
+        preview = $("#uploadLatestPreview"),
         remove = $("#uploadLatestDelete");
   if (!job) { box.hidden = true; return; }
   box.hidden = false;
@@ -1857,11 +1858,6 @@ function setUploadLatest(job) {
   preview.setAttribute("aria-label", `Preview the support fins on ${name}`);
   preview.textContent = job.kind === "reslice" ? "Resume reslice" : "Preview fins";
   if (job.kind === "reslice") preview.setAttribute("aria-label", `Resume reslice of ${name}`);
-  /* reslice still has to open the draft; a finned upload can be sliced without the preview */
-  const sliceable = staged && job.kind !== "reslice";
-  slice.hidden = !sliceable;
-  slice.dataset.ref = sliceable ? job.id : "";
-  slice.setAttribute("aria-label", `Slice ${name}`);
   const reslice = $("#uploadLatestReslice");
   reslice.hidden = !job.reslice?.eligible;
   reslice.dataset.ref = job.id;
@@ -1876,11 +1872,22 @@ async function refresh() {
   try {
     const jobs = await (await fetch("/api/jobs")).json();
     if (!Array.isArray(jobs)) throw new Error(jobs.detail || "unexpected response");
+    latestJobs = jobs;
     count.textContent = String(jobs.length);
     delAll.disabled = jobs.length === 0;
     delAll.setAttribute("aria-disabled", jobs.length === 0 ? "true" : "false");
     setUploadWait(jobs[0]);
     setUploadLatest(jobs[0]);
+    if (printOptionsJobId) {
+      const bound = jobs.find(j => j.id === printOptionsJobId);
+      if (!bound || bound.status !== "awaiting_confirm" || bound.error) {
+        $("#printOptions").hidden = true;
+        printOptionsJobId = null;
+        printOptionsJob = null;
+      } else {
+        printOptionsJob = bound;
+      }
+    }
     if (!jobs.length) {
       box.innerHTML = `<p class="empty-line">No jobs yet. Drop a model above to slice it.</p>`;
       return;
@@ -1907,10 +1914,13 @@ const PREVIEW_COLOUR = {
 };
 const PREVIEW_TRIANGLE_BUDGET = 200000;   // one drag frame stays sane on a big mesh
 const PREVIEW_KEY_STEP = 0.12;
+let printOptionsJobId = null;
+let printOptionsJob = null;
+let supportFinsAvailable = true;
+let supportFinsUnavailableReason = "";
+let latestJobs = [];
 let previewReturnFocus = null;
-let previewAxis = null;
 let previewBusy = false, savedResliceValues = null;
-const pendingDimensions = new Map();
 const reslicePending = new Set(), resliceTokens = new Map();
 let previewJob = null;          // {id, filename, ...} of the staged job
 let previewScene = null;        // the last GET /preview payload
@@ -1971,11 +1981,10 @@ function previewFallbackText(note) {
 /* a preview failure is not a slicing failure: the staged job stays queueable */
 function showPreviewError(message) {
   const err = $("#previewError");
-  err.textContent = `Could not load the preview: ${message}. The job is still staged — Slice it queues the model as uploaded.`;
+  err.textContent = `Could not load the preview: ${message}. The job is still staged.`;
   err.hidden = false;
   $("#previewHint").textContent = "The model could not be drawn here; nothing was lost.";
-  previewFallbackText("No preview available. Slice it queues the finned model exactly as it was uploaded.");
-  $("#previewConfirm").disabled = false;
+  previewFallbackText("No preview available.");
 }
 
 function drawPreview() {
@@ -1983,7 +1992,7 @@ function drawPreview() {
   const canvas = $("#previewCanvas");
   const ctx = canvas.getContext ? canvas.getContext("2d") : null;
   if (!ctx) {
-    previewFallbackText("This browser cannot draw the model. Slice it queues it as uploaded.");
+    previewFallbackText("This browser cannot draw the model.");
     return;
   }
   /* DPR-aware: the backing store is device pixels, the drawing stays in CSS pixels */
@@ -2030,7 +2039,7 @@ function drawPreview() {
     rotated.set(id, out);
   }
   if (!Number.isFinite(minX) || maxX - minX <= 0 || maxY - minY <= 0) {
-    previewFallbackText("This model has no drawable surfaces. Slice it queues it as uploaded.");
+    previewFallbackText("This model has no drawable surfaces.");
     return;
   }
   /* fit the whole body once, then let zoom scale that fit */
@@ -2167,12 +2176,9 @@ function showShotPreview(id, p) {
     fig.append(img, cap);
     box.append(fig);
   }
-  const scale = document.getElementById("previewScale");
-  if (scale) scale.hidden = true;
   $("#previewHint").textContent = "Still pictures. Green lines are the fins. The slice uses the full file.";
   const mb = Math.round((p.bytes || 0) / 1e6);
   $("#previewStats").textContent = mb ? `${mb} MB · pictures, not a rotatable model` : "Pictures, not a rotatable model";
-  $("#previewConfirm").disabled = false;
 }
 
 
@@ -2194,8 +2200,11 @@ async function createReslice(id, button) {
     if (!r.ok) throw new Error(job.detail || r.statusText);
     resliceTokens.delete(id);
     await refresh();
-    if (job.status === "awaiting_confirm") await openPreview(job.id, button);
-    else toast("Reslice already queued or completed");
+    if (job.status === "awaiting_confirm") {
+      setPrintOptions(job);
+      const optSupports = $("#optSupports");
+      if (optSupports) optSupports.focus();
+    } else toast("Reslice already queued or completed");
   } catch (e) { toast("Could not create reslice: " + e.message + ". Retry to use the same request.", 8000); }
   finally { reslicePending.delete(id); button.disabled = false; button.textContent = "Reslice…"; }
 }
@@ -2212,15 +2221,10 @@ async function withPreviewBusy(label, action) {
   }
 }
 
-function rememberDimensions() {
-  if (previewJob?.kind !== "reslice") return;
-  pendingDimensions.set(previewJob.id, {axis: previewAxis, values: ["scaleHeight", "scaleWidth", "scaleLength"].map(id => document.getElementById(id).value)});
-}
-
 function resliceValues() {
   const profile = {};
   for (const [key, selector] of [["machine","#resliceMachine"],["process","#resliceProcess"],["filament","#resliceFilament"]]) profile[key] = $(selector).value;
-  return {profile, options:{supports:$("#resliceSupports").checked, brim:$("#resliceBrim").checked, auto_orient:$("#resliceOrient").checked, shrink_to_fit:$("#resliceFit").checked}};
+  return {profile, options:{supports:$("#optSupports").value === "yes", brim:$("#optBrim").value === "yes", auto_orient:$("#optAutoOrient").value === "yes", shrink_to_fit:$("#optShrinkFit").value === "yes"}};
 }
 
 async function renderResliceSettings(snapshot) {
@@ -2234,11 +2238,6 @@ async function renderResliceSettings(snapshot) {
     $(selector).innerHTML = `<option value="">Select ${key}${current && !found ? " (missing or incompatible)" : ""}</option>` + rows.map(row => `<option value="${esc(row.rel)}"${row.rel === current ? " selected" : ""}>${esc(row.name)}</option>`).join("");
     if (!found) missing.push(key);
   }
-  const opts = snapshot.options || {};
-  for (const [key, selector] of [["supports","#resliceSupports"],["brim","#resliceBrim"],["auto_orient","#resliceOrient"],["shrink_to_fit","#resliceFit"]]) $(selector).checked = !!opts[key];
-  const fit = $("#resliceFit");
-  const fitUnsupported = previewJob?.support_fins || /\.3mf$/i.test(previewJob?.filename || "");
-  fit.disabled = !!fitUnsupported && !fit.checked;
   $("#reslicePresetError").textContent = missing.length ? `Select valid ${missing.join(", ")} before slicing.` : "";
 }
 
@@ -2256,20 +2255,6 @@ async function saveResliceSettings() {
   $("#resliceReload").hidden = true; $("#reslicePresetError").textContent = "";
 }
 
-async function resetPreviewScale() {
-  if (!previewJob || previewJob.kind !== "reslice") return;
-  const button = $("#scaleReset"); button.disabled = true;
-  try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(previewJob.id)}/scale/reset`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({revision:previewJob.revision})});
-    const result = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(resliceResponseError(r, result));
-    previewJob.revision = result.revision;
-    await reloadPreviewScene();
-    pendingDimensions.delete(previewJob.id);
-  } catch (e) { previewActionError("Reset failed: " + e.message); }
-  finally { button.disabled = false; }
-}
-
 function resliceResponseError(r, result) {
   if (r.status === 409 && previewJob?.kind === "reslice") {
     $("#resliceReload").hidden = false;
@@ -2278,15 +2263,6 @@ function resliceResponseError(r, result) {
   return result.detail || r.statusText;
 }
 function previewActionError(message) { $("#previewError").textContent = message; $("#previewError").hidden = false; }
-async function reloadPreviewScene() {
-  const r = await fetch("/api/jobs/" + encodeURIComponent(previewJob.id) + "/preview");
-  const scene = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(scene.detail || r.statusText);
-  previewScene = scene; renderPreviewChrome(scene); drawPreview();
-  $("#previewSizeNow").textContent = "current: " + (scene.bbox?.size || []).map(fmtMm).join(" × ") + " mm";
-  $("#previewSizeAfter").textContent = `Manual scale: ${Number(scene.manual_scale || 1).toFixed(3)}× baseline`;
-  previewAxis = null; ["scaleHeight","scaleWidth","scaleLength"].forEach(k => {document.getElementById(k).value = "";});
-}
 
 async function openPreview(id, returnFocus = document.activeElement) {
   if (!id || previewBusy) return;
@@ -2295,11 +2271,8 @@ async function openPreview(id, returnFocus = document.activeElement) {
         legend = $("#previewLegend"), stats = $("#previewStats"), fallback = $("#previewFallback");
   previewReturnFocus = returnFocus;
   previewJob = { id };
-  previewAxis = null;
   $("#resliceSettings").hidden = true;
-  $("#scaleReset").hidden = true;
   $("#previewTitle").textContent = "Support fins preview";
-  $("#previewConfirm").textContent = "Slice it";
   previewScene = null;
   previewDrag = null;
   previewHidden = new Set();
@@ -2311,9 +2284,6 @@ async function openPreview(id, returnFocus = document.activeElement) {
   canvas.hidden = false;
   const shots = document.getElementById("previewShots");
   if (shots) { shots.hidden = true; shots.replaceChildren(); }
-  const scale = document.getElementById("previewScale");
-  if (scale) scale.hidden = false;
-  $("#previewConfirm").disabled = false;
   $("#previewHint").textContent = "Loading the finned model…";
   /* showModal first: only then does the canvas have a box to measure */
   if (typeof dlg.showModal === "function") { if (!dlg.open) dlg.showModal(); }
@@ -2326,15 +2296,13 @@ async function openPreview(id, returnFocus = document.activeElement) {
     if (job.kind === "reslice") {
       $("#resliceSettings").hidden = false;
       $("#previewTitle").textContent = "Reslice job";
-      $("#previewConfirm").textContent = "Slice new job";
       $("#resliceSource").textContent = `Reslice of ${job.source_job_id}. Closing keeps this draft.`;
-      $("#scaleReset").hidden = false;
+      if (job.status === "awaiting_confirm") {
+        setPrintOptions(job);
+      }
       await renderResliceSettings(job.profile_snapshot || {});
       savedResliceValues = JSON.stringify(resliceValues());
       $("#resliceReload").hidden = true;
-      const pending = pendingDimensions.get(id);
-      ["scaleHeight", "scaleWidth", "scaleLength"].forEach((key, i) => { document.getElementById(key).value = pending?.values[i] || ""; });
-      previewAxis = pending?.axis || null;
     }
     const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/preview`);
     const p = await r.json().catch(() => ({}));
@@ -2346,17 +2314,10 @@ async function openPreview(id, returnFocus = document.activeElement) {
       ? "Drag to orbit, scroll to zoom, arrow keys when the view has focus. Click a name to hide or show that object."
       : "Arrow keys orbit, + and − zoom. Click a name to hide or show that object.";
     renderPreviewChrome(p);
-    if (previewJob.kind === "reslice") $("#previewSizeAfter").textContent = `Manual scale: ${Number(p.manual_scale || 1).toFixed(3)}× baseline`;
-    const sz = (p.bbox && p.bbox.size) || [];
-    const now = document.getElementById("previewSizeNow");
-    if (now) now.textContent = "current: " + sz.map(v=>Math.round(v*10)/10).join(" × ") + " mm";
-    if (previewJob.kind === "reslice") $("#previewSizeAfter").textContent += ` · baseline: ${sz.map(v => fmtMm(v / (p.manual_scale || 1))).join(" × ")} mm`;
     drawPreview();
   } catch (e) {
     showPreviewError(e.message);
-    $("#previewScale").hidden = true;
-    if (!previewJob?.status) $("#previewConfirm").disabled = true;
-    if (previewJob?.kind === "reslice") $("#previewFallback").textContent = "Preview and resize unavailable; settings can still be saved and sliced.";
+    if (previewJob?.kind === "reslice") $("#previewFallback").textContent = "Preview unavailable; settings can still be saved.";
   }
   }).then(() => { if ($("#previewDlg").open && !$("#previewCanvas").hidden) $("#previewCanvas").focus(); });
 }
@@ -2378,7 +2339,6 @@ async function keepPreview() {
     try {
       if (previewJob?.kind === "reslice") {
         if (JSON.stringify(resliceValues()) !== savedResliceValues) await saveResliceSettings();
-        rememberDimensions();
       }
       closePreview();
     } catch (e) { previewActionError("Draft not closed: " + e.message); }
@@ -2406,7 +2366,6 @@ async function discardPreview() {
       const j = await r.json().catch(() => ({}));
       throw new Error(j.detail || r.statusText);
     }
-    pendingDimensions.delete(job.id);
     closePreview();
     toast("Staged job discarded");
   } catch (e) {
@@ -2415,35 +2374,259 @@ async function discardPreview() {
   refresh();
 }
 
-async function confirmSlice(jobId) {
-  const id = jobId || (previewJob && previewJob.id);
+async function initSupportFins() {
+  try {
+    const r = await fetch("/api/support-fins");
+    if (!r.ok) return;
+    const j = await r.json();
+    supportFinsAvailable = !!j.available;
+    supportFinsUnavailableReason = j.reason || "support fins unavailable";
+    const cb = $("#supportFins");
+    if (cb && !j.available) {
+      cb.disabled = true;
+      cb.checked = false;
+      const hint = cb.closest(".field")?.querySelector(".hint") || (cb.parentElement && cb.parentElement.querySelector(".hint"));
+      if (hint) hint.textContent = supportFinsUnavailableReason;
+    }
+  } catch (e) { /* leave enabled by default */ }
+}
+
+function applyPrintOptionsConstraints() {
+  const job = printOptionsJob;
+  const is3mf = /\.3mf$/i.test(job?.filename || "");
+  const finsCb = $("#supportFins");
+  const finsChecked = !!finsCb?.checked;
+  const optOrient = $("#optAutoOrient");
+  const optShrink = $("#optShrinkFit");
+
+  if (finsChecked) {
+    if (optOrient) { optOrient.value = "no"; optOrient.disabled = true; }
+    if (optShrink) { optShrink.value = "no"; optShrink.disabled = true; }
+  } else {
+    if (optOrient) { optOrient.disabled = false; }
+    if (optShrink) {
+      if (is3mf) {
+        optShrink.value = "no";
+        optShrink.disabled = true;
+      } else {
+        optShrink.disabled = false;
+      }
+    }
+  }
+}
+
+function setPrintOptions(job) {
+  const panel = $("#printOptions");
+  if (!panel) return;
+  if (!job || job.status !== "awaiting_confirm" || job.error) {
+    panel.hidden = true;
+    printOptionsJobId = null;
+    printOptionsJob = null;
+    return;
+  }
+  if (printOptionsJobId !== job.id) {
+    const h = $("#maxHeight"), w = $("#maxWidth"), l = $("#maxLength");
+    if (h) h.value = "";
+    if (w) w.value = "";
+    if (l) l.value = "";
+    const err = $("#printOptionsError");
+    if (err) { err.hidden = true; err.textContent = ""; }
+  }
+  printOptionsJobId = job.id;
+  printOptionsJob = job;
+  panel.hidden = false;
+  const jobLabel = $("#printOptionsJob");
+  if (jobLabel) jobLabel.textContent = job.filename || "";
+
+  const opts = (job.profile_snapshot && job.profile_snapshot.options) || profileOptions || {};
+  const optSupports = $("#optSupports");
+  if (optSupports) optSupports.value = opts.supports ? "yes" : "no";
+  const optBrim = $("#optBrim");
+  if (optBrim) optBrim.value = opts.brim ? "yes" : "no";
+  const optOrient = $("#optAutoOrient");
+  if (optOrient) optOrient.value = opts.auto_orient !== false ? "yes" : "no";
+  const optShrink = $("#optShrinkFit");
+  if (optShrink) optShrink.value = opts.shrink_to_fit ? "yes" : "no";
+
+  const cb = $("#supportFins");
+  if (cb) {
+    if (job.fins) {
+      cb.checked = true;
+      cb.disabled = true;
+    } else if (!supportFinsAvailable) {
+      cb.checked = false;
+      cb.disabled = true;
+      const hint = cb.closest(".field")?.querySelector(".hint") || (cb.parentElement && cb.parentElement.querySelector(".hint"));
+      if (hint && supportFinsUnavailableReason) hint.textContent = supportFinsUnavailableReason;
+    } else {
+      cb.checked = !!job.support_fins;
+      cb.disabled = false;
+    }
+  }
+
+  applyPrintOptionsConstraints();
+}
+
+function openJobOptions(id) {
   if (!id) return;
-  const btn = $("#previewConfirm");
-  if (btn.dataset.busy === "true") return;    // a double click must not queue twice
+  const job = latestJobs.find(j => j.id === id);
+  if (job) {
+    setPrintOptions(job);
+    const optSupports = $("#optSupports");
+    if (optSupports) optSupports.focus();
+  } else {
+    fetch(`/api/jobs/${encodeURIComponent(id)}`)
+      .then(r => r.json())
+      .then(j => {
+        if (j.id) {
+          setPrintOptions(j);
+          const optSupports = $("#optSupports");
+          if (optSupports) optSupports.focus();
+        }
+      })
+      .catch(() => {});
+  }
+}
+
+async function slicePrintOptions() {
+  const btn = $("#printOptionsSlice");
+  if (!btn || btn.dataset.busy === "true") return;
+  if (!printOptionsJobId || !printOptionsJob) return;
+  const job = printOptionsJob;
+  const errEl = $("#printOptionsError");
+  if (errEl) { errEl.hidden = true; errEl.textContent = ""; }
+
+  const hVal = ($("#maxHeight")?.value || "").trim();
+  const wVal = ($("#maxWidth")?.value || "").trim();
+  const lVal = ($("#maxLength")?.value || "").trim();
+  const resize = {};
+  if (hVal) resize.max_height = Number(hVal);
+  if (wVal) resize.max_width = Number(wVal);
+  if (lVal) resize.max_length = Number(lVal);
+
+  for (const [k, v] of Object.entries(resize)) {
+    if (!Number.isFinite(v) || v <= 0 || v > 10000) {
+      if (errEl) {
+        errEl.textContent = "Resize dimensions must be finite numbers between 0.1 and 10000 mm.";
+        errEl.hidden = false;
+      }
+      return;
+    }
+  }
+
+  const fins = !!$("#supportFins")?.checked;
+  const shrink = $("#optShrinkFit")?.value === "yes";
+  const orient = $("#optAutoOrient")?.value === "yes";
+  const supports = $("#optSupports")?.value === "yes";
+  const brim = $("#optBrim")?.value === "yes";
+  const is3mf = /\.3mf$/i.test(job.filename || "");
+
+  if (fins && shrink) {
+    if (errEl) {
+      errEl.textContent = "Support fins cannot be combined with shrink to fit.";
+      errEl.hidden = false;
+    }
+    return;
+  }
+  if (is3mf && shrink) {
+    if (errEl) {
+      errEl.textContent = "Shrink to fit is unavailable for 3MF models.";
+      errEl.hidden = false;
+    }
+    return;
+  }
+
+  const options = {
+    supports,
+    brim,
+    auto_orient: fins ? false : orient,
+    shrink_to_fit: fins ? false : shrink,
+  };
+
   btn.dataset.busy = "true";
   btn.disabled = true;
+
   try {
-    if (previewJob?.kind === "reslice" && previewAxis && document.getElementById(previewAxis)?.value) {
-      throw new Error("Apply the entered size or clear it before slicing.");
+    let sliceResult, sliceBody;
+    if (job.kind === "reslice") {
+      const isPreviewOpen = !!$("#previewDlg")?.open && previewJob && previewJob.id === job.id;
+      const patchBody = {
+        revision: isPreviewOpen && previewJob ? previewJob.revision : job.revision,
+        options,
+        pending_support_fins: fins,
+      };
+      if (isPreviewOpen) {
+        const profile = {
+          machine: $("#resliceMachine").value,
+          process: $("#resliceProcess").value,
+          filament: $("#resliceFilament").value,
+        };
+        const missing = Object.keys(profile).filter(k => !profile[k]);
+        if (missing.length) {
+          $("#reslicePresetError").textContent = `Select valid ${missing.join(", ")}.`;
+          throw new Error("Select all required presets");
+        }
+        patchBody.profile = profile;
+      }
+      const rPatch = await fetch(`/api/jobs/${encodeURIComponent(job.id)}/settings`, {
+        method: "PATCH",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(patchBody),
+      });
+      const patchResult = await rPatch.json().catch(() => ({}));
+      if (!rPatch.ok) throw new Error(resliceResponseError(rPatch, patchResult) || "settings update failed");
+      let rev = patchResult.revision;
+      if (typeof rev === "number") {
+        if (printOptionsJob && printOptionsJob.id === job.id) printOptionsJob.revision = rev;
+        if (previewJob && previewJob.id === job.id) previewJob.revision = rev;
+      }
+
+      if (Object.keys(resize).length > 0) {
+        const rScale = await fetch(`/api/jobs/${encodeURIComponent(job.id)}/scale`, {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({revision: rev, maxima: resize}),
+        });
+        const scaleResult = await rScale.json().catch(() => ({}));
+        if (!rScale.ok) throw new Error(resliceResponseError(rScale, scaleResult) || "scale failed");
+        rev = scaleResult.revision;
+        if (typeof rev === "number") {
+          if (printOptionsJob && printOptionsJob.id === job.id) printOptionsJob.revision = rev;
+          if (previewJob && previewJob.id === job.id) previewJob.revision = rev;
+        }
+      }
+      sliceBody = { revision: rev };
+    } else {
+      sliceBody = {
+        options,
+        support_fins: fins,
+      };
+      if (Object.keys(resize).length > 0) {
+        sliceBody.resize = resize;
+      }
     }
-    if (previewJob?.kind === "reslice") await saveResliceSettings();
-    const r = previewJob?.kind === "reslice"
-      ? await fetch(`/api/jobs/${encodeURIComponent(id)}/slice`, {method:"POST", headers:{"Content-Type":"application/json"}, body:JSON.stringify({revision:previewJob.revision})})
-      : await fetch(`/api/jobs/${encodeURIComponent(id)}/slice`, { method: "POST" });
-    const j = await r.json().catch(() => ({}));
-    if (!r.ok) throw new Error(resliceResponseError(r, j) || "could not queue the slice");
-    const job = Object.assign({ id, status: "queued" }, previewJob || {}, j);
-    pendingDimensions.delete(id);
-    closePreview();
-    /* the card switches from the staged controls to the slice bar right away, before the poll */
-    setUploadWait(job);
-    setUploadLatest(job);
-    toast(j.queue_position ? `Queued for slice (#${j.queue_position})` : "Queued for slice");
+
+    const rSlice = await fetch(`/api/jobs/${encodeURIComponent(job.id)}/slice`, {
+      method: "POST",
+      headers: {"Content-Type": "application/json"},
+      body: JSON.stringify(sliceBody),
+    });
+    sliceResult = await rSlice.json().catch(() => ({}));
+    if (!rSlice.ok) throw new Error((job.kind === "reslice" ? resliceResponseError(rSlice, sliceResult) : sliceResult.detail) || rSlice.statusText || "could not queue the slice");
+
+    $("#printOptions").hidden = true;
+    printOptionsJobId = null;
+    printOptionsJob = null;
+    const queuedJob = Object.assign({ id: job.id, status: "queued", filename: job.filename }, sliceResult);
+    setUploadWait(queuedJob);
+    setUploadLatest(queuedJob);
+    toast(sliceResult.queue_position ? `Queued for slice (#${sliceResult.queue_position})` : "Queued for slice");
     await refresh();
   } catch (e) {
-    const err = $("#previewError");
-    err.textContent = "Could not queue the slice: " + e.message;
-    err.hidden = false;
+    if (errEl) {
+      errEl.textContent = "Could not queue the slice: " + e.message;
+      errEl.hidden = false;
+    }
     toast("Not sliced: " + e.message, 6000);
   } finally {
     btn.dataset.busy = "";
@@ -2451,94 +2634,11 @@ async function confirmSlice(jobId) {
   }
 }
 
-async function initSupportFins() {
-  try {
-    const r = await fetch("/api/support-fins");
-    if (!r.ok) return;
-    const j = await r.json();
-    const cb = $("#supportFins");
-    if (cb && !j.available) {
-      cb.disabled = true;
-      cb.checked = false;
-      const hint = cb.parentElement && cb.parentElement.querySelector(".hint");
-      if (hint) hint.textContent = j.reason || "support fins unavailable";
-    }
-  } catch (e) { /* leave enabled by default */ }
-}
-
-function previewScaleAxis(id) {
-  // Axis map: width=bbox[0], length=bbox[1], height=bbox[2].
-  return id === "scaleHeight" ? 2 : id === "scaleWidth" ? 0 : 1;
-}
-
-function previewScaleFollow(e) {
-  const src = e.target.id;
-  previewAxis = src;
-  const val = Number(e.target.value);
-  if (!previewScene || !Number.isFinite(val) || val <= 0) return;
-  const sz = (previewScene.bbox && previewScene.bbox.size) || [];
-  const cur = Number(sz[previewScaleAxis(src)]);
-  if (cur <= 0) return;
-  const factor = val / cur;
-  ["scaleHeight","scaleWidth","scaleLength"].forEach((k)=>{
-    if (k === src) return;
-    const el = document.getElementById(k);
-    if (el) el.value = (Number(sz[previewScaleAxis(k)]) * factor).toFixed(1);
-  });
-}
-
-async function applyPreviewScale() {
-  const id = previewJob && previewJob.id;
-  if (!id) return;
-  const axis = previewAxis;
-  const field = axis && document.getElementById(axis);
-  const value = field && Number(field.value);
-  if (!field || !Number.isFinite(value) || value <= 0) { previewActionError("Enter a finite positive dimension in mm."); if (field) field.focus(); return; }
-  const apiAxis = axis === "scaleHeight" ? "height" : axis === "scaleWidth" ? "width" : "length";
-  const button = $("#scaleApply"); button.disabled = true;
-  try {
-    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/scale`, {
-      method: "POST", headers: {"Content-Type":"application/json"},
-      body: JSON.stringify(previewJob.kind === "reslice" ? {revision:previewJob.revision, [apiAxis === "length" ? "depth" : apiAxis]:value} : { axis: apiAxis, value })
-    });
-    const j = await r.json().catch(()=>({}));
-    if (!r.ok) throw new Error(resliceResponseError(r, j));
-    if (previewJob.kind === "reslice") previewJob.revision = j.revision;
-    const after = document.getElementById("previewSizeAfter");
-    if (after) after.textContent = "new: " + (j.size||[]).map(v=>Math.round(v*10)/10).join(" × ") + " mm";
-    // reload preview
-    const pr = await fetch("/api/jobs/" + encodeURIComponent(id) + "/preview");
-    const p = await pr.json().catch(() => ({}));
-    if (!pr.ok) throw new Error(p.detail || pr.statusText);
-    previewScene = p;
-    renderPreviewChrome(p);
-    const sz = (p.bbox && p.bbox.size) || [];
-    const now = document.getElementById("previewSizeNow");
-    if (now) now.textContent = "current: " + sz.map(v=>Math.round(v*10)/10).join(" × ") + " mm";
-    drawPreview();
-    // clear inputs
-    ["scaleHeight","scaleWidth","scaleLength"].forEach(k=>{const e=document.getElementById(k); if(e) e.value="";});
-    previewAxis = null; pendingDimensions.delete(id);
-    toast("Scaled");
-  } catch (e) {
-    previewActionError("Scale failed: " + e.message);
-  } finally { button.disabled = false; }
-}
-
 function initPreview() {
   const canvas = $("#previewCanvas"), dlg = $("#previewDlg");
-  $("#previewConfirm").addEventListener("click", () => withPreviewBusy("Queuing slice…", () => confirmSlice()));
-  const apply = document.getElementById("scaleApply");
-  if (apply) apply.addEventListener("click", () => withPreviewBusy("Applying size…", applyPreviewScale));
-  ["scaleHeight","scaleWidth","scaleLength"].forEach(k=>{
-    const el = document.getElementById(k);
-    if (el) el.addEventListener("input", previewScaleFollow);
-  });
-  $("#scaleReset").addEventListener("click", () => withPreviewBusy("Resetting size…", resetPreviewScale));
-  $("#resliceFit").addEventListener("change", () => { if (!$("#resliceFit").checked && (previewJob?.support_fins || /\.3mf$/i.test(previewJob?.filename || ""))) $("#resliceFit").disabled = true; });
   $("#resliceSave").addEventListener("click", ev => withPreviewBusy("Saving settings…", async () => { const button = $("#resliceSave"); button.disabled = true; try { await saveResliceSettings(); toast("Draft settings saved"); } catch (e) { previewActionError("Settings not saved: " + e.message); } finally { button.disabled = false; } }));
-  $("#resliceCopy").addEventListener("click", () => withPreviewBusy("Loading dashboard settings…", async () => { try { const r = await fetch("/api/profile"); const j = await r.json(); if (!r.ok) throw new Error(j.detail || r.statusText); await renderResliceSettings({...j.paths, options:j.options}); } catch (e) { previewActionError("Could not copy dashboard settings: " + e.message); } }));
-  $("#resliceMachine").addEventListener("change", () => withPreviewBusy("Loading compatible presets…", async () => { try { const values = resliceValues(); await renderResliceSettings({...values.profile, options:values.options}); } catch (e) { previewActionError("Could not load presets: " + e.message); } }));
+  $("#resliceCopy").addEventListener("click", () => withPreviewBusy("Loading dashboard settings…", async () => { try { const r = await fetch("/api/profile"); const j = await r.json(); if (!r.ok) throw new Error(j.detail || r.statusText); await renderResliceSettings(j.paths); } catch (e) { previewActionError("Could not copy dashboard settings: " + e.message); } }));
+  $("#resliceMachine").addEventListener("change", () => withPreviewBusy("Loading compatible presets…", async () => { try { const values = resliceValues(); await renderResliceSettings(values.profile); } catch (e) { previewActionError("Could not load presets: " + e.message); } }));
   $("#resliceReload").addEventListener("click", () => withPreviewBusy("Reloading draft…", async () => { try { await reloadResliceRevision(); } catch (e) { previewActionError("Could not reload draft: " + e.message); } }));
   $("#previewClose").addEventListener("click", keepPreview);
   $("#previewDiscard").addEventListener("click", () => withPreviewBusy("Discarding draft…", discardPreview));
@@ -2573,6 +2673,7 @@ function initPreview() {
     previewJob = null;
     previewHidden = new Set();
     (previewReturnFocus && previewReturnFocus.isConnected ? previewReturnFocus : $("#jobsTitle")).focus();
+    previewReturnFocus = null;
   });
   window.addEventListener("resize", () => { if (previewScene) schedulePreview(); });
 }
@@ -2945,6 +3046,8 @@ function boot() {
   /* the card's static actions go through the same delegated handler as the rows: one printJob(id),
      one confirm dialog, one toast */
   $("#uploadLatest").addEventListener("click", onJobAction);
+  $("#printOptionsSlice").addEventListener("click", slicePrintOptions);
+  $("#supportFins").addEventListener("change", applyPrintOptionsConstraints);
   initPreview();
   initSupportFins();
   initFromLayer();
@@ -3027,10 +3130,6 @@ function boot() {
     else if (act === "delete") deletePrinter(ref, name || ref);
   });
 
-  $("#optSupports").addEventListener("change", ev => saveOption("supports", ev.target.value === "yes"));
-  $("#optBrim").addEventListener("change", ev => saveOption("brim", ev.target.value === "yes"));
-  $("#optAutoOrient").addEventListener("change", ev => saveOption("auto_orient", ev.target.value === "yes"));
-  $("#optShrinkFit").addEventListener("change", ev => saveOption("shrink_to_fit", ev.target.value === "yes"));
   $("#optHideProfiles").addEventListener("change", ev => saveOption("hide_profiles", !!ev.target.checked));
 
   route();

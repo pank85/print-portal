@@ -11,10 +11,12 @@ import dataclasses
 import io
 import json
 import os
+import threading
 import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
 import zipfile
 from pathlib import Path
 
@@ -92,16 +94,22 @@ def test_upload_stores_the_model_and_queues_a_job(client, jobs_dir, cube_stl):
 
     assert response.status_code == 200
     body = response.json()
-    assert body["status"] == "queued"
-    assert body["queue_position"] >= 1
+    assert body["status"] == "awaiting_confirm"
+    assert "queue_position" not in body
     jid = body["id"]
 
     assert (jobs_dir / jid / "upload" / "cube.stl").read_bytes() == cube_stl
     job = read_job_file(jobs_dir, jid)
-    assert job["status"] == "queued"          # no lifespan -> the worker never ran
+    assert job["status"] == "awaiting_confirm"
     assert job["filename"] == "cube.stl"
     assert job["upload_bytes"] == len(cube_stl)
     assert not (jobs_dir / jid / "out").exists()   # no slicer subprocess was spawned
+
+    sliced = client.post(f"/api/jobs/{jid}/slice")
+    assert sliced.status_code == 200
+    assert sliced.json()["status"] == "queued"
+    assert sliced.json()["queue_position"] >= 1
+    assert read_job_file(jobs_dir, jid)["status"] == "queued"
 
 
 def test_upload_rejects_an_unsupported_extension(client, jobs_dir):
@@ -580,11 +588,19 @@ def fake_fins(monkeypatch):
 
 
 def stage(client, cube_stl) -> str:
-    """Upload with the fins checkbox and return the staged job id."""
-    response = client.post("/api/upload", data={"support_fins": "true"},
+    """Upload and return the staged job id."""
+    response = client.post("/api/upload",
                            files={"file": ("cube.stl", cube_stl, "model/stl")})
     assert response.status_code == 200, response.text
     return response.json()["id"]
+
+
+def stage_finned(client, cube_stl) -> str:
+    """Upload and slice with support fins to produce a finned job."""
+    jid = stage(client, cube_stl)
+    res = client.post(f"/api/jobs/{jid}/slice", json={"support_fins": True})
+    assert res.status_code == 200, res.text
+    return jid
 
 
 def test_upload_with_fins_stages_the_job_instead_of_queuing_it(client, jobs_dir, cube_stl,
@@ -596,12 +612,24 @@ def test_upload_with_fins_stages_the_job_instead_of_queuing_it(client, jobs_dir,
     body = response.json()
     assert body["status"] == "awaiting_confirm"     # the dialog's "Slice it" queues it
     assert "queue_position" not in body
-    assert body["original"] == "cube.stl"
-    assert body["fins"]["stats"]["tines"] == 2
-
+    assert "fins" not in body
     jid = body["id"]
+
     job = read_job_file(jobs_dir, jid)
     assert job["status"] == "awaiting_confirm"
+    assert "support_fins" not in job
+    assert not (jobs_dir / jid / "upload" / "fins-cube.3mf").exists()
+    assert fake_fins == []
+
+    # Slicing with support_fins runs the CLI and queues the job
+    slice_res = client.post(f"/api/jobs/{jid}/slice", json={"support_fins": True})
+    assert slice_res.status_code == 200
+    slice_body = slice_res.json()
+    assert slice_body["status"] == "queued"
+    assert slice_body["queue_position"] >= 1
+
+    job = read_job_file(jobs_dir, jid)
+    assert job["status"] == "queued"
     assert job["support_fins"] is True
     assert job["original"] == "cube.stl"
     assert job["filename"] == "fins-cube.3mf"       # the finned 3MF is the slicer input
@@ -611,7 +639,9 @@ def test_upload_with_fins_stages_the_job_instead_of_queuing_it(client, jobs_dir,
 
 
 def test_the_fins_cli_receives_the_uploaded_model_and_the_timeout(client, cube_stl, fake_fins):
-    stage(client, cube_stl)
+    jid = stage(client, cube_stl)
+    res = client.post(f"/api/jobs/{jid}/slice", json={"support_fins": True})
+    assert res.status_code == 200
 
     src, dest, timeout = fake_fins[0]
     assert src.name == "cube.stl"
@@ -627,16 +657,21 @@ def test_a_fins_failure_is_a_400_and_leaves_no_job_behind(client, jobs_dir, cube
 
     monkeypatch.setattr(supportfins, "fin_model", explode)
 
-    response = client.post("/api/upload", data={"support_fins": "true"},
-                           files={"file": ("cube.stl", cube_stl, "model/stl")})
+    jid = stage(client, cube_stl)
+    assert (jobs_dir / jid).is_dir()
+
+    response = client.post(f"/api/jobs/{jid}/slice", json={"support_fins": True})
 
     assert response.status_code == 400
     assert response.json()["detail"] == "support fins failed: node exited 1: no overhangs"
-    assert list(jobs_dir.iterdir()) == []            # the half-made job dir was removed
+    assert (jobs_dir / jid).is_dir()                 # job directory remains published
+    job = read_job_file(jobs_dir, jid)
+    assert job["status"] == "awaiting_confirm"
+    assert (jobs_dir / jid / "upload" / "cube.stl").read_bytes() == cube_stl
 
 
 def test_preview_of_a_staged_job_returns_the_scene(client, monkeypatch, cube_stl, fake_fins):
-    jid = stage(client, cube_stl)
+    jid = stage_finned(client, cube_stl)
     monkeypatch.setattr(main, "JOBS", main.JOBS)     # the job dir is the fixture's
 
     response = client.get(f"/api/jobs/{jid}/preview")
@@ -662,7 +697,7 @@ def test_preview_of_a_queued_job_is_a_409(client, cube_stl):
 
 
 def test_preview_names_an_unreadable_finned_model(client, jobs_dir, cube_stl, fake_fins):
-    jid = stage(client, cube_stl)
+    jid = stage_finned(client, cube_stl)
     (jobs_dir / jid / "upload" / "fins-cube.3mf").write_bytes(b"not a zip")
 
     response = client.get(f"/api/jobs/{jid}/preview")
@@ -674,7 +709,7 @@ def test_preview_names_an_unreadable_finned_model(client, jobs_dir, cube_stl, fa
 
 def test_an_oversized_finned_mesh_returns_pictures(client, jobs_dir, cube_stl, fake_fins, monkeypatch):
     monkeypatch.setattr(preview, "MAX_BYTES", 1)
-    jid = stage(client, cube_stl)
+    jid = stage_finned(client, cube_stl)
 
     listed = client.get(f"/api/jobs/{jid}/preview")
 
@@ -711,14 +746,16 @@ def test_confirm_slice_queues_a_staged_job_exactly_once(client, jobs_dir, cube_s
     assert "not awaiting confirmation" in second.json()["detail"]
 
 
-def test_confirm_slice_refuses_a_job_that_was_never_staged(client, cube_stl):
-    jid = client.post(
-        "/api/upload", files={"file": ("cube.stl", cube_stl, "model/stl")}).json()["id"]
+@pytest.mark.parametrize("status", ["queued", "sliced", "failed"])
+def test_confirm_slice_refuses_a_job_that_was_never_staged(client, jobs_dir, cube_stl, status):
+    jid = stage(client, cube_stl)
+    (jobs_dir / jid / "job.json").write_text(json.dumps(
+        {**read_job_file(jobs_dir, jid), "status": status}))
 
     response = client.post(f"/api/jobs/{jid}/slice")
 
     assert response.status_code == 409
-    assert "job is 'queued'" in response.json()["detail"]
+    assert f"job is '{status}', not awaiting confirmation" in response.json()["detail"]
 
 
 def test_delete_all_still_removes_an_abandoned_staged_job(client, jobs_dir, cube_stl, fake_fins):
@@ -747,3 +784,236 @@ def test_the_support_fins_endpoint_reports_the_caps(client, monkeypatch):
         "timeout": main.CONFIG.support_fins_timeout,
         "max_triangles": preview.MAX_TRIANGLES,
     }
+
+
+def test_upload_of_stl_returns_awaiting_confirm_without_enqueue_or_fins(client, jobs_dir, cube_stl, fake_fins):
+    response = client.post("/api/upload", data={"support_fins": "true"},
+                           files={"file": ("cube.stl", cube_stl, "model/stl")})
+    assert response.status_code == 200
+    body = response.json()
+    assert body["status"] == "awaiting_confirm"
+    assert "queue_position" not in body
+    assert "fins" not in body
+    jid = body["id"]
+    job = read_job_file(jobs_dir, jid)
+    assert job["status"] == "awaiting_confirm"
+    assert "fins" not in job
+    assert not (jobs_dir / jid / "upload" / "fins-cube.3mf").exists()
+    assert fake_fins == []
+
+
+def test_slice_with_options_changes_pinned_process_without_writing_profile_and_queues_once(client, jobs_dir, cube_stl):
+    jid = stage(client, cube_stl)
+    job_before = read_job_file(jobs_dir, jid)
+    pinned_before = job_before["pinned_presets"]["sha256"]["process"]
+
+    # Slice with brim=false and supports=true
+    first = client.post(f"/api/jobs/{jid}/slice", json={
+        "options": {"supports": True, "brim": False, "auto_orient": False, "shrink_to_fit": False}
+    })
+    assert first.status_code == 200
+    assert first.json()["status"] == "queued"
+    assert first.json()["queue_position"] >= 1
+
+    job_after = read_job_file(jobs_dir, jid)
+    assert job_after["status"] == "queued"
+    pinned_after = job_after["pinned_presets"]["sha256"]["process"]
+    assert pinned_after != pinned_before
+    assert job_after["pinned_presets"]["options"] == {
+        "supports": True, "brim": False, "auto_orient": False, "shrink_to_fit": False
+    }
+
+    # Verify process.json on disk has supports enabled and brim disabled
+    proc = json.loads((jobs_dir / jid / "pinned" / "process.json").read_text())
+    assert proc.get("enable_support") == "1"
+    assert proc.get("brim_type") == "no_brim"
+
+    # Second slice is 409
+    second = client.post(f"/api/jobs/{jid}/slice", json={})
+    assert second.status_code == 409
+    assert "job is 'queued', not awaiting confirmation" in second.json()["detail"]
+
+
+def test_slice_resize_uses_smaller_ratio_and_support_fins_fins_scaled_mesh(client, jobs_dir, cube_stl, fake_fins):
+    # cube_stl is 20 x 20 x 20 mm
+    jid = stage(client, cube_stl)
+
+    # max_width=10.0 (factor = 10/20 = 0.5), max_height=16.0 (factor = 16/20 = 0.8)
+    # smaller ratio is 0.5
+    res = client.post(f"/api/jobs/{jid}/slice", json={
+        "resize": {"max_width": 10.0, "max_height": 16.0},
+        "support_fins": True
+    })
+    assert res.status_code == 200
+    assert res.json()["status"] == "queued"
+
+    # Verify fins CLI received the scaled model, not original
+    assert len(fake_fins) == 1
+    src, dest, _timeout = fake_fins[0]
+    scene = preview.read_scene(src)
+    assert scene["bbox"]["size"] == [10.0, 10.0, 10.0]
+
+
+def test_slice_with_fins_and_shrink_to_fit_is_409(client, jobs_dir, cube_stl):
+    jid = stage(client, cube_stl)
+    res = client.post(f"/api/jobs/{jid}/slice", json={
+        "support_fins": True,
+        "options": {"shrink_to_fit": True}
+    })
+    assert res.status_code == 409
+    assert res.json()["detail"] == "support fins cannot be combined with shrink to fit"
+    assert read_job_file(jobs_dir, jid)["status"] == "awaiting_confirm"
+
+
+def test_bare_slice_of_staged_job_queues(client, jobs_dir, cube_stl):
+    jid = stage(client, cube_stl)
+    res = client.post(f"/api/jobs/{jid}/slice")
+    assert res.status_code == 200
+    assert res.json()["status"] == "queued"
+    assert res.json()["queue_position"] >= 1
+    assert read_job_file(jobs_dir, jid)["status"] == "queued"
+
+
+def test_reslice_slice_options_body_is_422_and_patch_pending_support_fins_slice_cycle(client, jobs_dir, cube_stl, monkeypatch):
+    # Upload and slice a source job
+    jid = stage(client, cube_stl)
+    client.post(f"/api/jobs/{jid}/slice")
+    (jobs_dir / jid / "job.json").write_text(json.dumps(
+        {**read_job_file(jobs_dir, jid), "status": "sliced"}
+    ))
+
+    # Fork a reslice child
+    req_id = str(uuid.uuid4())
+    fork_res = client.post(f"/api/jobs/{jid}/reslice", json={"request_id": req_id})
+    assert fork_res.status_code == 201
+    child_id = fork_res.json()["id"]
+    rev = fork_res.json()["revision"]
+
+    # POST slice with options body to reslice is 422
+    err_res = client.post(f"/api/jobs/{child_id}/slice", json={"revision": rev, "options": {"supports": True}})
+    assert err_res.status_code == 422
+    assert "expected revision" in err_res.json()["detail"]
+
+    # PATCH pending_support_fins: true does not run CLI
+    called = []
+    def fake_fin(src, dest, timeout=None):
+        called.append(src)
+        Path(dest).write_bytes(finned_3mf_bytes())
+        return {"report": "ok", "stats": {"finTriangles": 4}}
+    monkeypatch.setattr(supportfins, "fin_model", fake_fin)
+
+    patch_res = client.patch(f"/api/jobs/{child_id}/settings", json={
+        "revision": rev,
+        "pending_support_fins": True
+    })
+    assert patch_res.status_code == 200
+    new_rev = patch_res.json()["revision"]
+    assert patch_res.json()["pending_support_fins"] is True
+    assert called == []
+
+    # Following slice {revision} runs CLI and queues
+    slice_res = client.post(f"/api/jobs/{child_id}/slice", json={"revision": new_rev})
+    assert slice_res.status_code == 200
+    assert len(called) == 1
+    assert slice_res.json()["status"] == "queued"
+
+    # Test that CLI failure does not queue
+    fork2 = client.post(f"/api/jobs/{jid}/reslice", json={"request_id": str(uuid.uuid4())}).json()
+    child2_id = fork2["id"]
+    rev2 = fork2["revision"]
+    p2 = client.patch(f"/api/jobs/{child2_id}/settings", json={
+        "revision": rev2, "pending_support_fins": True
+    }).json()
+    def explode(src, dest, timeout=None):
+        raise supportfins.SupportFinsError("exploded in reslice")
+    monkeypatch.setattr(supportfins, "fin_model", explode)
+    fail_slice = client.post(f"/api/jobs/{child2_id}/slice", json={"revision": p2["revision"]})
+    assert fail_slice.status_code == 400
+    assert "support fins failed: exploded in reslice" in fail_slice.json()["detail"]
+    assert read_job_file(jobs_dir, child2_id)["status"] == "awaiting_confirm"
+
+
+def test_slice_options_rejects_hide_profiles_with_422(client, jobs_dir, cube_stl):
+    jid = stage(client, cube_stl)
+    res = client.post(f"/api/jobs/{jid}/slice", json={
+        "options": {"hide_profiles": True}
+    })
+    assert res.status_code == 422
+    assert "invalid options keys" in res.json()["detail"]
+    job = read_job_file(jobs_dir, jid)
+    assert job["status"] == "awaiting_confirm"
+    assert "hide_profiles" not in job.get("pinned_presets", {}).get("options", {})
+
+
+def test_overlapping_plain_slice_resizes_cannot_delete_or_replace_each_others_temp(client, jobs_dir, cube_stl, monkeypatch):
+    jid = stage(client, cube_stl)
+    canonical = jobs_dir / jid / "upload" / "cube.stl"
+
+    orig_scale = preview.scale_file
+    entered_first = threading.Event()
+    allow_first_finish = threading.Event()
+    temp_files_seen: list[Path] = []
+    call_count = 0
+
+    def slow_scale(path, factor, out_path):
+        nonlocal call_count
+        call_count += 1
+        temp_files_seen.append(Path(out_path))
+        if call_count == 1:
+            orig_scale(path, factor, out_path)
+            entered_first.set()
+            allow_first_finish.wait(timeout=5)
+        else:
+            orig_scale(path, factor, out_path)
+
+    monkeypatch.setattr(preview, "scale_file", slow_scale)
+
+    res1_holder = []
+    def req1():
+        r = client.post(f"/api/jobs/{jid}/slice", json={"resize": {"max_width": 10.0}})
+        res1_holder.append(r)
+
+    t1 = threading.Thread(target=req1)
+    t1.start()
+
+    assert entered_first.wait(timeout=5)
+    assert len(temp_files_seen) == 1
+    t1_temp = temp_files_seen[0]
+    assert t1_temp.exists()
+    assert jid in t1_temp.name
+
+    # Request 2 runs while request 1 is waiting
+    res2 = client.post(f"/api/jobs/{jid}/slice", json={"resize": {"max_width": 15.0}})
+    assert res2.status_code == 200
+    assert res2.json()["status"] == "queued"
+    assert len(temp_files_seen) == 2
+    t2_temp = temp_files_seen[1]
+    assert t2_temp != t1_temp
+    # Req2 cleaned up its own temp, but did not delete req1's temp
+    assert not t2_temp.exists()
+    assert t1_temp.exists()
+
+    # Now allow request 1 to resume and hit STAGE_LOCK
+    allow_first_finish.set()
+    t1.join(timeout=5)
+
+    assert len(res1_holder) == 1
+    res1 = res1_holder[0]
+    # Request 1 must be rejected with 409 because request 2 already queued / modified the job
+    assert res1.status_code == 409
+    # Request 1 unlinks its own temp in finally
+    assert not t1_temp.exists()
+
+    # The canonical file keeps req2's size and the job remains queued
+    scene = preview.read_scene(canonical)
+    assert scene["bbox"]["size"] == [15.0, 15.0, 15.0]
+    assert read_job_file(jobs_dir, jid)["status"] == "queued"
+
+    # Single-request resize scales once and queues
+    jid2 = stage(client, cube_stl)
+    res_single = client.post(f"/api/jobs/{jid2}/slice", json={"resize": {"max_height": 8.0}})
+    assert res_single.status_code == 200
+    assert res_single.json()["status"] == "queued"
+    scene2 = preview.read_scene(jobs_dir / jid2 / "upload" / "cube.stl")
+    assert scene2["bbox"]["size"] == [8.0, 8.0, 8.0]
+    assert read_job_file(jobs_dir, jid2)["status"] == "queued"

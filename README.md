@@ -198,25 +198,25 @@ Every failure mode with the exact message it produces: [docs/troubleshooting.md]
 
 ## Optional support fins
 
-Opt-in (default OFF) in the upload form: tick **Add designed-in support fins** and the portal runs the
+Opt-in (default OFF) in the staged job's **Print options** panel: tick **Use support fins** and, when you click **Slice it**, the portal runs the
 bundled [support-fins](#acknowledgements) CLI locally on the upload, then slices the finned 3MF instead
 of the original. STL, 3MF and OBJ are accepted (a ZIP is unpacked first) and the output is always a 3MF;
-the original upload stays on disk. `GET /api/support-fins` reports whether the runtime is present, and
-the checkbox is offered only when it is.
+the original upload stays on disk. `GET /api/support-fins` reports whether the runtime is present; the
+checkbox is shown on the staged panel and disabled, with the reason in the hint, when the CLI is absent.
 
-A finned upload is staged, not queued:
+Every upload is staged, not queued:
 
-- The CLI runs during the upload, so the job comes back `awaiting_confirm` instead of `queued`. Nothing
-  enters the queue until you confirm. The preview does not open by itself.
-- The last-job card and the job row offer **Preview fins** and **Slice it**. Preview is optional: it
+- Uploads come back `awaiting_confirm` and bind the **Print options** panel on the upload card. Nothing
+  enters the queue until you click **Slice it**. The preview dialog does not open by itself.
+- Staged jobs offer **Print options** on the row to bind that job to the options panel, and **Preview fins**. Preview is optional: it
   shows what the CLI did (`"14 walls, 24 tines"`, overhang regions, fin/tine/brace counts) and a
   **local** 3D preview of the finned 3MF: drag to orbit, wheel to zoom, arrows when the canvas is
   focused, chips to show/hide the part and the supports. No geometry, no upload and no font ever leaves
   the container.
-- **Slice it** (on the card, the row, or inside the preview) queues the job (`POST /api/jobs/{id}/slice`).
-  **Keep for later** leaves it staged. **Discard** deletes it.
-- A CLI failure is a `400 support fins failed: <cli text>` and the job directory is removed, so a broken
-  upload leaves nothing behind.
+- Exactly one **Slice it** button lives in the **Print options** panel (`POST /api/jobs/{id}/slice`).
+  Inside the preview dialog, **Keep for later** leaves the draft staged, and **Discard** deletes it.
+- A slice-time CLI failure is a `400 support fins failed: <cli text>`, the job directory remains, and the
+  status stays `awaiting_confirm`.
 
 Limits worth knowing before you tick the box:
 
@@ -232,7 +232,7 @@ Limits worth knowing before you tick the box:
   build time), which is why the image is ~1.1 GB.
 - **Serialised and bounded**: one fin run at a time, each capped by `SUPPORT_FINS_TIMEOUT` (300 s), so a
   second finned upload waits for the first.
-- **The preview is bounded** to 450 000 triangles and 32 MiB of input for the rotatable view. A larger finned file, up to the 150 MiB upload limit, shows still pictures (front and side) instead of refusing. Past that the dialog reports `preview unavailable: …` and still offers **Slice it**.
+- **The preview is bounded** to 450 000 triangles and 32 MiB of input for the rotatable view. A larger finned file, up to the 150 MiB upload limit, shows still pictures (front and side) instead of refusing. Past that the dialog reports `preview unavailable: …`.
 - **A staged job is protected from age pruning** (absent from ACTIVE_STATUSES but in PRUNE_KEEP_STATUSES) and can be deleted
   individually or by **Delete finished**; it simply never enters the queue until you confirm.
 

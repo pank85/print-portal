@@ -61,7 +61,7 @@ A pairing is a complete statement about a printer, not a patch: a slot the body 
 
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
-| POST | `/api/upload` | multipart `file` (`.stl` `.3mf` `.obj` `.zip`) + optional `output_name`, optional `support_fins=true` → queue a slice, or stage a finned job | 200 `{id,status:"queued",queue_position}` · 200 `{id,status:"awaiting_confirm",fins:{report,stats},original}` when `support_fins` is set (nothing queued) · 400 `support fins failed: <cli text>` (job dir removed) · 400 unsupported suffix / invalid `output_name` · **409 `no_printer_profile`** · 413 larger than `MAX_UPLOAD_MB` (from `Content-Length` or the streaming count) · archives: `ArchiveError.status`, 400 or 413 |
+| POST | `/api/upload` | multipart `file` (`.stl` `.3mf` `.obj` `.zip`) + optional `output_name`, form field `support_fins` ignored → stage the job | 200 `{id,status:"awaiting_confirm"}` (nothing queued) · 400 unsupported suffix / invalid `output_name` · **409 `no_printer_profile`** · 413 larger than `MAX_UPLOAD_MB` (from `Content-Length` or the streaming count) · archives: `ArchiveError.status`, 400 or 413 |
 | GET | `/api/jobs` | job list, newest first (every `job.json` that parses) | 200 |
 | GET | `/api/jobs/{jid}` | one job: status, stats, error, `threemf`, `archive`, and for a finned job `original`, `fins`, `support_fins` | 200 · 404 (`jid` must be 12 lowercase hex) |
 | GET | `/api/jobs/{jid}/gcode` | download the sliced gcode | 200 file · 409 `not sliced yet` · 404 |
@@ -111,16 +111,16 @@ and jobs being uploaded for printing cannot be deleted. A source may be deleted 
 
 ## Support fins
 
-Opt-in designed-in supports, off by default. `POST /api/upload` with `support_fins=true` runs the
-bundled CLI inside the request, then **stages** the job instead of queueing it: `status` is
-`awaiting_confirm` and the body is `{id, status, fins: {report, stats}, original}` (no `queue_position`).
+Opt-in designed-in supports, off by default. Every successful `POST /api/upload` **stages** the job
+with `status: "awaiting_confirm"` (the form field `support_fins` is ignored and does not run the CLI).
+Support fins run at slice time when requested via `POST /api/jobs/{jid}/slice` with `support_fins: true`.
 The status list is therefore `queued` · `slicing` · `awaiting_confirm` · `sliced` · `failed`;
 `awaiting_confirm` is deliberately **not** an active status (it can be deleted like a
-finished job) but `prune()` keeps it, so an open preview dialog is never collected.
+finished job) but `prune()` keeps it, so an open staged job is never collected.
 
 | Method | Path | Purpose | Notable statuses |
 |---|---|---|---|
-| POST | `/api/jobs/{jid}/slice` | enter the queue for a staged job — *Slice it* on the card, the row, or the preview dialog | 200 `{id,status:"queued",queue_position}` · 404 · 409 `job is '<status>', not awaiting confirmation` (a double click is a 409, not a second queue entry: the check and the enqueue share one lock) |
+| POST | `/api/jobs/{jid}/slice` | enter the queue for a staged job; optionally accepts `options`, `support_fins`, and `resize` (for reslice: `{revision}`) | 200 `{id,status:"queued",queue_position}` · 400 `support fins failed: <cli text>` (job directory remains) · 404 · 409 `job is '<status>', not awaiting confirmation` / `support fins cannot be combined with shrink to fit` (a double click is a 409, not a second queue entry: the check and the enqueue share one lock) · 422 |
 | GET | `/api/jobs/{jid}/preview` | geometry for the pre-slice preview, or `{mode:"shots", views:["front","side"], bytes}` when the file is over `MAX_BYTES` (32 MiB) and at most `shot.SHOT_MAX_BYTES` (150 MiB) | 200 · 404 · 409 `preview unavailable: this job has no support fins` (for non-reslice jobs) · 409 `preview unavailable: <reason>` |
 | GET | `/api/jobs/{jid}/preview-shot?view=front\|side` | one cached PNG of the finned mesh | 200 `image/png` · 400 · 404 · 409 |
 | GET | `/api/support-fins` | capability probe for the upload checkbox | 200 always: `{available, reason, timeout, max_triangles}`; `reason` is `""` when available, else `support-fins CLI is missing from the image` / `node runtime is not available` |

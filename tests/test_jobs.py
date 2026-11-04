@@ -47,6 +47,10 @@ def upload(client: TestClient, blob: bytes, filename: str = "cube.stl",
                        files={"file": (filename, blob, "model/stl")}, data=data)
 
 
+def queue_staged(client: TestClient, jid: str):
+    return client.post(f"/api/jobs/{jid}/slice")
+
+
 def read_job(jobs: Path, jid: str) -> dict:
     return json.loads((jobs / jid / "job.json").read_text())
 
@@ -158,7 +162,7 @@ def test_upload_stores_the_output_name(storage, api_client, cube_stl):
     job = read_job(jobs, jid)
     assert job["output_name"] == "Benchy v2"
     assert job["filename"] == "cube.stl"          # the upload name is kept for display
-    assert job["status"] == "queued"
+    assert job["status"] == "awaiting_confirm"
 
 
 def test_upload_without_output_name_uses_the_model_stem(storage, api_client, cube_stl):
@@ -394,6 +398,8 @@ def test_upload_zip_queues_the_extracted_model(storage, api_client, switchable, 
 
     assert response.status_code == 200, response.text
     jid = response.json()["id"]
+    queue_res = queue_staged(api_client, jid)
+    assert queue_res.status_code == 200
     job = read_job(jobs, jid)
     assert job["status"] == "queued"
     assert job["filename"] == "cube.stl"            # the member, not the archive
@@ -716,12 +722,18 @@ def test_finning_happens_before_prepare_and_drops_the_rewritten_copy(
 
     assert response.status_code == 200, response.text
     jid = response.json()["id"]
+    # Upload stages the job and runs prepare_3mf (creating slice-benchy.3mf)
+    assert (jobs / jid / "upload" / "slice-benchy.3mf").is_file()
+
+    # Slice with support_fins runs the CLI and drops the rewritten copy
+    slice_res = api_client.post(f"/api/jobs/{jid}/slice", json={"support_fins": True})
+    assert slice_res.status_code == 200, slice_res.text
     assert seen["src"].name == "benchy.3mf"        # the untouched upload, not a prepared copy
     job = read_job(jobs, jid)
     assert job["filename"] == "fins-benchy.3mf"
     assert job["threemf"]["rewrite"] == "discarded"
     assert any("support fins rebuilt the 3MF" in note for note in job["threemf"]["notes"])
-    assert "slicer_input" not in job               # nothing stale for run_slice to prefer
+    assert "slicer_input" not in job or job.get("slicer_input") is None
     assert sorted(p.name for p in (jobs / jid / "upload").iterdir()) == [
         "benchy.3mf", "fins-benchy.3mf"]
 
@@ -1166,7 +1178,10 @@ def test_a_fins_upload_is_staged_not_queued(storage, api_client, queue_watch, mo
                                             cube_stl):
     jobs, _sliced = storage
 
+    called = []
+
     def fake_fin_model(src: Path, dest: Path, timeout: float | None = None) -> dict:
+        called.append(src)
         Path(dest).write_bytes(cube_stl)
         return {"report": "r", "stats": {"finTriangles": 12}}
 
@@ -1181,6 +1196,12 @@ def test_a_fins_upload_is_staged_not_queued(storage, api_client, queue_watch, mo
     assert "queue_position" not in body      # staged: the dialog's *Slice it* is the entry
     assert queue_watch.empty()
     assert read_job(jobs, body["id"])["status"] == "awaiting_confirm"
+    assert called == []                      # upload no longer runs the fins CLI
+
+    slice_res = api_client.post(f"/api/jobs/{body['id']}/slice", json={"support_fins": True})
+    assert slice_res.status_code == 200
+    assert len(called) == 1
+    assert queue_watch.qsize() == 1
 
 
 def test_upload_pins_survive_later_parent_edits(storage, api_client, switchable, monkeypatch, cube_stl):
@@ -1243,14 +1264,15 @@ def test_confirming_a_staged_job_queues_it_exactly_once(storage, api_client, que
     assert queue_watch.qsize() == 1          # a double click is not a second slice
 
 
-def test_confirm_refuses_a_job_that_was_never_staged(storage, api_client, queue_watch):
+@pytest.mark.parametrize("status", ["queued", "sliced", "failed"])
+def test_confirm_refuses_a_job_that_was_never_staged(storage, api_client, queue_watch, status):
     jobs, _sliced = storage
-    make_job(jobs, "aaaabbbb0002", "queued")
+    make_job(jobs, "aaaabbbb0002", status)
 
     response = api_client.post("/api/jobs/aaaabbbb0002/slice")
 
     assert response.status_code == 409
-    assert "job is 'queued', not awaiting confirmation" in response.json()["detail"]
+    assert f"job is '{status}', not awaiting confirmation" in response.json()["detail"]
     assert queue_watch.empty()
 
 
