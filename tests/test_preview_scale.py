@@ -202,3 +202,42 @@ def test_geometry_capability_zero_and_unsupported(tmp_path):
     assert result["preview_available"] and not result["resize_available"]
     assert result["size"] == [0, 0, 0]
     assert not preview.geometry_capability(tmp_path / "missing.obj")["preview_available"]
+
+
+def test_scale_and_capability_when_exceeding_preview_caps(tmp_path, monkeypatch):
+    monkeypatch.setattr(preview, "MAX_BYTES", 50)
+    monkeypatch.setattr(preview, "MAX_TRIANGLES", 1)
+    stl = tmp_path / "model.stl"
+    stl.write_bytes(_box_stl())
+    # File is ~143 bytes, which exceeds MAX_BYTES (50)
+    with pytest.raises(preview.PreviewError, match="preview cap is"):
+        preview.read_scene(stl)
+
+    # Capability must report preview unavailable but resize available with real dimensions
+    cap = preview.geometry_capability(stl)
+    assert not cap["preview_available"]
+    assert cap["resize_available"]
+    assert cap["size"] == pytest.approx([WIDTH, LENGTH, HEIGHT])
+    assert "preview cap is" in cap["reason"]
+
+    # measure_size must measure geometry without preview cap
+    assert preview.measure_size(stl) == pytest.approx([WIDTH, LENGTH, HEIGHT])
+
+    # scale_file must scale successfully
+    out = tmp_path / "scaled.stl"
+    preview.scale_file(stl, 0.5, out)
+    assert preview.measure_size(out) == pytest.approx([WIDTH * 0.5, LENGTH * 0.5, HEIGHT * 0.5])
+
+
+def test_slice_resize_succeeds_when_preview_capped(client, jobs_dir, monkeypatch):
+    monkeypatch.setattr(preview, "MAX_BYTES", 50)
+    upload = client.post("/api/upload", files={"file": ("box.stl", _box_stl(), "model/stl")})
+    assert upload.status_code == 200, upload.text
+    jid = upload.json()["id"]
+
+    res = client.post(f"/api/jobs/{jid}/slice", json={"resize": {"max_height": 20.0}})
+    assert res.status_code == 200, res.text
+    assert res.json()["status"] == "queued"
+    job = json.loads((jobs_dir / jid / "job.json").read_text())
+    assert job["status"] == "queued"
+
