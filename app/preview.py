@@ -43,6 +43,8 @@ import zipfile
 import zlib
 from pathlib import Path
 
+import mesh
+
 MAX_TRIANGLES = 450_000
 """Cap on the triangles in one preview response."""
 
@@ -658,6 +660,49 @@ def _scale_3mf(path: Path, factor: float, out_path: Path) -> None:
             dst.writestr(cloned, data)
 
 
+def measure_size(path: Path) -> list[float]:
+    """Measure the [width, length, height] (x, y, z) bounding box size in millimetres.
+
+    Unlike read_scene, this operates on files up to the full upload limit without
+    the browser preview's 32 MB or 450k-triangle caps.
+    """
+    suffix = path.suffix.lower()
+    if suffix not in _SUPPORTED_SUFFIXES:
+        raise PreviewError(f"{path.name}: the portal reads .3mf, .stl and .obj geometry only")
+    if not path.is_file():
+        raise PreviewError(f"{path.name}: cannot read the file (file not found)")
+    if suffix in (".stl", ".obj"):
+        try:
+            bbox = mesh.model_bounding_box(path)
+            return [_round(bbox.size[0]), _round(bbox.size[1]), _round(bbox.size[2])]
+        except mesh.MeshError as exc:
+            raise PreviewError(str(exc)) from exc
+    elif suffix == ".3mf":
+        try:
+            unit, leaves = _read_3mf(path)
+        except Exception as exc:
+            if isinstance(exc, PreviewError):
+                raise
+            raise PreviewError(f"{path.name}: cannot read 3MF geometry ({exc})") from exc
+        scale = _UNIT_MM.get(unit, 1.0)
+        lo = [math.inf, math.inf, math.inf]
+        hi = [-math.inf, -math.inf, -math.inf]
+        has_vertices = False
+        for leaf in leaves:
+            for x, y, z in leaf["vertices"]:
+                has_vertices = True
+                pt = (x * scale, y * scale, z * scale)
+                for ax in range(3):
+                    if pt[ax] < lo[ax]:
+                        lo[ax] = pt[ax]
+                    if pt[ax] > hi[ax]:
+                        hi[ax] = pt[ax]
+        if not has_vertices:
+            raise PreviewError(f"{path.name} has no readable vertices")
+        return [_round(hi[i] - lo[i]) for i in range(3)]
+    raise PreviewError(f"{path.name}: unsupported file type")
+
+
 def geometry_capability(path: Path) -> dict:
     """Return bounded preview/resize capability and millimetre dimensions, or a reason.
 
@@ -666,22 +711,35 @@ def geometry_capability(path: Path) -> dict:
     """
     try:
         scene = read_scene(path)
+        size = scene["bbox"]["size"]
+        available = any(value > 0 for value in size)
+        return {"preview_available": True, "resize_available": available,
+                "reason": None if available else "geometry has zero extent",
+                "unit": "millimeter", "size": size}
     except PreviewError as exc:
+        scene_err = str(exc)
+
+    try:
+        size = measure_size(path)
+        available = any(value > 0 for value in size)
+        reason = None if available else "geometry has zero extent"
+        return {"preview_available": False, "resize_available": available,
+                "reason": reason or scene_err,
+                "unit": "millimeter", "size": size}
+    except (PreviewError, OSError) as exc:
         return {"preview_available": False, "resize_available": False, "reason": str(exc),
                 "unit": "millimeter", "size": None}
-    size = scene["bbox"]["size"]
-    available = any(value > 0 for value in size)
-    return {"preview_available": True, "resize_available": available,
-            "reason": None if available else "geometry has zero extent",
-            "unit": "millimeter", "size": size}
 
 
 def scale_file(path: Path, factor: float, out_path: Path) -> None:
     """Write validated uniformly scaled geometry atomically, preserving input on failure."""
     if isinstance(factor, bool) or not isinstance(factor, (int, float)) or not math.isfinite(factor) or factor <= 0:
         raise PreviewError(f"{path.name}: scale factor must be finite and positive")
-    read_scene(path)  # Validate the complete input and enforce all resource limits first.
     suffix = path.suffix.lower()
+    if suffix not in _SUPPORTED_SUFFIXES:
+        raise PreviewError(f"{path.name}: cannot scale this file type")
+    if not path.is_file():
+        raise PreviewError(f"{path.name}: cannot read the file (file not found)")
     tmp = None
     try:
         with tempfile.NamedTemporaryFile(dir=out_path.parent, suffix=suffix, delete=False) as f:
@@ -689,33 +747,51 @@ def scale_file(path: Path, factor: float, out_path: Path) -> None:
         if suffix == ".3mf":
             _scale_3mf(path, factor, tmp)
         elif suffix == ".stl":
-            raw = path.read_bytes()
+            raw = bytearray(path.read_bytes())
             count = _binary_triangle_count(raw)
             if count:
-                out = bytearray(raw)
+                unpack_9f = struct.Struct("<9f").unpack_from
+                pack_9f = struct.Struct("<9f").pack_into
                 for i in range(count):
-                    for j in range(3, 12):
-                        offset = 84 + i * 50 + j * 4
-                        value = float(_scale_number(str(struct.unpack_from("<f", raw, offset)[0]), factor, name=path.name))
-                        try:
-                            struct.pack_into("<f", out, offset, value)
-                        except (OverflowError, struct.error) as exc:
-                            raise PreviewError(f"{path.name} has an out-of-range coordinate") from exc
-                tmp.write_bytes(out)
+                    base = 84 + i * 50 + 12
+                    v0, v1, v2, v3, v4, v5, v6, v7, v8 = unpack_9f(raw, base)
+                    for c in (v0, v1, v2, v3, v4, v5, v6, v7, v8):
+                        if not (math.isfinite(c) and abs(c) <= MAX_COORDINATE_MM):
+                            raise PreviewError(f"{path.name} has a non-finite or out-of-range coordinate")
+                    v0 *= factor; v1 *= factor; v2 *= factor
+                    v3 *= factor; v4 *= factor; v5 *= factor
+                    v6 *= factor; v7 *= factor; v8 *= factor
+                    for c in (v0, v1, v2, v3, v4, v5, v6, v7, v8):
+                        if not (math.isfinite(c) and abs(c) <= MAX_COORDINATE_MM):
+                            raise PreviewError(f"{path.name} has an out-of-range coordinate")
+                    pack_9f(raw, base, v0, v1, v2, v3, v4, v5, v6, v7, v8)
+                tmp.write_bytes(raw)
             else:
-                lines = raw.decode("utf-8", errors="strict").splitlines(keepends=True)
+                try:
+                    text = raw.decode("utf-8", errors="strict")
+                except UnicodeError:
+                    raise PreviewError(_stl_no_vertices(path.name, raw))
+                lines = text.splitlines(keepends=True)
                 result = []
+                vertex_found = False
                 for line in lines:
                     parts = line.split()
                     if parts and parts[0] == "vertex":
                         if len(parts) != 4:
                             raise PreviewError(f"{path.name} has a malformed STL vertex")
                         line = "vertex " + " ".join(_scale_number(x, factor, name=path.name) for x in parts[1:]) + "\n"
+                        vertex_found = True
                     result.append(line)
+                if not vertex_found:
+                    raise PreviewError(_stl_no_vertices(path.name, raw))
                 tmp.write_text("".join(result))
         elif suffix == ".obj":
-            lines = path.read_text().splitlines(keepends=True)
+            try:
+                lines = path.read_text().splitlines(keepends=True)
+            except UnicodeError:
+                raise PreviewError(f"{path.name} is not a valid text OBJ file")
             result = []
+            vertex_found = False
             for line in lines:
                 parts = line.split()
                 if parts and parts[0] == "v":
@@ -723,14 +799,19 @@ def scale_file(path: Path, factor: float, out_path: Path) -> None:
                         raise PreviewError(f"{path.name} has a malformed OBJ vertex")
                     line = "v " + " ".join(_scale_number(x, factor, name=path.name) for x in parts[1:4])
                     line += (" " + " ".join(parts[4:]) if parts[4:] else "") + "\n"
+                    vertex_found = True
                 result.append(line)
+            if not vertex_found:
+                raise PreviewError(f"{path.name} has no readable OBJ vertices")
             tmp.write_text("".join(result))
         else:
             raise PreviewError(f"{path.name}: cannot scale this file type")
-        read_scene(tmp)
+        measure_size(tmp)
         os.replace(tmp, out_path)
         tmp = None
     except (OSError, UnicodeError, ValueError) as exc:
+        if isinstance(exc, PreviewError):
+            raise
         raise PreviewError(f"{path.name}: cannot scale geometry ({exc})") from exc
     finally:
         if tmp is not None:

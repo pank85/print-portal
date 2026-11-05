@@ -1790,8 +1790,11 @@ def api_confirm_slice(jid: str, body: dict | None = None):
         # 2. Resize, if requested
         if "resize" in body:
             canonical_path = _canonical_model(jid, job)
-            scene = preview.read_scene(canonical_path)
-            factor = uniform_max_factor(scene["bbox"]["size"], body["resize"])
+            try:
+                dims = preview.measure_size(canonical_path)
+            except (preview.PreviewError, OSError) as exc:
+                raise HTTPException(400, f"resize unavailable: {exc}") from exc
+            factor = uniform_max_factor(dims, body["resize"])
             stat_before = canonical_path.stat()
             snapshot_size = stat_before.st_size
             snapshot_mtime = stat_before.st_mtime_ns
@@ -1816,6 +1819,8 @@ def api_confirm_slice(jid: str, body: dict | None = None):
                         raise HTTPException(409, "retained geometry unavailable")
                     os.replace(out_tmp, canonical_path)
                     job = write_job(jid, model_bytes=canonical_path.stat().st_size)
+            except preview.PreviewError as exc:
+                raise HTTPException(400, f"resize failed: {exc}") from exc
             finally:
                 out_tmp.unlink(missing_ok=True)
 
@@ -2060,8 +2065,10 @@ def _scale_fins(jid: str, job: dict, payload: dict):
         raise HTTPException(400, "size is implausibly large")
     name = Path(job.get("filename") or "").name
     path = job_dir(jid) / "upload" / name
-    scene = preview.read_scene(path)
-    size = scene["bbox"]["size"]
+    try:
+        size = preview.measure_size(path)
+    except (preview.PreviewError, OSError) as exc:
+        raise HTTPException(409, f"resize unavailable: {exc}") from exc
     # Axis map: width=bbox[0], length=bbox[1], height=bbox[2].
     idx = {"width": 0, "length": 1, "height": 2, "x": 0, "y": 1, "z": 2}[axis]
     current = float(size[idx])
@@ -2071,13 +2078,18 @@ def _scale_fins(jid: str, job: dict, payload: dict):
     if factor <= 0 or factor > 100:
         raise HTTPException(400, "resulting scale is out of range")
     out = path.with_name(path.stem + ".scaled_tmp" + path.suffix)
-    preview.scale_file(path, factor, out)
-    os.replace(out, path)
-    write_job(jid, scale_axis=axis, scale_value=value,
-              scale_factor=factor)
-    new_scene = preview.read_scene(path)
-    return {"job": jid, "filename": name, "factor": factor,
-            "size": new_scene["bbox"]["size"]}
+    try:
+        preview.scale_file(path, factor, out)
+        os.replace(out, path)
+        write_job(jid, scale_axis=axis, scale_value=value,
+                  scale_factor=factor)
+        new_size = preview.measure_size(path)
+        return {"job": jid, "filename": name, "factor": factor,
+                "size": new_size}
+    except preview.PreviewError as exc:
+        raise HTTPException(400, f"scale failed: {exc}") from exc
+    finally:
+        out.unlink(missing_ok=True)
 
 
 def _reslice_revision(job: dict, payload: dict) -> None:
@@ -2135,15 +2147,15 @@ def _scale_reslice(jid: str, job: dict, payload: dict) -> dict:
         path = _canonical_model(jid, job)
         candidate = None
         try:
-            scene = preview.read_scene(path)
-            factor = uniform_max_factor(scene["bbox"]["size"], payload["maxima"])
+            size = preview.measure_size(path)
+            factor = uniform_max_factor(size, payload["maxima"])
             cumulative = job.get("manual_scale", 1.0) * factor
             if not math.isfinite(cumulative) or cumulative <= 0:
                 raise HTTPException(400, "resulting scale is out of range")
             with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as f:
                 candidate = Path(f.name)
             preview.scale_file(path, factor, candidate)
-            size = preview.read_scene(candidate)["bbox"]["size"]
+            size = preview.measure_size(candidate)
             updated = _commit_reslice_geometry(jid, job, path, candidate, cumulative)
             return {"job": jid, "filename": path.name, "factor": factor, "size": size,
                     "revision": updated["revision"], "manual_scale": cumulative, "unit": "millimeter"}
@@ -2169,8 +2181,8 @@ def _scale_reslice(jid: str, job: dict, payload: dict) -> dict:
     path = _canonical_model(jid, job)
     candidate = None
     try:
-        scene = preview.read_scene(path)
-        current = scene["bbox"]["size"][axes[axis]]
+        size = preview.measure_size(path)
+        current = size[axes[axis]]
         if not math.isfinite(current) or current <= 0:
             raise HTTPException(400, "cannot scale a zero-size model")
         factor = value / current
@@ -2180,7 +2192,7 @@ def _scale_reslice(jid: str, job: dict, payload: dict) -> dict:
         with tempfile.NamedTemporaryFile(dir=path.parent, suffix=path.suffix, delete=False) as f:
             candidate = Path(f.name)
         preview.scale_file(path, factor, candidate)
-        size = preview.read_scene(candidate)["bbox"]["size"]
+        size = preview.measure_size(candidate)
         updated = _commit_reslice_geometry(jid, job, path, candidate, cumulative)
         return {"job": jid, "filename": path.name, "factor": factor, "size": size,
                 "revision": updated["revision"], "manual_scale": cumulative, "unit": "millimeter"}
