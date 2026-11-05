@@ -319,6 +319,12 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
   background:transparent; color:var(--color-destructive-text); border-color:#EF444466;
 }
 .btn[aria-busy="true"]{ cursor:progress; }
+.spinner{
+  display:inline-block; width:14px; height:14px;
+  border:2px solid currentColor; border-right-color:transparent; border-radius:50%;
+  animation:spin 650ms linear infinite; vertical-align:middle; flex-shrink:0;
+}
+@keyframes spin{ to{ transform:rotate(360deg); } }
 .icon{ width:18px; height:18px; flex:0 0 auto; }
 
 #resliceSettings .preview-scale { display:flex; flex-wrap:wrap; gap:var(--space-2); align-items:end; }
@@ -1396,6 +1402,8 @@ const drop = $("#drop"), input = $("#file");
 let uploading = false;
 /* True while the request body is still moving. The poll must not repaint the box then. */
 let transferPhase = false;
+/* Active while a slice is being confirmed (options, scaling, support-fins preflight). */
+let slicePendingJob = null;
 /* Last time the transfer label was rewritten; the polite live region is throttled by this. */
 let lastPaint = 0;
 function openFilePicker() { if (!uploading) input.click(); }
@@ -1448,6 +1456,7 @@ function resetUploadTrack() {
 
 /* Every failure path lands here: the card resets instead of leaving a bar spinning. */
 function clearUploadWait() {
+  slicePendingJob = null;
   transferPhase = false;
   $("#uploadWait").hidden = true;
   $("#uploadWait").classList.remove("is-uploading");
@@ -1754,6 +1763,17 @@ function setUploadWait(job) {
   const box = $("#uploadWait"), labelEl = $("#uploadWaitLabel"),
         modelEl = $("#uploadWaitModel"), track = $("#uploadWaitTrack");
   const active = !!job && isSlicing(job.status) && !job.error;
+  if (slicePendingJob && (!job || slicePendingJob.id === job.id)) {
+    box.hidden = false;
+    box.classList.remove("is-uploading");
+    resetUploadTrack();
+    const label = slicePendingJob.label;
+    if (labelEl.textContent !== label) labelEl.textContent = label;
+    if (track.getAttribute("aria-label") !== label) track.setAttribute("aria-label", label);
+    const model = slicePendingJob.filename || "";
+    if (modelEl.textContent !== model) { modelEl.textContent = model; modelEl.title = model; }
+    return;
+  }
   box.hidden = !active;
   if (!active) return;
   box.classList.remove("is-uploading");
@@ -2615,6 +2635,13 @@ async function slicePrintOptions() {
 
   btn.dataset.busy = "true";
   btn.disabled = true;
+  btn.setAttribute("aria-busy", "true");
+  const origBtnContent = btn.innerHTML;
+  btn.innerHTML = `<span class="spinner" aria-hidden="true"></span> ${fins ? "Generating support fins…" : "Queueing slice…"}`;
+
+  const pendingLabel = fins ? "generating support fins…" : "waiting for the slicer…";
+  slicePendingJob = { id: job.id, filename: job.filename, label: pendingLabel };
+  setUploadWait({ id: job.id, status: "queued", filename: job.filename });
 
   try {
     let sliceResult, sliceBody;
@@ -2684,6 +2711,7 @@ async function slicePrintOptions() {
     sliceResult = await rSlice.json().catch(() => ({}));
     if (!rSlice.ok) throw new Error((job.kind === "reslice" ? resliceResponseError(rSlice, sliceResult) : sliceResult.detail) || rSlice.statusText || "could not queue the slice");
 
+    slicePendingJob = null;
     $("#printOptions").hidden = true;
     printOptionsJobId = null;
     printOptionsJob = null;
@@ -2693,14 +2721,19 @@ async function slicePrintOptions() {
     toast(sliceResult.queue_position ? `Queued for slice (#${sliceResult.queue_position})` : "Queued for slice");
     await refresh();
   } catch (e) {
+    slicePendingJob = null;
+    setUploadWait(null);
     if (errEl) {
       errEl.textContent = "Could not queue the slice: " + e.message;
       errEl.hidden = false;
     }
     toast("Not sliced: " + e.message, 6000);
   } finally {
+    slicePendingJob = null;
     btn.dataset.busy = "";
     btn.disabled = false;
+    btn.removeAttribute("aria-busy");
+    btn.innerHTML = origBtnContent;
   }
 }
 

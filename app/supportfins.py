@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import shutil
 import subprocess
 import threading
@@ -136,9 +137,13 @@ def fin_model(src: Path, dest: Path, *, timeout: float | None = None) -> dict:
         if dest.exists():
             dest.unlink()
         try:
+            env = dict(os.environ)
+            if "NODE_OPTIONS" not in env or "--max-old-space-size" not in env["NODE_OPTIONS"]:
+                env["NODE_OPTIONS"] = f"--max-old-space-size=4096 {env.get('NODE_OPTIONS', '')}".strip()
             proc = subprocess.run(
                 [_NODE, str(CLI), str(src), "-o", str(dest), "--json"],
                 stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, timeout=limit,
+                env=env,
             )
         except subprocess.TimeoutExpired as exc:
             raise SupportFinsError(f"support fins timed out after {limit:g}s") from exc

@@ -105,6 +105,7 @@ def test_fin_model_invokes_the_cli_with_json_and_returns_its_report(cli, src, tm
     assert calls[0]["argv"] == ["node", str(cli), str(src), "-o", str(dest), "--json"]
     assert calls[0]["timeout"] == supportfins.DEFAULT_TIMEOUT
     assert calls[0]["text"] is True
+    assert "--max-old-space-size=4096" in calls[0]["env"]["NODE_OPTIONS"]
     assert result == {"report": "3 walls, 3 tines",
                       "stats": {"tines": 3, "finTriangles": 12}}
     assert dest.read_bytes().startswith(b"PK\x03\x04")
