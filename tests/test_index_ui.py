@@ -731,6 +731,23 @@ def test_upload_wait_region_is_updated_in_place_without_innerhtml(page):
     assert not re.search(r"setUploadWait\s*\(\s*null\s*\)", try_part)
 
 
+def test_slice_pending_feedback_and_spinner(page):
+    """Confirming a slice provides immediate accessible feedback and maintains wait during support fins."""
+    style = page[page.index("<style>"):page.index("</style>")]
+    assert ".spinner" in style
+    assert "@keyframes spin" in style
+    assert "cursor:progress" in style
+
+    wait_body = function_body(page, "setUploadWait")
+    assert "slicePendingJob" in wait_body
+    assert "box.hidden = false" in wait_body
+
+    slice_body = function_body(page, "slicePrintOptions")
+    assert 'btn.setAttribute("aria-busy", "true")' in slice_body
+    assert "Generating support fins…" in slice_body
+    assert "slicePendingJob = " in slice_body
+
+
 def test_reduced_motion_keeps_the_slice_indicator_visible(page):
     """Motion off freezes the sweep, so the frozen state has to be a visible static bar.
 
