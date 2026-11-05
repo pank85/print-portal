@@ -1350,8 +1350,9 @@ def test_the_preview_dialog_is_a_labelled_modal_with_a_fallback(page):
     assert 'class="dialog"' in dlg
     assert 'aria-labelledby="previewTitle"' in dlg
     assert 'aria-describedby="previewHint"' in dlg
-    assert '<h2 id="previewTitle">Support fins preview</h2>' in dlg
+    assert '<h2 id="previewTitle">Preview</h2>' in dlg
     assert 'id="previewHint"' in dlg and 'class="hint"' in dlg
+    assert 'id="previewGcodeImg"' in dlg
 
     canvas = dlg[dlg.rindex("<canvas", 0, dlg.index('id="previewCanvas"')):]
     canvas = canvas[:canvas.index(">")]
@@ -1479,24 +1480,26 @@ def test_closing_keeps_the_job_and_discarding_asks_first(page):
 
 
 def test_the_last_job_block_offers_preview_and_slice_for_a_staged_job(page):
-    """A finned upload lands on the card with preview, but no slice button.
+    """A staged upload hides preview unless it is a reslice draft; a sliced job shows Preview."""
+    import shutil
+    import subprocess
 
-    Print options owns the single Slice it button.
-    """
     card = upload_card(page)
     tag = card[card.rindex("<button", 0, card.index('id="uploadLatestPreview"')):]
     tag = tag[:tag.index(">")]
     assert 'data-act="preview"' in tag
-    assert "hidden" in tag                              # only a staged job shows it
-    assert "aria-label=" in tag
-    assert "Preview fins" in card[card.index('id="uploadLatestPreview"'):]
+    assert "hidden" in tag                              # only shown dynamically
+    assert 'aria-label="Preview the sliced model"' in tag
+    assert "Preview" in card[card.index('id="uploadLatestPreview"'):]
+    assert "Preview fins" not in card[card.index('id="uploadLatestPreview"'):]
     assert 'id="uploadLatestSlice"' not in card
 
     latest = function_body(page, "setUploadLatest")
     assert 'const staged = job.status === "awaiting_confirm" && !job.error;' in latest
-    assert "preview.hidden = !staged;" in latest
-    assert 'preview.dataset.ref = staged ? job.id : "";' in latest
-    assert "preview.setAttribute(\"aria-label\", `Preview the support fins on ${name}`);" in latest
+    assert 'job.kind === "reslice"' in latest
+    assert 'preview.textContent = "Resume reslice";' in latest
+    assert 'preview.hidden = true;' in latest
+    assert 'preview.textContent = "Preview";' in latest
 
     handler = function_body(page, "onJobAction")
     assert 'btn.dataset.act === "preview"' in handler
@@ -1507,18 +1510,172 @@ def test_the_last_job_block_offers_preview_and_slice_for_a_staged_job(page):
     assert '$("#uploadLatest").addEventListener("click", onJobAction);' in page
     assert page.count("/preview`") == 1                 # one dialog, one request path
 
+    node = shutil.which("node")
+    if node:
+        js = r'''
+const assert = require('assert');
+const elements = {};
+for (const id of ['uploadLatest', 'uploadLatestBody', 'uploadLatestPrint', 'uploadLatestGcode',
+                  'uploadLatestFromLayer', 'uploadLatestPreview', 'uploadLatestDelete', 'uploadLatestReslice']) {
+  elements[id] = {hidden:false, textContent:'', dataset:{}, setAttribute(k,v){this[k]=v;}};
+}
+const $ = s => elements[s.slice(1)];
+const renderJobBody = () => '';
+const jobPrintable = j => j.status === 'sliced' && !j.error;
+const reslicePending = new Set();
+''' + function_body(page, "setUploadLatest") + "\n}\n" + r'''
+// 1. Non-reslice staged upload -> preview hidden
+const stagedNonReslice = {id:'j1', status:'awaiting_confirm', filename:'part.stl'};
+setUploadLatest(stagedNonReslice);
+assert.equal(elements.uploadLatestPreview.hidden, true);
+
+// 2. Reslice staged upload -> preview visible as "Resume reslice"
+const stagedReslice = {id:'j2', kind:'reslice', status:'awaiting_confirm', filename:'part.stl'};
+setUploadLatest(stagedReslice);
+assert.equal(elements.uploadLatestPreview.hidden, false);
+assert.equal(elements.uploadLatestPreview.textContent, 'Resume reslice');
+assert.equal(elements.uploadLatestPreview.dataset.ref, 'j2');
+
+// 3. Sliced job -> preview visible as "Preview"
+const sliced = {id:'j3', status:'sliced', filename:'part.gcode'};
+setUploadLatest(sliced);
+assert.equal(elements.uploadLatestPreview.hidden, false);
+assert.equal(elements.uploadLatestPreview.textContent, 'Preview');
+assert.equal(elements.uploadLatestPreview.dataset.ref, 'j3');
+'''
+        subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
+
 
 def test_a_staged_row_offers_both_preview_and_slice_it(page):
+    import shutil
+    import subprocess
+
     row = function_body(page, "renderJobRow")
     staged = slice_between(row, "const staged =", ': "";')
+    actions = slice_between(row, "const actions =", ': "";')
 
-    assert 'data-act="preview"' in staged
+    # staged rows do not render "Preview fins"; only "Print options" unless reslice
+    assert "Preview fins" not in staged
+    assert "Print options" in staged
     assert 'data-act="options"' in staged
     assert 'data-act="slice"' not in staged
-    assert staged.index('data-act="preview"') < staged.index('data-act="options"')
-    assert "Preview fins" in staged and "Print options" in staged
-    # a failed or finished job gets neither: neither can be reviewed or queued any more
+    assert 'j.kind === "reslice"' in staged
+    assert "Resume reslice" in staged
     assert 'j.status === "awaiting_confirm" && !j.error' in row
+
+    # sliced rows render the "Preview" button adjacent to Print
+    assert 'data-act="preview"' in actions
+    assert "Preview" in actions
+    assert 'data-act="print"' in actions
+    assert actions.index('data-act="print"') < actions.index('data-act="preview"')
+
+    node = shutil.which("node")
+    if node:
+        js = r'''
+const assert = require('assert');
+const esc = s => s;
+const renderJobBody = () => '';
+const jobPrintable = j => j.status === 'sliced' && !j.error;
+''' + function_body(page, "renderJobRow") + "\n}\n" + r'''
+// 1. Non-reslice staged job has Print options but no Preview
+const row1 = renderJobRow({id:'j1', status:'awaiting_confirm'});
+assert.ok(row1.includes('Print options'));
+assert.ok(!row1.includes('Preview fins'));
+assert.ok(!row1.includes('Resume reslice'));
+assert.ok(!row1.includes('data-act="preview"'));
+
+// 2. Reslice staged job has Resume reslice
+const row2 = renderJobRow({id:'j2', kind:'reslice', status:'awaiting_confirm'});
+assert.ok(row2.includes('Resume reslice'));
+assert.ok(row2.includes('data-act="preview"'));
+
+// 3. Sliced job has Print and Preview
+const row3 = renderJobRow({id:'j3', status:'sliced'});
+assert.ok(row3.includes('Print'));
+assert.ok(row3.includes('Preview'));
+assert.ok(row3.includes('data-act="preview"'));
+'''
+        subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
+
+
+def test_sliced_job_preview_wires_gcode_image_and_stats(page):
+    """Sliced jobs open the preview dialog displaying G-code PNG toolpath and stats."""
+    import shutil
+    import subprocess
+
+    dlg = preview_dialog(page)
+    assert 'id="previewGcodeImg"' in dlg
+    assert 'class="preview-gcode-img"' in dlg
+
+    open_ = function_body(page, "openPreview")
+    assert 'job.status === "sliced"' in open_
+    assert 'G-code preview: ' in open_
+    assert '/gcode-preview' in open_
+    assert 'gcodeImg.src =' in open_
+    assert 'gcodeImg.hidden = false;' in open_
+    assert 'discard.hidden = true;' in open_
+    assert 'closeBtn.textContent = "Close";' in open_
+
+    close = function_body(page, "closePreview")
+    assert 'img.hidden = true;' in close
+    assert 'img.removeAttribute("src");' in close
+    assert 'discard.hidden = false;' in close
+    assert 'closeBtn.textContent = "Keep for later";' in close
+
+    node = shutil.which("node")
+    if node:
+        functions = []
+        for name in ("openPreview", "closePreview"):
+            functions.append(("async " if name != "closePreview" else "") + function_body(page, name) + "\n}")
+        js = r'''
+const assert = require('assert');
+const elements = new Proxy({}, {get(target, id) {
+  if (!target[id]) target[id] = {
+    hidden:false, textContent:'', src:'', dataset:{},
+    replaceChildren(){}, focus(){}, showModal(){this.open=true;},
+    close(){this.open=false;}, setAttribute(k,v){this[k]=v;}, removeAttribute(k){delete this[k];}
+  };
+  return target[id];
+}});
+const $ = s => elements[s.slice(1)];
+const document = {activeElement:{isConnected:true, focus(){}}, getElementById: id => elements[id]};
+let previewBusy = false, previewReturnFocus, previewJob, previewScene, previewDrag, previewHidden, previewView;
+const withPreviewBusy = async (_, action) => action();
+const showPreviewError = () => {};
+global.fetch = async (url) => {
+  if (url.includes('/api/jobs/job-123')) {
+    return {
+      ok: true,
+      json: async () => ({
+        id: 'job-123',
+        status: 'sliced',
+        filename: 'benchy.stl',
+        stats: { layers: 150, time: '1h 12m', grams: 24.5, layer_height: 0.2 }
+      })
+    };
+  }
+  return { ok: false, statusText: 'not found', json: async () => ({}) };
+};
+''' + "\n".join(functions) + r'''
+(async () => {
+  await openPreview('job-123');
+  assert.equal(elements.previewDlg.open, true);
+  assert.equal(elements.previewTitle.textContent, 'G-code preview: benchy.stl');
+  assert.equal(elements.previewGcodeImg.hidden, false);
+  assert.equal(elements.previewGcodeImg.src, '/api/jobs/job-123/gcode-preview');
+  assert.equal(elements.previewCanvas.hidden, true);
+  assert.equal(elements.previewDiscard.hidden, true);
+  assert.equal(elements.previewClose.textContent, 'Close');
+  assert.ok(elements.previewStats.textContent.includes('150'));
+
+  closePreview();
+  assert.equal(elements.previewGcodeImg.hidden, true);
+  assert.ok(!elements.previewGcodeImg.src);
+  assert.equal(elements.previewDiscard.hidden, false);
+  assert.equal(elements.previewClose.textContent, 'Keep for later');
+})().catch(e => { console.error(e); process.exit(1); });
+'''
+        subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
 
 
 def test_the_preview_wires_every_input_and_tears_down_on_close(page):

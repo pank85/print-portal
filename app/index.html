@@ -473,6 +473,8 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 #previewCanvas{ display:block; width:100%; height:100%; touch-action:none; cursor:grab; }
 #previewCanvas:active{ cursor:grabbing; }
 #previewCanvas[hidden]{ display:none; }
+.preview-gcode-img{ max-width:100%; max-height:100%; object-fit:contain; border-radius:var(--radius-sm); margin:0 auto; display:block; }
+.preview-gcode-img[hidden]{ display:none; }
 .preview-shots{
   display:grid; grid-template-columns:1fr 1fr; gap:var(--space-2);
   width:100%; height:100%; align-content:start; overflow-y:auto; padding:var(--space-2); box-sizing:border-box;
@@ -660,10 +662,10 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
               Print from layer…
             </button>
             <button type="button" class="btn" id="uploadLatestPreview"
-                    data-act="preview" aria-label="Preview the support fins" hidden>
+                    data-act="preview" aria-label="Preview the sliced model" hidden>
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
-              Preview fins
+              Preview
             </button>
             <button type="button" class="btn" id="uploadLatestReslice" data-act="reslice" hidden>Reslice…</button>
             <button type="button" class="btn btn-danger" id="uploadLatestDelete"
@@ -920,7 +922,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 </dialog>
 
 <dialog id="previewDlg" class="dialog" aria-labelledby="previewTitle" aria-describedby="previewHint">
-  <h2 id="previewTitle">Support fins preview</h2>
+  <h2 id="previewTitle">Preview</h2>
   <p id="previewHint" class="hint">Support fins preview from the 4 corners of the bed. Green lines are the fins.</p>
   <div id="resliceSettings" hidden>
     <p id="resliceSource" class="hint"></p>
@@ -939,6 +941,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
   <div class="preview-stage">
     <canvas id="previewCanvas" tabindex="0" role="img"
             aria-label="3-D preview of the finned model. Drag to rotate, scroll to zoom, arrow keys to rotate." hidden></canvas>
+    <img id="previewGcodeImg" class="preview-gcode-img" alt="G-code toolpath preview" hidden>
     <div id="previewShots" class="preview-shots" hidden></div>
     <p id="previewFallback" hidden></p>
   </div>
@@ -1855,6 +1858,9 @@ function renderJobRow(j) {
             <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
             Print
           </button>
+          <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">
+            Preview
+          </button>
           <button type="button" class="btn" data-act="from-layer" data-ref="${esc(j.id)}">
             Print from layer…
           </button>
@@ -1865,9 +1871,7 @@ function renderJobRow(j) {
           </a>` : "";
   /* a staged job has nothing to print yet, but it can still be reviewed or configured from here */
   const staged = j.status === "awaiting_confirm" && !j.error ? `
-          <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">
-            ${j.kind === "reslice" ? "Resume reslice" : "Preview fins"}
-          </button>
+          ${j.kind === "reslice" ? `<button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">Resume reslice</button>` : ""}
           <button type="button" class="btn" data-act="options" data-ref="${esc(j.id)}">
             Print options
           </button>` : "";
@@ -1909,13 +1913,27 @@ function setUploadLatest(job) {
   fromLayer.hidden = !printable;
   fromLayer.dataset.ref = printable ? job.id : "";
   fromLayer.setAttribute("aria-label", `Print ${name} from a layer on the bed`);
-  /* staged jobs are previewable up to the moment they queue; the poll re-aims this static button */
+  /* staged uploads only preview reslice drafts; sliced jobs show gcode preview */
   const staged = job.status === "awaiting_confirm" && !job.error;
-  preview.hidden = !staged;
-  preview.dataset.ref = staged ? job.id : "";
-  preview.setAttribute("aria-label", `Preview the support fins on ${name}`);
-  preview.textContent = job.kind === "reslice" ? "Resume reslice" : "Preview fins";
-  if (job.kind === "reslice") preview.setAttribute("aria-label", `Resume reslice of ${name}`);
+  if (staged) {
+    if (job.kind === "reslice") {
+      preview.hidden = false;
+      preview.dataset.ref = job.id;
+      preview.textContent = "Resume reslice";
+      preview.setAttribute("aria-label", `Resume reslice of ${name}`);
+    } else {
+      preview.hidden = true;
+      preview.dataset.ref = "";
+    }
+  } else if (printable) {
+    preview.hidden = false;
+    preview.dataset.ref = job.id;
+    preview.textContent = "Preview";
+    preview.setAttribute("aria-label", `Preview ${name}`);
+  } else {
+    preview.hidden = true;
+    preview.dataset.ref = "";
+  }
   const reslice = $("#uploadLatestReslice");
   reslice.hidden = !job.reslice?.eligible;
   reslice.dataset.ref = job.id;
@@ -2352,11 +2370,12 @@ async function openPreview(id, returnFocus = document.activeElement) {
   if (!id || previewBusy) return;
   return withPreviewBusy("Loading draft…", async () => {
   const dlg = $("#previewDlg"), canvas = $("#previewCanvas"), err = $("#previewError"),
-        legend = $("#previewLegend"), stats = $("#previewStats"), fallback = $("#previewFallback");
+        legend = $("#previewLegend"), stats = $("#previewStats"), fallback = $("#previewFallback"),
+        gcodeImg = $("#previewGcodeImg"), discard = $("#previewDiscard"), closeBtn = $("#previewClose");
   previewReturnFocus = returnFocus;
   previewJob = { id };
   $("#resliceSettings").hidden = true;
-  $("#previewTitle").textContent = "Support fins preview";
+  $("#previewTitle").textContent = "Preview";
   previewScene = null;
   previewDrag = null;
   previewHidden = new Set();
@@ -2366,6 +2385,9 @@ async function openPreview(id, returnFocus = document.activeElement) {
   stats.textContent = "";
   fallback.hidden = true; fallback.textContent = "";
   canvas.hidden = true;
+  if (gcodeImg) { gcodeImg.hidden = true; gcodeImg.removeAttribute("src"); }
+  if (discard) discard.hidden = false;
+  if (closeBtn) closeBtn.textContent = "Keep for later";
   const shots = document.getElementById("previewShots");
   if (shots) { shots.hidden = true; shots.replaceChildren(); }
   $("#previewHint").textContent = "Loading preview…";
@@ -2377,6 +2399,28 @@ async function openPreview(id, returnFocus = document.activeElement) {
     const job = await jr.json().catch(() => ({}));
     if (!jr.ok) throw new Error(job.detail || jr.statusText);
     previewJob = job;
+    if (job.status === "sliced") {
+      $("#previewTitle").textContent = "G-code preview: " + (job.filename || id);
+      const s = job.stats || {};
+      $("#previewHint").textContent = `${s.layers || "?"} layers · ${s.time || "?"} · ${s.grams ? s.grams.toFixed(1) + " g" : "?"}`;
+      stats.textContent = `Time: ${s.time || "?"} · Filament: ${s.grams ? s.grams.toFixed(1) + " g" : "?"} · Layers: ${s.layers || "?"} · Height: ${s.layer_height || "?"} mm`;
+      canvas.hidden = true;
+      if (shots) { shots.hidden = true; shots.replaceChildren(); }
+      $("#resliceSettings").hidden = true;
+      if (gcodeImg) {
+        gcodeImg.src = "/api/jobs/" + encodeURIComponent(id) + "/gcode-preview";
+        gcodeImg.hidden = false;
+      }
+      if (discard) discard.hidden = true;
+      if (closeBtn) {
+        closeBtn.textContent = "Close";
+        closeBtn.focus();
+      }
+      return;
+    }
+    if (gcodeImg) { gcodeImg.hidden = true; gcodeImg.removeAttribute("src"); }
+    if (discard) discard.hidden = false;
+    if (closeBtn) closeBtn.textContent = "Keep for later";
     if (job.kind === "reslice") {
       $("#resliceSettings").hidden = false;
       $("#previewTitle").textContent = "Reslice job";
@@ -2409,6 +2453,12 @@ async function openPreview(id, returnFocus = document.activeElement) {
 
 function closePreview() {
   const dlg = $("#previewDlg");
+  const img = $("#previewGcodeImg");
+  if (img) { img.hidden = true; img.removeAttribute("src"); }
+  const discard = $("#previewDiscard");
+  if (discard) discard.hidden = false;
+  const closeBtn = $("#previewClose");
+  if (closeBtn) closeBtn.textContent = "Keep for later";
   previewDrag = null;
   previewScene = null;
   previewJob = null;
@@ -2771,6 +2821,12 @@ function initPreview() {
       cancelAnimationFrame(previewFrame);
       previewFrame = 0;
     }
+    const img = $("#previewGcodeImg");
+    if (img) { img.hidden = true; img.removeAttribute("src"); }
+    const discard = $("#previewDiscard");
+    if (discard) discard.hidden = false;
+    const closeBtn = $("#previewClose");
+    if (closeBtn) closeBtn.textContent = "Keep for later";
     previewDrag = null;
     previewScene = null;
     previewJob = null;
