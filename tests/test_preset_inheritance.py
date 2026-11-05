@@ -341,3 +341,34 @@ def test_rejected_import_keeps_implicit_selection(client, datadir, monkeypatch, 
     response = client.post('/api/profile/upload', files={'file': ('different.json', json.dumps({'type': 'machine', 'name': 'different machine'}), 'application/json')})
     assert any('not selected' in note for note in response.json()['notes'])
     assert {k: str(v.relative_to(datadir)) for k, v in main.partial_selection().items()} == original
+
+
+def test_preset_caches_reused_and_invalidated_on_change(tmp_path):
+    prof.clear_preset_caches()
+    datadir, resources = tmp_path / 'data', tmp_path / 'resources'
+    parent = put(resources, 'Vendor', 'filament', 'common', filament_max_volumetric_speed=['12'])
+    child = put(datadir, 'Custom', 'filament', 'child', inherits='common', x='child')
+
+    res1 = prof.effective_preset(child, 'filament', datadir, resources)
+    assert res1['filament_max_volumetric_speed'] == ['12']
+    assert (resources.resolve(), 'filament') in prof._PRESET_INDEX_CACHE
+    assert child.resolve() in prof._PRESET_FILE_CACHE
+
+    # Subsequent call reuses cached index and file data
+    res2 = prof.effective_preset(child, 'filament', datadir, resources)
+    assert res2 == res1
+
+    # Adding a conflicting parent invalidates the cache signature and raises ambiguous
+    put(resources, 'Other', 'filament', 'common', filament_max_volumetric_speed=['15'])
+    with pytest.raises(prof.ProfileError, match='ambiguous'):
+        prof.effective_preset(child, 'filament', datadir, resources)
+
+    # Clearing caches resets internal state cleanly
+    prof.clear_preset_caches()
+    assert len(prof._PRESET_INDEX_CACHE) == 0
+    assert len(prof._PRESET_FILE_CACHE) == 0
+
+
+def test_warm_resource_cache_completes_cleanly():
+    prof.warm_resource_cache()
+

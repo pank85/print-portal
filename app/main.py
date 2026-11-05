@@ -921,6 +921,7 @@ def prune() -> None:
 async def lifespan(_app: FastAPI):
     # The slicer worker is the only background thread; the printer is never contacted here.
     threading.Thread(target=worker, daemon=True).start()
+    threading.Thread(target=prof.warm_resource_cache, daemon=True).start()
     yield
 
 
