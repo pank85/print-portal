@@ -1200,15 +1200,25 @@ function presetName(kind, rel) {
 
 /* The only place that turns a machine rel into `?machine=`: the dashboard process list and
    the printer form's process list therefore ask for exactly the same filter (issue 7). */
+const presetInflight = new Map();
 async function fetchPresets(machineRel) {
   const qs = machineRel ? `?machine=${encodeURIComponent(machineRel)}` : "";
-  const r = await fetch(`/api/profiles${qs}`);
-  const list = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(list.detail || r.statusText);
-  for (const kind of ["machine", "process", "filament"]) {
-    for (const row of list[kind] || []) if (row && row.rel) presetNames[kind].set(row.rel, row.name);
-  }
-  return list;
+  if (presetInflight.has(qs)) return presetInflight.get(qs);
+  const task = (async () => {
+    try {
+      const r = await fetch(`/api/profiles${qs}`);
+      const list = await r.json().catch(() => ({}));
+      if (!r.ok) throw new Error(list.detail || r.statusText);
+      for (const kind of ["machine", "process", "filament"]) {
+        for (const row of list[kind] || []) if (row && row.rel) presetNames[kind].set(row.rel, row.name);
+      }
+      return list;
+    } finally {
+      presetInflight.delete(qs);
+    }
+  })();
+  presetInflight.set(qs, task);
+  return task;
 }
 
 /* Programmatic re-fill: assigning innerHTML never fires `change`, so refreshing the selects

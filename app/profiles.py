@@ -100,6 +100,98 @@ BUNDLE_MAX_BYTES = 20 * 1024 * 1024
 
 # The resources belonging to the pinned Orca installation, not the writable datadir.
 ORCA_PROFILES = Path('/opt/orca/resources/profiles')
+_STATIC_ORCA_PROFILES = ORCA_PROFILES.resolve()
+
+_PRESET_FILE_CACHE: dict[Path, tuple[int, int, dict]] = {}
+_PRESET_INDEX_CACHE: dict[tuple[Path, str], tuple[object, dict[str, set[Path]]]] = {}
+
+
+def clear_preset_caches() -> None:
+    _PRESET_FILE_CACHE.clear()
+    _PRESET_INDEX_CACHE.clear()
+
+
+def _read_preset_file(file: Path, ptype: str) -> dict:
+    try:
+        st = file.stat()
+        if st.st_size > BUNDLE_MAX_BYTES:
+            raise ValueError('preset is too large')
+        cached = _PRESET_FILE_CACHE.get(file)
+        if cached is not None and cached[0] == st.st_mtime_ns and cached[1] == st.st_size:
+            data = cached[2]
+        else:
+            data = json.loads(file.read_text(encoding='utf-8'))
+            if not isinstance(data, dict):
+                raise ValueError('preset is not an object')
+            _PRESET_FILE_CACHE[file] = (st.st_mtime_ns, st.st_size, data)
+    except (OSError, ValueError) as exc:
+        raise ProfileError(f'unreadable {ptype} preset: {file.name}') from exc
+    if data.get('type') not in (None, ptype):
+        raise ProfileError(f'invalid {ptype} preset: {file.name}')
+    return dict(data)
+
+
+def _get_root_preset_index(root: Path, ptype: str) -> dict[str, set[Path]]:
+    if not root.is_dir():
+        return {}
+    resolved_root = root.resolve()
+
+    if resolved_root == _STATIC_ORCA_PROFILES:
+        cached = _PRESET_INDEX_CACHE.get((resolved_root, ptype))
+        if cached is not None:
+            return cached[1]
+        index: dict[str, set[Path]] = {}
+        for candidate in resolved_root.glob(f'**/{ptype}/**/*.json'):
+            try:
+                res = candidate.resolve()
+            except OSError:
+                continue
+            if not res.is_relative_to(resolved_root) or not res.is_file():
+                continue
+            try:
+                data = _read_preset_file(res, ptype)
+            except ProfileError:
+                continue
+            name = data.get('name') or candidate.stem
+            if isinstance(name, str):
+                index.setdefault(name, set()).add(res)
+        _PRESET_INDEX_CACHE[(resolved_root, ptype)] = (0, index)
+        return index
+
+    candidates: list[tuple[Path, int, int]] = []
+    for candidate in root.glob(f'**/{ptype}/**/*.json'):
+        try:
+            res = candidate.resolve()
+            if res.is_relative_to(resolved_root) and res.is_file():
+                st = res.stat()
+                candidates.append((res, st.st_mtime_ns, st.st_size))
+        except OSError:
+            continue
+    candidates.sort(key=lambda item: item[0])
+    sig = tuple((str(item[0]), item[1], item[2]) for item in candidates)
+
+    cached = _PRESET_INDEX_CACHE.get((resolved_root, ptype))
+    if cached is not None and cached[0] == sig:
+        return cached[1]
+
+    index = {}
+    for res, _, _ in candidates:
+        try:
+            data = _read_preset_file(res, ptype)
+        except ProfileError:
+            continue
+        name = data.get('name') or res.stem
+        if isinstance(name, str):
+            index.setdefault(name, set()).add(res)
+    _PRESET_INDEX_CACHE[(resolved_root, ptype)] = (sig, index)
+    return index
+
+
+def warm_resource_cache() -> None:
+    """Preload the static OrcaSlicer resources profile index if present."""
+    if _STATIC_ORCA_PROFILES.is_dir():
+        for ptype in ('machine', 'process', 'filament'):
+            _get_root_preset_index(_STATIC_ORCA_PROFILES, ptype)
 
 
 def _resolved_chain(path: Path, ptype: str, datadir: Path,
@@ -118,15 +210,7 @@ def _resolved_chain(path: Path, ptype: str, datadir: Path,
         raise ProfileError('preset escapes the preset roots')
 
     def read_preset(file: Path) -> dict:
-        try:
-            if file.stat().st_size > BUNDLE_MAX_BYTES:
-                raise ValueError('preset is too large')
-            value = json.loads(file.read_text(encoding='utf-8'))
-        except (OSError, ValueError) as exc:
-            raise ProfileError(f'unreadable {ptype} preset: {file.name}') from exc
-        if not isinstance(value, dict) or value.get('type') not in (None, ptype):
-            raise ProfileError(f'invalid {ptype} preset: {file.name}')
-        return value
+        return _read_preset_file(file, ptype)
 
     bindings = load_parent_edges(roots[0])
 
@@ -192,19 +276,9 @@ def _resolved_chain(path: Path, ptype: str, datadir: Path,
         if index is None:
             index = {}
             for root in roots:
-                if not root.is_dir():
-                    continue
-                for candidate in root.glob(f'**/{ptype}/**/*.json'):
-                    resolved = candidate.resolve()
-                    if not resolved.is_relative_to(root) or not resolved.is_file():
-                        continue
-                    try:
-                        value = read_preset(resolved)
-                    except ProfileError:
-                        continue
-                    name = value.get('name') or candidate.stem
-                    if isinstance(name, str):
-                        index.setdefault(name, set()).add(resolved)
+                root_idx = _get_root_preset_index(root, ptype)
+                for name, paths in root_idx.items():
+                    index.setdefault(name, set()).update(paths)
         matches = sorted(index.get(parent, set()))
         # Within a vendor, Orca stores some presets in subdirectories. Prefer the
         # nearest containing directory, stopping at the type directory; never pick a
@@ -300,22 +374,24 @@ def list_parent_candidates(child: Path, ptype: str, datadir: Path,
     for root, prefix in zip(roots, ('datadir', 'resources')):
         if not root.is_dir():
             continue
-        for candidate in root.glob(f'**/{ptype}/**/*.json'):
+        root_idx = _get_root_preset_index(root, ptype)
+        matching = sorted(root_idx.get(inherits, set()))
+        for resolved in matching:
             try:
-                resolved = candidate.resolve()
+                resolved = resolved.resolve()
             except OSError:
                 continue
             if (not resolved.is_relative_to(root) or resolved == child or not resolved.is_file()
                     or resolved.is_symlink() or resolved.stat().st_size > BUNDLE_MAX_BYTES):
                 continue
             try:
-                value = json.loads(resolved.read_text(encoding='utf-8'))
                 raw = resolved.read_bytes()
+                value = json.loads(raw.decode('utf-8'))
             except (OSError, ValueError):
                 continue
             if not isinstance(value, dict) or value.get('type') not in (None, ptype):
                 continue
-            name = value.get('name') or candidate.stem
+            name = value.get('name') or resolved.stem
             if name != inherits:
                 continue
             candidates.append({
