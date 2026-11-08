@@ -147,6 +147,26 @@ def _read_preset_file(file: Path, ptype: str) -> dict:
     return dict(data)
 
 
+def _preset_names_to_index(data: dict, fallback_name: str) -> list[str]:
+    names: list[str] = []
+    name = data.get('name') or fallback_name
+    if isinstance(name, str) and name.strip():
+        names.append(name.strip())
+    renamed = data.get('renamed_from')
+    if isinstance(renamed, str):
+        for old in renamed.split(';'):
+            old = old.strip()
+            if old and old not in names:
+                names.append(old)
+    elif isinstance(renamed, list):
+        for old in renamed:
+            if isinstance(old, str):
+                old = old.strip()
+                if old and old not in names:
+                    names.append(old)
+    return names
+
+
 def _get_root_preset_index(root: Path, ptype: str) -> dict[str, set[Path]]:
     if not root.is_dir():
         return {}
@@ -158,6 +178,8 @@ def _get_root_preset_index(root: Path, ptype: str) -> dict[str, set[Path]]:
             return cached[1]
         index: dict[str, set[Path]] = {}
         for candidate in resolved_root.glob(f'**/{ptype}/**/*.json'):
+            if candidate.name == PORTAL_PROCESS_FILE:
+                continue
             try:
                 res = candidate.resolve()
             except OSError:
@@ -168,14 +190,15 @@ def _get_root_preset_index(root: Path, ptype: str) -> dict[str, set[Path]]:
                 data = _read_preset_file(res, ptype)
             except ProfileError:
                 continue
-            name = data.get('name') or candidate.stem
-            if isinstance(name, str):
+            for name in _preset_names_to_index(data, candidate.stem):
                 index.setdefault(name, set()).add(res)
         _PRESET_INDEX_CACHE[(resolved_root, ptype)] = (0, index)
         return index
 
     candidates: list[tuple[Path, int, int]] = []
     for candidate in root.glob(f'**/{ptype}/**/*.json'):
+        if candidate.name == PORTAL_PROCESS_FILE:
+            continue
         try:
             res = candidate.resolve()
             if res.is_relative_to(resolved_root) and res.is_file():
@@ -196,8 +219,7 @@ def _get_root_preset_index(root: Path, ptype: str) -> dict[str, set[Path]]:
             data = _read_preset_file(res, ptype)
         except ProfileError:
             continue
-        name = data.get('name') or res.stem
-        if isinstance(name, str):
+        for name in _preset_names_to_index(data, res.stem):
             index.setdefault(name, set()).add(res)
     _PRESET_INDEX_CACHE[(resolved_root, ptype)] = (sig, index)
     return index
@@ -260,7 +282,7 @@ def _resolved_chain(path: Path, ptype: str, datadir: Path,
             raise ProfileError(f'explicit {ptype} parent is unavailable or changed') from exc
         if not isinstance(data, dict) or data.get('type') not in (None, ptype):
             raise ProfileError(f'invalid {ptype} preset: {candidate.name}')
-        if (data.get('name') or candidate.stem) != expected:
+        if expected not in _preset_names_to_index(data, candidate.stem):
             raise ProfileError(f'explicit {ptype} parent name does not match inherits')
         return candidate, data
 
@@ -407,12 +429,12 @@ def list_parent_candidates(child: Path, ptype: str, datadir: Path,
                 continue
             if not isinstance(value, dict) or value.get('type') not in (None, ptype):
                 continue
-            name = value.get('name') or resolved.stem
-            if name != inherits:
+            names = _preset_names_to_index(value, resolved.stem)
+            if inherits not in names:
                 continue
             candidates.append({
                 'id': prefix + ':' + resolved.relative_to(root).as_posix(),
-                'name': name,
+                'name': inherits,
                 'sha256': hashlib.sha256(raw).hexdigest(),
                 'source': prefix,
             })

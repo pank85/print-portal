@@ -3,6 +3,7 @@ FROM ubuntu:24.04 AS orca
 
 ARG ORCA_URL=https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v2.5.0/OrcaSlicer_Linux_AppImage_Ubuntu2404_V2.5.0.AppImage
 ARG ORCA_SHA256=d13eb0a9cd618ed080ab6b82c64c0a60c4501aac91e88d5ac2c3b526fb141a7c
+ARG ORCA_TAG=v2.5.0
 
 RUN set -eu; \
     apt-get update; \
@@ -13,6 +14,8 @@ RUN set -eu; \
     chmod +x /tmp/OrcaSlicer.AppImage; \
     cd /tmp && /tmp/OrcaSlicer.AppImage --appimage-extract >/dev/null; \
     mv /tmp/squashfs-root /opt/orca; \
+    curl -fL --retry 3 --retry-delay 2 "https://github.com/OrcaSlicer/OrcaSlicer/archive/refs/tags/${ORCA_TAG}.tar.gz" | \
+      tar -xz --strip-components=3 -C /opt/orca/resources/profiles --wildcards '*/resources/profiles/*'; \
     chmod -R a+rX /opt/orca; \
     mv /opt/orca/bin/orca-slicer /opt/orca/bin/orca-slicer.real; \
     printf '%s\n' '#!/bin/sh' 'export LC_ALL=C' 'exec /opt/orca/libexec/orca-slicer-env /opt/orca/bin/orca-slicer.real "$@"' > /opt/orca/bin/orca-slicer; \
