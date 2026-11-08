@@ -676,24 +676,12 @@ def test_preview_of_a_staged_job_returns_the_scene(client, monkeypatch, cube_stl
 
     response = client.get(f"/api/jobs/{jid}/preview")
 
-    assert response.status_code == 200
-    body = response.json()
-    assert body["job"] == jid
-    assert body["mode"] == "shots"
-    assert body["views"] == ["front_left", "front_right", "rear_left", "rear_right"]
-    assert body["original"] == "cube.stl"
-    assert body["fins"]["stats"]["tines"] == 2
+    assert response.status_code == 409
+    assert "support fins preview is disabled" in response.json()["detail"]
 
-    # Requesting explicit scene mode still returns the geometry scene
     scene_res = client.get(f"/api/jobs/{jid}/preview?mode=scene")
-    assert scene_res.status_code == 200
-    scene_body = scene_res.json()
-    assert scene_body["job"] == jid
-    assert scene_body["unit"] == "millimeter"
-    assert {obj["role"] for obj in scene_body["objects"]} == {"part", "supports"}
-    assert scene_body["original"] == "cube.stl"
-    assert scene_body["fins"]["stats"]["tines"] == 2
-    assert scene_body["bbox"]["size"] == [10.0, 10.0, 0.0]
+    assert scene_res.status_code == 409
+    assert "support fins preview is disabled" in scene_res.json()["detail"]
 
 
 def test_preview_of_a_queued_job_is_a_409(client, cube_stl):
@@ -703,7 +691,7 @@ def test_preview_of_a_queued_job_is_a_409(client, cube_stl):
     response = client.get(f"/api/jobs/{jid}/preview")
 
     assert response.status_code == 409
-    assert "has no support fins" in response.json()["detail"]
+    assert "support fins preview is disabled" in response.json()["detail"]
 
 
 def test_preview_names_an_unreadable_finned_model(client, jobs_dir, cube_stl, fake_fins):
@@ -713,8 +701,7 @@ def test_preview_names_an_unreadable_finned_model(client, jobs_dir, cube_stl, fa
     response = client.get(f"/api/jobs/{jid}/preview")
 
     assert response.status_code == 409
-    assert response.json()["detail"].startswith("preview unavailable: ")
-    assert "is not a readable 3MF archive" in response.json()["detail"]
+    assert "support fins preview is disabled" in response.json()["detail"]
 
 
 def test_an_oversized_finned_mesh_returns_pictures(client, jobs_dir, cube_stl, fake_fins, monkeypatch):
@@ -723,17 +710,92 @@ def test_an_oversized_finned_mesh_returns_pictures(client, jobs_dir, cube_stl, f
 
     listed = client.get(f"/api/jobs/{jid}/preview")
 
-    assert listed.status_code == 200, listed.text
-    body = listed.json()
-    assert body["mode"] == "shots"
-    assert body["views"] == ["front_left", "front_right", "rear_left", "rear_right"]
-    assert body["bytes"] == (jobs_dir / jid / "upload" / "fins-cube.3mf").stat().st_size
+    assert listed.status_code == 409
+    assert "support fins preview is disabled" in listed.json()["detail"]
 
     for view in ("front_left", "front_right", "rear_left", "rear_right", "front", "side"):
         picture = client.get(f"/api/jobs/{jid}/preview-shot?view={view}")
-        assert picture.status_code == 200
-        assert picture.headers["content-type"].startswith("image/png")
-        assert picture.content.startswith(b"\x89PNG")
+        assert picture.status_code == 409
+        assert "support fins preview is disabled" in picture.json()["detail"]
+
+
+def test_preview_reslice_draft_returns_scene(client, jobs_dir):
+    jid = "123456abcdef"
+    d = jobs_dir / jid
+    (d / "upload").mkdir(parents=True)
+    (d / "upload" / "part.obj").write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+    (d / "baseline").write_text("v 0 0 0\nv 1 0 0\nv 0 1 0\nf 1 2 3\n")
+    (d / "job.json").write_text(json.dumps({
+        "id": jid, "status": "awaiting_confirm", "kind": "reslice",
+        "filename": "part.obj", "revision": 0, "canonical_model": "part.obj",
+    }))
+
+    response = client.get(f"/api/jobs/{jid}/preview")
+    assert response.status_code == 200
+    body = response.json()
+    assert body["job"] == jid
+    assert body["mode"] == "scene"
+    assert body["unit"] == "millimeter"
+    assert "bbox" in body
+
+    scene_res = client.get(f"/api/jobs/{jid}/preview?mode=scene")
+    assert scene_res.status_code == 200
+    assert scene_res.json()["mode"] == "scene"
+
+
+def test_gcode_preview_and_thumbnail_on_sliced_job(client, jobs_dir):
+    jid = "feedface1234"
+    sliced_job(jobs_dir, jid=jid, filename="cube.stl")
+    gcode = (jobs_dir / jid / "out" / "cube.gcode")
+    gcode.write_text("G1 X10 Y10 E1.0\nG1 X20 Y20 E2.0\n")
+
+    res = client.get(f"/api/jobs/{jid}/gcode-preview")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("image/png")
+    assert res.headers["cache-control"] == "public, max-age=86400"
+    assert res.content.startswith(b"\x89PNG")
+
+    thumb_res = client.get(f"/api/jobs/{jid}/thumbnail")
+    assert thumb_res.status_code == 200
+    assert thumb_res.headers["content-type"].startswith("image/png")
+    assert thumb_res.headers["cache-control"] == "public, max-age=86400"
+    assert thumb_res.content == res.content
+
+
+def test_gcode_preview_refuses_unsliced_jobs(client, cube_stl):
+    staged_jid = stage(client, cube_stl)
+    res_queued = client.post(f"/api/jobs/{staged_jid}/slice")
+    assert res_queued.status_code == 200
+    res = client.get(f"/api/jobs/{staged_jid}/gcode-preview")
+    assert res.status_code == 409
+    assert res.json()["detail"] == "job is 'queued', not sliced"
+
+    thumb_res = client.get(f"/api/jobs/{staged_jid}/thumbnail")
+    assert thumb_res.status_code == 409
+    assert thumb_res.json()["detail"] == "job is 'queued', not sliced"
+
+    staged_jid2 = stage(client, cube_stl)
+    res_staged = client.get(f"/api/jobs/{staged_jid2}/gcode-preview")
+    assert res_staged.status_code == 409
+    assert res_staged.json()["detail"] == "job is 'awaiting_confirm', not sliced"
+
+
+def test_gcode_preview_404_on_missing_job_or_gcode(client, jobs_dir):
+    res = client.get("/api/jobs/aaaaaaaaaaaa/gcode-preview")
+    assert res.status_code == 404
+    assert res.json()["detail"] == "job not found"
+
+    thumb_res = client.get("/api/jobs/aaaaaaaaaaaa/thumbnail")
+    assert thumb_res.status_code == 404
+    assert thumb_res.json()["detail"] == "job not found"
+
+    jid = "baadf00d1234"
+    sliced_job(jobs_dir, jid=jid, filename="cube.stl")
+    (jobs_dir / jid / "out" / "cube.gcode").unlink()
+
+    missing_res = client.get(f"/api/jobs/{jid}/gcode-preview")
+    assert missing_res.status_code == 404
+    assert missing_res.json()["detail"] == "sliced gcode not found"
 
 
 def test_preview_of_an_unknown_job_is_404(client):
