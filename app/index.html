@@ -923,7 +923,7 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 
 <dialog id="previewDlg" class="dialog" aria-labelledby="previewTitle" aria-describedby="previewHint">
   <h2 id="previewTitle">Preview</h2>
-  <p id="previewHint" class="hint">Support fins preview from the 4 corners of the bed. Green lines are the fins.</p>
+  <p id="previewHint" class="hint">G-code toolpath preview.</p>
   <div id="resliceSettings" hidden>
     <p id="resliceSource" class="hint"></p>
     <p class="hint">Preset references use their current contents, not historical preset contents. Embedded object overrides may still apply.</p>
@@ -1599,6 +1599,11 @@ function onJobAction(ev) {
   if (!btn) {
     if (ev.target.closest("a, button, input, select, label")) return;
     const row = ev.target.closest("article.job");
+    const prevBtn = row && row.querySelector('[data-act="preview"]');
+    if (prevBtn && prevBtn.dataset.ref) {
+      openPreview(prevBtn.dataset.ref, prevBtn);
+      return;
+    }
     const fromBtn = row && row.querySelector('[data-act="from-layer"]');
     if (fromBtn && fromBtn.dataset.ref) openFromLayer(fromBtn.dataset.ref, fromBtn);
     return;
@@ -1858,7 +1863,9 @@ function renderJobRow(j) {
             <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
             Print
           </button>
-          <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">
+          <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}" aria-label="Preview ${esc(j.filename || "sliced model")}">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
             Preview
           </button>
           <button type="button" class="btn" data-act="from-layer" data-ref="${esc(j.id)}">
@@ -2368,7 +2375,7 @@ function previewActionError(message) { $("#previewError").textContent = message;
 
 async function openPreview(id, returnFocus = document.activeElement) {
   if (!id || previewBusy) return;
-  return withPreviewBusy("Loading draft…", async () => {
+  return withPreviewBusy("Loading preview…", async () => {
   const dlg = $("#previewDlg"), canvas = $("#previewCanvas"), err = $("#previewError"),
         legend = $("#previewLegend"), stats = $("#previewStats"), fallback = $("#previewFallback"),
         gcodeImg = $("#previewGcodeImg"), discard = $("#previewDiscard"), closeBtn = $("#previewClose");
@@ -2408,6 +2415,10 @@ async function openPreview(id, returnFocus = document.activeElement) {
       if (shots) { shots.hidden = true; shots.replaceChildren(); }
       $("#resliceSettings").hidden = true;
       if (gcodeImg) {
+        fallback.textContent = "Loading toolpath preview…";
+        fallback.hidden = false;
+        gcodeImg.onload = () => { fallback.hidden = true; fallback.textContent = ""; };
+        gcodeImg.onerror = () => { fallback.textContent = "Toolpath preview could not be loaded."; fallback.hidden = false; gcodeImg.hidden = true; };
         gcodeImg.src = "/api/jobs/" + encodeURIComponent(id) + "/gcode-preview";
         gcodeImg.hidden = false;
       }
@@ -2470,6 +2481,10 @@ function closePreview() {
 
 async function keepPreview() {
   if (previewBusy) return;
+  if (previewJob?.status === "sliced") {
+    closePreview();
+    return;
+  }
   await withPreviewBusy("Saving draft…", async () => {
     try {
       if (previewJob?.kind === "reslice") {

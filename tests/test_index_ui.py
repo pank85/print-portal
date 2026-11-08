@@ -1567,6 +1567,8 @@ def test_a_staged_row_offers_both_preview_and_slice_it(page):
     assert 'data-act="preview"' in actions
     assert "Preview" in actions
     assert 'data-act="print"' in actions
+    assert 'aria-label="Preview' in actions
+    assert '<svg class="icon"' in actions
     assert actions.index('data-act="print"') < actions.index('data-act="preview"')
 
     node = shutil.which("node")
@@ -1621,6 +1623,13 @@ def test_sliced_job_preview_wires_gcode_image_and_stats(page):
     assert 'img.removeAttribute("src");' in close
     assert 'discard.hidden = false;' in close
     assert 'closeBtn.textContent = "Keep for later";' in close
+
+    keep = function_body(page, "keepPreview")
+    assert 'if (previewJob?.status === "sliced") {\n    closePreview();' in keep
+
+    handler = function_body(page, "onJobAction")
+    assert 'const prevBtn = row && row.querySelector(\'[data-act="preview"]\');' in handler
+    assert "openPreview(prevBtn.dataset.ref, prevBtn);" in handler
 
     node = shutil.which("node")
     if node:
