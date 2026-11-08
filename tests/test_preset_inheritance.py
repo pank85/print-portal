@@ -372,3 +372,47 @@ def test_preset_caches_reused_and_invalidated_on_change(tmp_path):
 def test_warm_resource_cache_completes_cleanly():
     prof.warm_resource_cache()
 
+
+def test_renamed_from_resolves_inherited_presets(tmp_path):
+    prof.clear_preset_caches()
+    datadir, resources = tmp_path / 'data', tmp_path / 'resources'
+    # Parent in resources has a new name, but carries renamed_from with legacy aliases
+    put(resources, 'Creality', 'process', 'new_name',
+        renamed_from='legacy_one; legacy_two',
+        layer_height='0.2')
+    put(resources, 'Bambu', 'filament', 'bambu_new',
+        renamed_from=['legacy_filament_alias'],
+        filament_cost=['20'])
+
+    child_p1 = put(datadir, 'Custom', 'process', 'child_p1', inherits='legacy_one', wall_loops='3')
+    child_p2 = put(datadir, 'Custom', 'process', 'child_p2', inherits='legacy_two', wall_loops='4')
+    child_f = put(datadir, 'Custom', 'filament', 'child_f', inherits='legacy_filament_alias', nozzle_temperature=['210'])
+
+    eff1 = prof.effective_preset(child_p1, 'process', datadir, resources)
+    assert eff1['layer_height'] == '0.2'
+    assert eff1['wall_loops'] == '3'
+
+    eff2 = prof.effective_preset(child_p2, 'process', datadir, resources)
+    assert eff2['layer_height'] == '0.2'
+    assert eff2['wall_loops'] == '4'
+
+    eff_f = prof.effective_preset(child_f, 'filament', datadir, resources)
+    assert eff_f['filament_cost'] == ['20']
+    assert eff_f['nozzle_temperature'] == ['210']
+
+
+def test_portal_process_file_excluded_from_indexing(tmp_path):
+    prof.clear_preset_caches()
+    datadir, resources = tmp_path / 'data', tmp_path / 'resources'
+    put(resources, 'Vendor', 'process', 'parent_preset', layer_height='0.2')
+    child = put(datadir, 'Custom', 'process', 'child_preset', inherits='parent_preset')
+
+    # A portal options process preset written to datadir copying parent settings must not conflict
+    opt_file = datadir / 'system' / 'Custom' / 'process' / prof.PORTAL_PROCESS_FILE
+    opt_file.parent.mkdir(parents=True, exist_ok=True)
+    opt_file.write_text(json.dumps({'type': 'process', 'name': 'parent_preset', 'layer_height': '0.2'}))
+
+    eff = prof.effective_preset(child, 'process', datadir, resources)
+    assert eff['layer_height'] == '0.2'
+
+
