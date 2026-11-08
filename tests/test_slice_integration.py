@@ -32,7 +32,11 @@ import pytest
 import fit
 import profiles as prof
 
-CANDIDATE_BINARIES = ("/opt/orca/bin/orca-slicer", "/tmp/opt-orca/bin/orca-slicer")
+CANDIDATE_BINARIES = (
+    "/opt/orca/bin/orca-slicer",
+    "/tmp/opt-orca-2.5.0/bin/orca-slicer",
+    "/tmp/opt-orca/bin/orca-slicer",
+)
 SLICE_TIMEOUT = 180
 
 
@@ -63,9 +67,32 @@ def slice_stl(orca: str, datadir: Path, presets: dict[str, Path], stl: bytes,
     (out / "home").mkdir(parents=True)
     env = {**os.environ, "HOME": str(out / "home"), "QT_QPA_PLATFORM": "offscreen",
            "DISPLAY": "", "LC_ALL": "C"}
+
+    # Prepare effective presets matching production (app/main.py: _pin_model_locked).
+    # If a machine preset explicitly tests `from: "user"`, pass raw so the slicer
+    # rejects the invalid preset.
+    machine_raw = json.loads(presets["machine"].read_text())
+    if machine_raw.get("from") == "user":
+        load_settings = f"{presets['machine']};{presets['process']}"
+        load_filaments = str(presets["filament"])
+    else:
+        eff_dir = tmp_path / "effective"
+        eff_dir.mkdir(parents=True, exist_ok=True)
+        eff_machine = eff_dir / "machine.json"
+        eff_process = eff_dir / "process.json"
+        eff_filament = eff_dir / "filament.json"
+        m_eff = prof.effective_preset(presets["machine"], "machine", datadir)
+        p_eff = prof.effective_preset(presets["process"], "process", datadir) if json.loads(presets["process"].read_text()).get("inherits") else json.loads(presets["process"].read_text())
+        f_eff = prof.effective_preset(presets["filament"], "filament", datadir) if json.loads(presets["filament"].read_text()).get("inherits") else json.loads(presets["filament"].read_text())
+        prof.write_json_atomic(eff_machine, m_eff)
+        prof.write_json_atomic(eff_process, p_eff)
+        prof.write_json_atomic(eff_filament, f_eff)
+        load_settings = f"{eff_machine};{eff_process}"
+        load_filaments = str(eff_filament)
+
     argv = [orca, "--datadir", str(datadir),
-            "--load-settings", f"{presets['machine']};{presets['process']}",
-            "--load-filaments", str(presets["filament"]),
+            "--load-settings", load_settings,
+            "--load-filaments", load_filaments,
             "--slice", "0", *extra_args, "--outputdir", str(out), str(stl_path)]
 
     proc = subprocess.run(argv, capture_output=True, text=True, env=env, cwd=tmp_path,
@@ -224,7 +251,7 @@ def test_the_real_slicer_rejects_a_user_sourced_machine(empty_datadir, bundle_by
 
     result, out = slice_stl(orca, empty_datadir, presets, cube_stl, tmp_path)
 
-    assert result["return_code"] == -17, result
+    assert result["return_code"] in (-17, -5), result
     assert not (out / "plate_1.gcode").exists()
 
 

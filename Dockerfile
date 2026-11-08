@@ -1,8 +1,8 @@
 # print-portal: OrcaSlicer slicing service (amd64 only)
 FROM ubuntu:24.04 AS orca
 
-ARG ORCA_URL=https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v2.4.2/OrcaSlicer_Linux_AppImage_Ubuntu2404_V2.4.2.AppImage
-ARG ORCA_SHA256=d12fb8c8eac1aecd2dfb6377acd48f994f8fa439ed5292fa532dd82880f029fd
+ARG ORCA_URL=https://github.com/OrcaSlicer/OrcaSlicer/releases/download/v2.5.0/OrcaSlicer_Linux_AppImage_Ubuntu2404_V2.5.0.AppImage
+ARG ORCA_SHA256=d13eb0a9cd618ed080ab6b82c64c0a60c4501aac91e88d5ac2c3b526fb141a7c
 
 RUN set -eu; \
     apt-get update; \
@@ -13,6 +13,7 @@ RUN set -eu; \
     chmod +x /tmp/OrcaSlicer.AppImage; \
     cd /tmp && /tmp/OrcaSlicer.AppImage --appimage-extract >/dev/null; \
     mv /tmp/squashfs-root /opt/orca; \
+    chmod -R a+rX /opt/orca; \
     mv /opt/orca/bin/orca-slicer /opt/orca/bin/orca-slicer.real; \
     printf '%s\n' '#!/bin/sh' 'export LC_ALL=C' 'exec /opt/orca/libexec/orca-slicer-env /opt/orca/bin/orca-slicer.real "$@"' > /opt/orca/bin/orca-slicer; \
     chmod 0755 /opt/orca/bin/orca-slicer; \
@@ -28,7 +29,7 @@ ENV DEBIAN_FRONTEND=noninteractive \
     ORCA_BIN=/opt/orca/bin/orca-slicer \
     ORCA_DATADIR=/data/orca-datadir \
     HOME=/data/home \
-    SEED_VERSION=2.4.2-2 \
+    SEED_VERSION=2.5.0-1 \
     PATH=/opt/venv/bin:$PATH
 
 RUN set -eu; [ "$(dpkg --print-architecture)" = "amd64" ] || { echo "print-portal images are amd64 only (the OrcaSlicer AppImage is x86_64)"; exit 1; }
@@ -72,6 +73,7 @@ RUN set -eu; \
 
 COPY app /app
 COPY presets/datadir /opt/orca-datadir
+COPY presets/resources/profiles /opt/orca/resources/profiles
 COPY docker/entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod 0755 /usr/local/bin/entrypoint.sh
 COPY scripts/smoke_test.py /opt/smoke_test.py

@@ -81,7 +81,7 @@ is a workaround for a misdiagnosis, and it is why A cannot show the bundle's rea
 ### The seed ships no presets
 
 `presets/datadir/` holds one file, `system/Custom.json`, with four empty lists
-(`machine_model_list`, `process_list`, `filament_list`, `machine_list`). `SEED_VERSION` is `2.4.2-2`.
+(`machine_model_list`, `process_list`, `filament_list`, `machine_list`). `SEED_VERSION` is `2.5.0-1`.
 Import becomes the only way in.
 
 ### Resolution returns `None`; reads never fail, actions 409
@@ -273,8 +273,12 @@ the machine permits the process (`_paired_process`, `main.py:245`), and writes a
 * **B may change before it lands.** Re-read `app/profiles.py` on that branch before trusting the symbol
   names or line numbers above were read before the commit landed; the memory pointers in §2 now
   describe `5e8d328`, which is in `develop`.
-* Whether `-17`/`251`/`from` behave the same on OrcaSlicer > 2.4.2. What would confirm: re-run the
-  bisect recorded at in-progress `profiles.py:31-43` against the newer binary.
+* Measured on OrcaSlicer 2.5.0: the CLI packs official vendor profiles into binary `.opc` files and
+  requires flattened effective presets (stripping `inherits`) when loading via `--load-settings`. It also
+  requires extruder variants (`printer_extruder_variant`, `printer_extruder_id`, `extruder_variant_list`,
+  `default_nozzle_volume_type`, `extruder_type` on machine; `print_extruder_variant`, `print_extruder_id` on process)
+  and `filament_diameter` to avoid null dereferences. Machine preset rejection for `from: "user"` or missing/`"System"`
+  returns return_code `-5` (rc 251) or `-17`.
 * Whether A's merge path was ever tested with a bundle whose `compatible_printers` named the machine.
   A's comment (`profiles.py:31-35`) claims "every other variant stayed at -17"; no artifact of those
   runs exists in the repo. A single slice with a patched `compatible_printers` would settle it.
