@@ -156,11 +156,24 @@ def main() -> None:
             print(f"note: {note}", file=sys.stderr)
         raise SystemExit(1)
 
+    machine = profiles.effective_preset(machine_path, "machine", datadir)
+    profiles.clamp_machine(machine, bed)
+    filament = profiles.effective_preset(filament_path, "filament", datadir)
+    process = profiles.derived_process_data(process_path, datadir, {})
+    eff_dir = workdir / "effective"
+    eff_dir.mkdir(parents=True, exist_ok=True)
+    eff_machine = eff_dir / "machine.json"
+    eff_process = eff_dir / "process.json"
+    eff_filament = eff_dir / "filament.json"
+    profiles.write_json_atomic(eff_machine, machine)
+    profiles.write_json_atomic(eff_process, process)
+    profiles.write_json_atomic(eff_filament, filament)
+
     cmd = [
         args.orca,
         "--datadir", str(datadir),
-        "--load-settings", f"{machine_path};{process_path}",
-        "--load-filaments", str(filament_path),
+        "--load-settings", f"{eff_machine};{eff_process}",
+        "--load-filaments", str(eff_filament),
         "--slice", "0",
         "--outputdir", str(outdir),
         args.stl,

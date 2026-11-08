@@ -98,7 +98,7 @@ runtime.
 
 | Variable | Value | Read by |
 |---|---|---|
-| `SEED_VERSION` | **A:** `2.4.2-1`, **B:** `2.4.2-2` (`Dockerfile:31`) | `docker/entrypoint.sh:5,16` — seeding runs when `.seed-version` differs |
+| `SEED_VERSION` | `2.5.0-1` (`Dockerfile:31`) | `docker/entrypoint.sh:5,16` — seeding runs when `.seed-version` differs |
 | `HOME` | `/data/home` (`Dockerfile:30`), re-exported by the entrypoint | the slicer subprocess |
 | `TMPDIR` | `/data/tmp` (`entrypoint.sh:24`) | Starlette's spooled uploads |
 | `PORT` | `8088` (`Dockerfile:26`) | uvicorn |

@@ -80,7 +80,7 @@ preset file at all — the CLI slices with an empty presets tree, which is why t
 Imported presets land in `$ORCA_DATADIR/system/Custom/{machine,process,filament}` under the bundle's
 own names and are registered in `system/Custom.json`. On container start `docker/entrypoint.sh`
 re-seeds `/opt/orca-datadir` into `$ORCA_DATADIR` whenever the `.seed-version` marker does not match
-`SEED_VERSION` (`2.4.2-2` in the `Dockerfile`).
+`SEED_VERSION` (`2.5.0-1` in the `Dockerfile`).
 
 A machine preset only has to carry `"from": "system"`; its *name* is not policed.
 

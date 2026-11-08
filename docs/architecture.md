@@ -161,7 +161,7 @@ Both are writable state in the container; only the image half survives a contain
 | Path | Where | Created by | Contents |
 |---|---|---|---|
 | `/app` | image | `COPY app /app` (`Dockerfile:65`) | the application code |
-| `/opt/orca` | image | `Dockerfile:2-19` | OrcaSlicer 2.4.2 AppImage, extracted, with a wrapper that sets `LC_ALL=C` |
+| `/opt/orca` | image | `Dockerfile:2-19` | OrcaSlicer 2.5.0 AppImage, extracted, with a wrapper that sets `LC_ALL=C` |
 | `/opt/orca-datadir` | image (read-only seed) | `COPY presets/datadir /opt/orca-datadir` (`Dockerfile:66`) | **A:** 11 preset files incl. `system/Custom/machine/generic-klipper-0.4.json`. **B (uncommitted):** `system/Custom.json` only, four empty lists |
 | `/opt/smoke` | image | `Dockerfile:69-71` | `cube.stl` and `portal-import.orca_printer` for the build-time slice |
 | `$DATA_DIR/jobs` | volume | `entrypoint.sh:15`, `main.py:79` | one directory per job: `upload/`, `out/`, `job.json` |

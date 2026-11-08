@@ -10,14 +10,14 @@ A fresh install ships no preset at all (see `machine_slot`), so import is the on
 Why import needs real work: a bundle carries presets with
   * no `type` field at all (the folder it sits in is the only hint),
   * `compatible_printers` naming a machine preset that does not exist here.
-The one field the CLI is strict about is `from`, measured with OrcaSlicer 2.4.2: a machine
-preset must carry `"from": "system"` (`"user"` -> return_code -17 "The selected printer is not
-compatible with the process preset in the 3mf", `"System"`/`"SYSTEM"`/absent -> return_code 251
-"The input preset file is invalid and can not be parsed"), while process and filament presets
-take `"User"`/`"user"` and reject `"System"`. The CLI tolerates a dangling `inherits` but
-silently uses defaults, so the portal resolves chains itself and refuses incomplete slices.
+The one field the CLI is strict about is `from`, measured with OrcaSlicer 2.4.2 / 2.5.0: a machine
+preset must carry `"from": "system"` (`"user"` -> return_code -17 / -5,
+`"System"`/`"SYSTEM"`/absent -> return_code 251 / -5 "The input preset file is invalid and can not be parsed"),
+while process and filament presets take `"User"`/`"user"` and reject `"System"`. The CLI rejects
+unresolved `inherits` when loading presets directly, so the portal resolves chains itself and strips
+`inherits` when passing effective presets to the slicer.
 Import sets the type and `from`, rewrites `compatible_printers` to the imported machine's own
-name, and preserves the remaining source settings.
+name, defaults required extruder variants and filament diameter, and preserves the remaining source settings.
 """
 from __future__ import annotations
 
@@ -43,10 +43,9 @@ FOLDER_TYPE = {"printer": "machine", "machine": "machine",
 # none, so a fresh install selects nothing there and `partial_selection` drops the key — and
 # an import writes every preset under its own name anyway.
 #
-# The one strict field is `from`. Measured with OrcaSlicer 2.4.2: a machine preset carrying
-# "user" answers -17 "The selected printer is not compatible with the process preset in the
-# 3mf", and "System"/"SYSTEM"/a missing `from` answers 251 "The input preset file is invalid
-# and can not be parsed"; only "system" slices. Process and filament are the mirror image
+# The one strict field is `from`. Measured with OrcaSlicer 2.4.2 / 2.5.0: a machine preset carrying
+# "user" answers -17 / -5, and "System"/"SYSTEM"/a missing `from` answers 251 / -5 "The input preset file
+# is invalid and can not be parsed"; only "system" slices. Process and filament are the mirror image
 # ("User"/"user" fine, "System" invalid). `normalise` enforces both halves.
 DEFAULT_PROFILE = {
     "machine":  "system/Custom/machine/generic-klipper-0.4.json",
@@ -99,7 +98,24 @@ SUMMARISE = {
 BUNDLE_MAX_BYTES = 20 * 1024 * 1024
 
 # The resources belonging to the pinned Orca installation, not the writable datadir.
-ORCA_PROFILES = Path('/opt/orca/resources/profiles')
+def _default_orca_profiles() -> Path:
+    if "ORCA_RESOURCES" in os.environ:
+        return Path(os.environ["ORCA_RESOURCES"])
+    candidate = Path('/opt/orca/resources/profiles')
+    if candidate.is_dir():
+        return candidate
+    orca_bin = os.environ.get("ORCA_BIN")
+    if orca_bin:
+        cand = Path(orca_bin).resolve().parent.parent / "resources" / "profiles"
+        if cand.is_dir():
+            return cand
+    local_repo = Path(__file__).resolve().parent.parent / "presets" / "resources" / "profiles"
+    if local_repo.is_dir():
+        return local_repo
+    return candidate
+
+
+ORCA_PROFILES = _default_orca_profiles()
 _STATIC_ORCA_PROFILES = ORCA_PROFILES.resolve()
 
 _PRESET_FILE_CACHE: dict[Path, tuple[int, int, dict]] = {}
@@ -791,13 +807,26 @@ def normalise(data: dict, ptype: str, machine_name: str | None,
     notes: list[str] = []
     out = dict(data)
     out["type"] = ptype
+    out.setdefault("instantiation", "true")
     if ptype == "machine":
-        # measured with OrcaSlicer 2.4.2: anything but these two literals fails the slice
+        # measured with OrcaSlicer: anything but these two literals fails the slice
         # (-17 for "user", 251 for "System"/"SYSTEM"/absent), so neither is the bundle's
         out["from"] = "system"
-        out["instantiation"] = "true"
+        out.setdefault("extruder_type", ["Direct Drive"])
+        out.setdefault("default_nozzle_volume_type", ["Standard"])
+        out.setdefault("extruder_variant_list", ["Direct Drive Standard"])
+        out.setdefault("printer_extruder_id", ["1"])
+        out.setdefault("printer_extruder_variant", ["Direct Drive Standard"])
     else:
         out["from"] = data["from"] if data.get("from") in ("User", "user") else "User"
+        if ptype == "process":
+            out.setdefault("print_extruder_id", ["1"])
+            out.setdefault("print_extruder_variant", ["Direct Drive Standard"])
+        elif ptype == "filament":
+            out.setdefault("filament_diameter", ["1.75"])
+            if not out.get("filament_id"):
+                name_key = str(out.get("name") or data.get("name") or "filament")
+                out["filament_id"] = "OF" + hashlib.sha256(name_key.encode()).hexdigest()[:6].upper()
     out.setdefault("name", safe_stem(str(data.get("name") or "imported")))
 
     parent = out.get("inherits")
