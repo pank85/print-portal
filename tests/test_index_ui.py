@@ -1352,7 +1352,8 @@ def test_the_preview_dialog_is_a_labelled_modal_with_a_fallback(page):
     assert 'aria-describedby="previewHint"' in dlg
     assert '<h2 id="previewTitle">Preview</h2>' in dlg
     assert 'id="previewHint"' in dlg and 'class="hint"' in dlg
-    assert 'id="previewGcodeImg"' in dlg
+    assert 'id="previewCanvas"' in dlg
+    assert 'id="previewLayerControls"' in dlg
 
     canvas = dlg[dlg.rindex("<canvas", 0, dlg.index('id="previewCanvas"')):]
     canvas = canvas[:canvas.index(">")]
@@ -1601,26 +1602,29 @@ assert.ok(row3.includes('data-act="preview"'));
 
 
 def test_sliced_job_preview_wires_gcode_image_and_stats(page):
-    """Sliced jobs open the preview dialog displaying G-code PNG toolpath and stats."""
+    """Sliced jobs open the preview dialog displaying G-code 3-D canvas, layer slider, and stats."""
     import shutil
     import subprocess
 
     dlg = preview_dialog(page)
-    assert 'id="previewGcodeImg"' in dlg
-    assert 'class="preview-gcode-img"' in dlg
+    assert 'id="previewCanvas"' in dlg
+    assert 'id="previewLayerControls"' in dlg
+    assert 'id="previewLayerSlider"' in dlg
+    assert 'id="previewLayerNumber"' in dlg
+    assert 'id="previewLayerTotal"' in dlg
 
     open_ = function_body(page, "openPreview")
     assert 'job.status === "sliced"' in open_
     assert 'G-code preview: ' in open_
-    assert '/gcode-preview' in open_
-    assert 'gcodeImg.src =' in open_
-    assert 'gcodeImg.hidden = false;' in open_
+    assert '/gcode' in open_
+    assert 'canvas.hidden = false;' in open_
+    assert 'layerControls.hidden = false;' in open_
     assert 'discard.hidden = true;' in open_
     assert 'closeBtn.textContent = "Close";' in open_
 
     close = function_body(page, "closePreview")
-    assert 'img.hidden = true;' in close
-    assert 'img.removeAttribute("src");' in close
+    assert 'canvas.hidden = true;' in close
+    assert 'layerControls.hidden = true;' in close
     assert 'discard.hidden = false;' in close
     assert 'closeBtn.textContent = "Keep for later";' in close
 
@@ -1634,7 +1638,7 @@ def test_sliced_job_preview_wires_gcode_image_and_stats(page):
     node = shutil.which("node")
     if node:
         functions = []
-        for name in ("openPreview", "closePreview"):
+        for name in ("getGCodePreview", "openPreview", "closePreview"):
             functions.append(("async " if name != "closePreview" else "") + function_body(page, name) + "\n}")
         js = r'''
 const assert = require('assert');
@@ -1648,10 +1652,33 @@ const elements = new Proxy({}, {get(target, id) {
 }});
 const $ = s => elements[s.slice(1)];
 const document = {activeElement:{isConnected:true, focus(){}}, getElementById: id => elements[id]};
-let previewBusy = false, previewReturnFocus, previewJob, previewScene, previewDrag, previewHidden, previewView;
+let previewBusy = false, previewReturnFocus, previewJob, previewScene, previewDrag, previewHidden, previewView, previewGcodeInstance = null, gcodePreviewModule = null;
 const withPreviewBusy = async (_, action) => action();
 const showPreviewError = () => {};
+
+let lastGCodeInstance = null;
+global.GCodePreview = {
+  init: ({ canvas }) => {
+    lastGCodeInstance = {
+      canvas,
+      layers: new Array(150),
+      endLayer: 150,
+      renderCount: 0,
+      cleared: false,
+      disposed: false,
+      processGCode: async () => {},
+      render() { this.renderCount++; },
+      clear() { this.cleared = true; },
+      dispose() { this.disposed = true; }
+    };
+    return lastGCodeInstance;
+  }
+};
+
 global.fetch = async (url) => {
+  if (url.includes('/api/jobs/job-123/gcode')) {
+    return { ok: true, text: async () => '; GCODE DATA\nG1 X10 Y10 Z0.2 E1.0\n' };
+  }
   if (url.includes('/api/jobs/job-123')) {
     return {
       ok: true,
@@ -1670,18 +1697,29 @@ global.fetch = async (url) => {
   await openPreview('job-123');
   assert.equal(elements.previewDlg.open, true);
   assert.equal(elements.previewTitle.textContent, 'G-code preview: benchy.stl');
-  assert.equal(elements.previewGcodeImg.hidden, false);
-  assert.equal(elements.previewGcodeImg.src, '/api/jobs/job-123/gcode-preview');
-  assert.equal(elements.previewCanvas.hidden, true);
+  assert.equal(elements.previewCanvas.hidden, false);
+  assert.equal(elements.previewLayerControls.hidden, false);
+  assert.equal(elements.previewLayerSlider.min, '1');
+  assert.equal(elements.previewLayerSlider.max, '150');
+  assert.equal(elements.previewLayerSlider.value, '150');
+  assert.equal(elements.previewLayerNumber.textContent, '150');
+  assert.equal(elements.previewLayerTotal.textContent, '150');
   assert.equal(elements.previewDiscard.hidden, true);
   assert.equal(elements.previewClose.textContent, 'Close');
   assert.ok(elements.previewStats.textContent.includes('150'));
 
+  // Test slider input event:
+  elements.previewLayerSlider.value = '75';
+  elements.previewLayerSlider.oninput();
+  assert.equal(elements.previewLayerNumber.textContent, '75');
+  assert.equal(lastGCodeInstance.endLayer, 75);
+
   closePreview();
-  assert.equal(elements.previewGcodeImg.hidden, true);
-  assert.ok(!elements.previewGcodeImg.src);
+  assert.equal(elements.previewCanvas.hidden, true);
+  assert.equal(elements.previewLayerControls.hidden, true);
   assert.equal(elements.previewDiscard.hidden, false);
   assert.equal(elements.previewClose.textContent, 'Keep for later');
+  assert.equal(lastGCodeInstance.disposed, true);
 })().catch(e => { console.error(e); process.exit(1); });
 '''
         subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
@@ -1863,7 +1901,7 @@ const elements = new Proxy({}, {get(target, id) {
 }});
 const $ = s => s === '#jobsTitle' ? heading : elements[s.slice(1)];
 const document = {activeElement:button, getElementById: id => elements[id]};
-let previewBusy = false, previewReturnFocus, previewJob, previewScene, previewDrag, previewHidden, previewView;
+let previewBusy = false, previewReturnFocus, previewJob, previewScene, previewDrag, previewHidden, previewView, previewGcodeInstance = null;
 const withPreviewBusy = async (_, action) => action();
 const toast = () => {};
 const showPreviewError = () => {};

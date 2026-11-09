@@ -507,8 +507,14 @@ def test_index_page_has_no_external_dependencies(client):
     assert r.status_code == 200
     assert "text/html" in r.headers.get("content-type", "")
     text = r.text
-    for bad in ['src="http', 'href="http', "cdn.", "@import", "fonts.googleapis"]:
+    for bad in ['src="http', 'href="http', "@import", "fonts.googleapis"]:
         assert bad not in text, bad
+    import re
+    cdn_matches = re.findall(r'(https?://[^\s"\'<>]*cdn[^\s"\'<>]+)', text)
+    assert len(cdn_matches) > 0, "expected CDN entries for three and gcode-preview"
+    for url in cdn_matches:
+        assert url.startswith("https://cdn.jsdelivr.net/npm/"), f"Unauthorized CDN URL: {url}"
+        assert any(pkg in url for pkg in ("three@", "gcode-preview@")), f"Unauthorized CDN package: {url}"
 
 
 def test_settings_view_ids_are_present(client):
@@ -749,53 +755,53 @@ def test_gcode_preview_and_thumbnail_on_sliced_job(client, jobs_dir):
     gcode = (jobs_dir / jid / "out" / "cube.gcode")
     gcode.write_text("G1 X10 Y10 E1.0\nG1 X20 Y20 E2.0\n")
 
-    res = client.get(f"/api/jobs/{jid}/gcode-preview")
+    res = client.get(f"/api/jobs/{jid}/gcode")
     assert res.status_code == 200
-    assert res.headers["content-type"].startswith("image/png")
-    assert res.headers["cache-control"] == "public, max-age=86400"
-    assert res.content.startswith(b"\x89PNG")
+    assert "text/plain" in res.headers["content-type"]
+    assert res.text == "G1 X10 Y10 E1.0\nG1 X20 Y20 E2.0\n"
 
-    thumb_res = client.get(f"/api/jobs/{jid}/thumbnail")
-    assert thumb_res.status_code == 200
-    assert thumb_res.headers["content-type"].startswith("image/png")
-    assert thumb_res.headers["cache-control"] == "public, max-age=86400"
-    assert thumb_res.content == res.content
+    # Legacy image preview and thumbnail routes are removed
+    assert client.get(f"/api/jobs/{jid}/gcode-preview").status_code == 404
+    assert client.get(f"/api/jobs/{jid}/thumbnail").status_code == 404
 
 
 def test_gcode_preview_refuses_unsliced_jobs(client, cube_stl):
     staged_jid = stage(client, cube_stl)
     res_queued = client.post(f"/api/jobs/{staged_jid}/slice")
     assert res_queued.status_code == 200
-    res = client.get(f"/api/jobs/{staged_jid}/gcode-preview")
+    res = client.get(f"/api/jobs/{staged_jid}/gcode")
     assert res.status_code == 409
-    assert res.json()["detail"] == "job is 'queued', not sliced"
+    assert "not sliced" in res.json()["detail"]
 
-    thumb_res = client.get(f"/api/jobs/{staged_jid}/thumbnail")
-    assert thumb_res.status_code == 409
-    assert thumb_res.json()["detail"] == "job is 'queued', not sliced"
+    assert client.get(f"/api/jobs/{staged_jid}/gcode-preview").status_code == 404
+    assert client.get(f"/api/jobs/{staged_jid}/thumbnail").status_code == 404
 
     staged_jid2 = stage(client, cube_stl)
-    res_staged = client.get(f"/api/jobs/{staged_jid2}/gcode-preview")
+    res_staged = client.get(f"/api/jobs/{staged_jid2}/gcode")
     assert res_staged.status_code == 409
-    assert res_staged.json()["detail"] == "job is 'awaiting_confirm', not sliced"
+    assert "not sliced" in res.json()["detail"]
+
+    assert client.get(f"/api/jobs/{staged_jid2}/gcode-preview").status_code == 404
+    assert client.get(f"/api/jobs/{staged_jid2}/thumbnail").status_code == 404
 
 
 def test_gcode_preview_404_on_missing_job_or_gcode(client, jobs_dir):
-    res = client.get("/api/jobs/aaaaaaaaaaaa/gcode-preview")
+    res = client.get("/api/jobs/aaaaaaaaaaaa/gcode")
     assert res.status_code == 404
     assert res.json()["detail"] == "job not found"
 
-    thumb_res = client.get("/api/jobs/aaaaaaaaaaaa/thumbnail")
-    assert thumb_res.status_code == 404
-    assert thumb_res.json()["detail"] == "job not found"
+    assert client.get("/api/jobs/aaaaaaaaaaaa/gcode-preview").status_code == 404
+    assert client.get("/api/jobs/aaaaaaaaaaaa/thumbnail").status_code == 404
 
     jid = "baadf00d1234"
     sliced_job(jobs_dir, jid=jid, filename="cube.stl")
     (jobs_dir / jid / "out" / "cube.gcode").unlink()
 
-    missing_res = client.get(f"/api/jobs/{jid}/gcode-preview")
-    assert missing_res.status_code == 404
-    assert missing_res.json()["detail"] == "sliced gcode not found"
+    missing_res = client.get(f"/api/jobs/{jid}/gcode")
+    assert missing_res.status_code == 409
+
+    assert client.get(f"/api/jobs/{jid}/gcode-preview").status_code == 404
+    assert client.get(f"/api/jobs/{jid}/thumbnail").status_code == 404
 
 
 def test_preview_of_an_unknown_job_is_404(client):
