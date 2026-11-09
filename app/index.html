@@ -4,6 +4,15 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Print Portal</title>
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://cdn.jsdelivr.net/npm/three@0.166.0/build/three.module.js",
+    "gcode-preview": "https://cdn.jsdelivr.net/npm/gcode-preview@2.18.0/dist/gcode-preview.es.min.js",
+    "lil-gui": "data:text/javascript,export class GUI {}"
+  }
+}
+</script>
 <style>
 :root{
   color-scheme: dark;
@@ -473,8 +482,26 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
 #previewCanvas{ display:block; width:100%; height:100%; touch-action:none; cursor:grab; }
 #previewCanvas:active{ cursor:grabbing; }
 #previewCanvas[hidden]{ display:none; }
-.preview-gcode-img{ max-width:100%; max-height:100%; object-fit:contain; border-radius:var(--radius-sm); margin:0 auto; display:block; }
-.preview-gcode-img[hidden]{ display:none; }
+.preview-layer-controls{
+  display:flex; flex-direction:column; gap:var(--space-1);
+  background:var(--color-card); border:1px solid var(--color-border);
+  border-radius:var(--radius-sm); padding:var(--space-2) var(--space-3);
+  margin-top:var(--space-2);
+}
+.preview-layer-controls[hidden]{ display:none; }
+.preview-layer-label{
+  display:flex; justify-content:space-between; align-items:center;
+  font-size:var(--text-sm); color:var(--color-muted-foreground);
+}
+.preview-layer-count{ font-family:var(--font-mono); font-size:var(--text-sm); color:var(--color-foreground); font-weight:600; }
+#previewLayerSlider{
+  width:100%; min-height:var(--target-min); height:var(--target-min);
+  accent-color:var(--color-accent); cursor:pointer; margin:0;
+  background:transparent;
+}
+#previewLayerSlider:focus-visible{
+  outline:2px solid var(--color-ring); outline-offset:2px; border-radius:var(--radius-sm);
+}
 .preview-shots{
   display:grid; grid-template-columns:1fr 1fr; gap:var(--space-2);
   width:100%; height:100%; align-content:start; overflow-y:auto; padding:var(--space-2); box-sizing:border-box;
@@ -941,9 +968,15 @@ select{ appearance:none; background-image:none; margin:0; max-width:100%; }
   <div class="preview-stage">
     <canvas id="previewCanvas" tabindex="0" role="img"
             aria-label="3-D preview of the finned model. Drag to rotate, scroll to zoom, arrow keys to rotate." hidden></canvas>
-    <img id="previewGcodeImg" class="preview-gcode-img" alt="G-code toolpath preview" hidden>
     <div id="previewShots" class="preview-shots" hidden></div>
     <p id="previewFallback" hidden></p>
+  </div>
+  <div id="previewLayerControls" class="preview-layer-controls" hidden>
+    <label for="previewLayerSlider" class="preview-layer-label">
+      <span>Layer</span>
+      <span class="preview-layer-count mono"><span id="previewLayerNumber">1</span> / <span id="previewLayerTotal">1</span></span>
+    </label>
+    <input type="range" id="previewLayerSlider" min="1" max="1" value="1" aria-label="Layer slider">
   </div>
   <p id="previewStats" class="mono"></p>
   <div id="previewLegend" class="preview-legend" role="group" aria-label="Objects in the preview"></div>
@@ -2011,6 +2044,32 @@ let previewHidden = new Set();  // object ids the legend has toggled off
 let previewDrag = null;         // {id, x, y} while a pointer is down
 let previewFrame = 0;           // one-shot coalescing, never a loop
 let previewView = { yaw: -0.6, pitch: -0.45, zoom: 1 };
+let previewGcodeInstance = null;
+let gcodePreviewModule = null;
+
+async function getGCodePreview() {
+  if (typeof GCodePreview !== "undefined") return GCodePreview;
+  if (!gcodePreviewModule) {
+    gcodePreviewModule = await import("gcode-preview");
+  }
+  return gcodePreviewModule;
+}
+
+function resetPreviewCanvas() {
+  const canvas = $("#previewCanvas");
+  if (canvas && typeof canvas.cloneNode === "function" && typeof canvas.replaceWith === "function" && canvas.parentNode) {
+    const fresh = canvas.cloneNode(false);
+    canvas.replaceWith(fresh);
+    fresh.addEventListener("pointerdown", previewOrbit);
+    fresh.addEventListener("pointermove", previewOrbit);
+    fresh.addEventListener("pointerup", previewOrbit);
+    fresh.addEventListener("pointercancel", previewOrbit);
+    fresh.addEventListener("wheel", previewZoom, { passive: false });
+    fresh.addEventListener("keydown", previewKey);
+    return fresh;
+  }
+  return canvas;
+}
 
 function prefersReducedMotion() {
   return !!(window.matchMedia && window.matchMedia("(prefers-reduced-motion: reduce)").matches);
@@ -2378,7 +2437,8 @@ async function openPreview(id, returnFocus = document.activeElement) {
   return withPreviewBusy("Loading preview…", async () => {
   const dlg = $("#previewDlg"), canvas = $("#previewCanvas"), err = $("#previewError"),
         legend = $("#previewLegend"), stats = $("#previewStats"), fallback = $("#previewFallback"),
-        gcodeImg = $("#previewGcodeImg"), discard = $("#previewDiscard"), closeBtn = $("#previewClose");
+        discard = $("#previewDiscard"), closeBtn = $("#previewClose"),
+        layerControls = $("#previewLayerControls");
   previewReturnFocus = returnFocus;
   previewJob = { id };
   $("#resliceSettings").hidden = true;
@@ -2387,12 +2447,17 @@ async function openPreview(id, returnFocus = document.activeElement) {
   previewDrag = null;
   previewHidden = new Set();
   previewView = { yaw: -0.6, pitch: -0.45, zoom: 1 };
+  if (previewGcodeInstance) {
+    if (typeof previewGcodeInstance.clear === "function") previewGcodeInstance.clear();
+    if (typeof previewGcodeInstance.dispose === "function") previewGcodeInstance.dispose();
+    previewGcodeInstance = null;
+  }
   err.hidden = true; err.textContent = "";
   legend.replaceChildren();
   stats.textContent = "";
   fallback.hidden = true; fallback.textContent = "";
   canvas.hidden = true;
-  if (gcodeImg) { gcodeImg.hidden = true; gcodeImg.removeAttribute("src"); }
+  if (layerControls) layerControls.hidden = true;
   if (discard) discard.hidden = false;
   if (closeBtn) closeBtn.textContent = "Keep for later";
   const shots = document.getElementById("previewShots");
@@ -2411,25 +2476,62 @@ async function openPreview(id, returnFocus = document.activeElement) {
       const s = job.stats || {};
       $("#previewHint").textContent = `${s.layers || "?"} layers · ${s.time || "?"} · ${s.grams ? s.grams.toFixed(1) + " g" : "?"}`;
       stats.textContent = `Time: ${s.time || "?"} · Filament: ${s.grams ? s.grams.toFixed(1) + " g" : "?"} · Layers: ${s.layers || "?"} · Height: ${s.layer_height || "?"} mm`;
-      canvas.hidden = true;
+      canvas.hidden = false;
+      if (layerControls) layerControls.hidden = false;
       if (shots) { shots.hidden = true; shots.replaceChildren(); }
       $("#resliceSettings").hidden = true;
-      if (gcodeImg) {
-        fallback.textContent = "Loading toolpath preview…";
-        fallback.hidden = false;
-        gcodeImg.onload = () => { fallback.hidden = true; fallback.textContent = ""; };
-        gcodeImg.onerror = () => { fallback.textContent = "Toolpath preview could not be loaded."; fallback.hidden = false; gcodeImg.hidden = true; };
-        gcodeImg.src = "/api/jobs/" + encodeURIComponent(id) + "/gcode-preview";
-        gcodeImg.hidden = false;
-      }
       if (discard) discard.hidden = true;
       if (closeBtn) {
         closeBtn.textContent = "Close";
         closeBtn.focus();
       }
+      fallback.textContent = "Loading G-code toolpath…";
+      fallback.hidden = false;
+      try {
+        const gr = await fetch(`/api/jobs/${encodeURIComponent(id)}/gcode`);
+        if (!gr.ok) throw new Error(gr.statusText || "could not fetch G-code");
+        const gcodeText = await gr.text();
+        const GP = await getGCodePreview();
+        if (previewGcodeInstance) {
+          if (typeof previewGcodeInstance.clear === "function") previewGcodeInstance.clear();
+        } else if (GP && typeof GP.init === "function") {
+          previewGcodeInstance = GP.init({ canvas });
+        }
+        if (previewGcodeInstance) {
+          if (typeof previewGcodeInstance.processGCode === "function") {
+            await previewGcodeInstance.processGCode(gcodeText);
+          }
+          if (typeof previewGcodeInstance.render === "function") {
+            previewGcodeInstance.render();
+          }
+          const totalLayers = (previewGcodeInstance.layers && previewGcodeInstance.layers.length)
+            || (s.layers || 1);
+          const slider = $("#previewLayerSlider");
+          const layerNum = $("#previewLayerNumber");
+          const layerTot = $("#previewLayerTotal");
+          if (slider) {
+            slider.min = "1";
+            slider.max = String(totalLayers);
+            slider.value = String(totalLayers);
+            slider.oninput = () => {
+              if (previewGcodeInstance) {
+                previewGcodeInstance.endLayer = Number(slider.value);
+                if (typeof previewGcodeInstance.render === "function") previewGcodeInstance.render();
+              }
+              if (layerNum) layerNum.textContent = slider.value;
+            };
+          }
+          if (layerNum) layerNum.textContent = String(totalLayers);
+          if (layerTot) layerTot.textContent = String(totalLayers);
+        }
+        fallback.hidden = true; fallback.textContent = "";
+      } catch (e) {
+        fallback.textContent = "Toolpath preview could not be loaded: " + e.message;
+        fallback.hidden = false;
+      }
       return;
     }
-    if (gcodeImg) { gcodeImg.hidden = true; gcodeImg.removeAttribute("src"); }
+    if (layerControls) layerControls.hidden = true;
     if (discard) discard.hidden = false;
     if (closeBtn) closeBtn.textContent = "Keep for later";
     if (job.kind === "reslice") {
@@ -2464,8 +2566,16 @@ async function openPreview(id, returnFocus = document.activeElement) {
 
 function closePreview() {
   const dlg = $("#previewDlg");
-  const img = $("#previewGcodeImg");
-  if (img) { img.hidden = true; img.removeAttribute("src"); }
+  if (previewGcodeInstance) {
+    if (typeof previewGcodeInstance.clear === "function") previewGcodeInstance.clear();
+    if (typeof previewGcodeInstance.dispose === "function") previewGcodeInstance.dispose();
+    previewGcodeInstance = null;
+  }
+  const layerControls = $("#previewLayerControls");
+  if (layerControls) layerControls.hidden = true;
+  const canvas = $("#previewCanvas");
+  if (canvas) canvas.hidden = true;
+  if (typeof resetPreviewCanvas === "function") resetPreviewCanvas();
   const discard = $("#previewDiscard");
   if (discard) discard.hidden = false;
   const closeBtn = $("#previewClose");
@@ -2836,8 +2946,16 @@ function initPreview() {
       cancelAnimationFrame(previewFrame);
       previewFrame = 0;
     }
-    const img = $("#previewGcodeImg");
-    if (img) { img.hidden = true; img.removeAttribute("src"); }
+    if (previewGcodeInstance) {
+      if (typeof previewGcodeInstance.clear === "function") previewGcodeInstance.clear();
+      if (typeof previewGcodeInstance.dispose === "function") previewGcodeInstance.dispose();
+      previewGcodeInstance = null;
+    }
+    const layerControls = $("#previewLayerControls");
+    if (layerControls) layerControls.hidden = true;
+    const canvas = $("#previewCanvas");
+    if (canvas) canvas.hidden = true;
+    if (typeof resetPreviewCanvas === "function") resetPreviewCanvas();
     const discard = $("#previewDiscard");
     if (discard) discard.hidden = false;
     const closeBtn = $("#previewClose");

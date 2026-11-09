@@ -18,8 +18,6 @@ Endpoints
     GET    /api/jobs             job list
     GET    /api/jobs/{id}        job status + stats
     GET    /api/jobs/{id}/gcode  download the sliced gcode
-    GET    /api/jobs/{id}/gcode-preview  preview image of the sliced gcode
-    GET    /api/jobs/{id}/thumbnail      alias for gcode-preview
     POST   /api/jobs/{id}/print  upload the gcode to Moonraker and start it
     DELETE /api/jobs/{id}        remove job directory and its sliced output
     DELETE /api/jobs             remove every finished job (skips active ones)
@@ -58,10 +56,6 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
 import archives
 import config
 import fit
-try:
-    import app.gcode_preview as gcode_preview
-except ImportError:
-    import gcode_preview
 import mesh
 import moonraker
 import preview
@@ -868,10 +862,6 @@ def _run_slice_effective(jid, job, d, src, out, paths, options):
         target = SLICED / jid / f"{job_output_name(job)}.gcode"
         target.parent.mkdir(parents=True, exist_ok=True)
         shutil.move(str(gcode), str(target))
-        try:
-            gcode_preview.get_or_render_preview(target)
-        except Exception as exc:
-            log.warning("could not warm gcode preview cache for %s: %s", jid, exc)
         write_job(jid, status="sliced", elapsed=elapsed, gcode=target.name,
                   gcode_dir="sliced", gcode_bytes=target.stat().st_size, stats=stats,
                   layer_height=(result.get("layer_height") or stats.get("layer_height")))
@@ -2285,30 +2275,13 @@ def api_gcode(jid: str, from_layer: int | None = None, from_z: float | None = No
         )
         return FileResponse(
             rebased,
+            media_type="text/plain",
             filename=f"{job_output_name(job)}_from_layer{meta['start_layer']}_on_bed.gcode",
         )
-    return FileResponse(gcode, filename=job_output_name(job) + ".gcode")
-
-
-@app.get("/api/jobs/{jid}/gcode-preview")
-@app.get("/api/jobs/{jid}/thumbnail")
-def api_gcode_preview(jid: str):
-    job = read_job(jid)
-    if job.get("status") != "sliced":
-        raise HTTPException(409, f"job is '{job.get('status')}', not sliced")
-    path = gcode_path(jid, job)
-    if not path or not path.is_file():
-        raise HTTPException(404, "sliced gcode not found")
-    try:
-        png_path = gcode_preview.get_or_render_preview(path)
-    except FileNotFoundError as exc:
-        raise HTTPException(404, "sliced gcode not found") from exc
-    except Exception as exc:
-        raise HTTPException(500, f"failed to generate preview: {exc}") from exc
     return FileResponse(
-        png_path,
-        media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
+        gcode,
+        media_type="text/plain",
+        filename=job_output_name(job) + ".gcode",
     )
 
 

@@ -1,292 +1,170 @@
-"""Unit tests for app/gcode_preview.py: thumbnail extraction, toolpath rasterization, caching."""
+"""Tests verifying raw G-code delivery with media_type="text/plain" and removal of legacy preview endpoints."""
 from __future__ import annotations
 
-import base64
-import os
-import struct
-import time
-import zlib
+import json
 from pathlib import Path
 
 import pytest
-
-import gcode_preview
-
-PNG_HEADER = b"\x89PNG\r\n\x1a\n"
-JPEG_HEADER = b"\xff\xd8\xff\xe0\x00\x10JFIF\x00"
+from fastapi.testclient import TestClient
 
 
-def _make_dummy_png(w: int, h: int) -> bytes:
-    """Helper to generate minimal valid PNG bytes with specified dimensions."""
-    def chunk(tag: bytes, data: bytes) -> bytes:
-        return (
-            struct.pack(">I", len(data))
-            + tag
-            + data
-            + struct.pack(">I", zlib.crc32(tag + data) & 0xFFFFFFFF)
-        )
-
-    raw = b"".join(b"\x00" + b"\x12\x16\x1c" * w for _ in range(h))
-    ihdr = struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)
-    return PNG_HEADER + chunk(b"IHDR", ihdr) + chunk(b"IDAT", zlib.compress(raw, 1)) + chunk(b"IEND", b"")
-
-
-def _parse_png_ihdr(data: bytes) -> tuple[int, int, int, int]:
-    """Parse width, height, bit_depth, color_type from PNG IHDR chunk."""
-    assert data[:8] == PNG_HEADER, "Invalid PNG magic header"
-    length = struct.unpack(">I", data[8:12])[0]
-    assert length == 13, f"Unexpected IHDR length: {length}"
-    assert data[12:16] == b"IHDR", "First chunk must be IHDR"
-    w, h, bit_depth, color_type = struct.unpack(">IIBB", data[16:26])
-    return w, h, bit_depth, color_type
-
-
-def test_extract_thumbnail_single_png(tmp_path: Path) -> None:
-    png_bytes = _make_dummy_png(32, 32)
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    lines = [
-        "; header comments",
-        f"; thumbnail begin 32x32 {len(png_bytes)}",
-        f"; {b64[:30]}",
-        f"; {b64[30:]}",
-        "; thumbnail end",
-        "G28",
-    ]
-    p = tmp_path / "single.gcode"
-    p.write_text("\n".join(lines), encoding="utf-8")
-
-    result = gcode_preview.extract_thumbnail(p)
-    assert result == png_bytes
-
-
-def test_extract_thumbnail_multi_resolution(tmp_path: Path) -> None:
-    png_small = _make_dummy_png(16, 16)
-    png_large = _make_dummy_png(300, 300)
-    png_mid = _make_dummy_png(64, 64)
-
-    b64_small = base64.b64encode(png_small).decode("ascii")
-    b64_large = base64.b64encode(png_large).decode("ascii")
-    b64_mid = base64.b64encode(png_mid).decode("ascii")
-
-    lines = [
-        f"; thumbnail begin 16x16 {len(png_small)}",
-        f"; {b64_small}",
-        "; thumbnail end",
-        f"; thumbnail begin 300x300 {len(png_large)}",
-        f"; {b64_large}",
-        "; thumbnail end",
-        f"; thumbnail begin 64x64 {len(png_mid)}",
-        f"; {b64_mid}",
-        "; thumbnail end",
-    ]
-    p = tmp_path / "multi.gcode"
-    p.write_text("\n".join(lines), encoding="utf-8")
-
-    result = gcode_preview.extract_thumbnail(p)
-    assert result == png_large
+SAMPLE_MULTI_LAYER_GCODE = """\
+;FLAVOR:Klipper
+;Layer height:0.2
+; HEADER_BLOCK_START
+; total layer number: 4
+; max_z_height: 0.88
+; HEADER_BLOCK_END
+PRINT_START BED=55 EXTRUDER=210
+G90
+G21
+M83
+M106 S0
+;LAYER_CHANGE
+;Z:0.28
+;HEIGHT:0.28
+BEFORE_LAYER_CHANGE LAYER=0
+G1 E-1.2 F2400
+G1 X10 Y10 F9000
+G1 Z0.68
+G1 Z0.28
+G1 E1.2 F1800
+G1 X20 Y10 E0.5
+;LAYER_CHANGE
+;Z:0.48
+;HEIGHT:0.2
+BEFORE_LAYER_CHANGE LAYER=1
+G1 E-1.2 F2400
+G1 X20 Y20 Z0.88
+G1 Z0.48
+G1 E1.2 F1800
+G1 X10 Y20 E0.5
+;LAYER_CHANGE
+;Z:0.68
+;HEIGHT:0.2
+BEFORE_LAYER_CHANGE LAYER=2
+G1 E-1.2 F2400
+G1 X10 Y10 F9000
+G1 Z0.68
+G1 E1.2 F1800
+G1 X20 Y10 E0.5
+;LAYER_CHANGE
+;Z:0.88
+;HEIGHT:0.2
+BEFORE_LAYER_CHANGE LAYER=3
+G1 E-1.2 F2400
+G1 X20 Y20 F9000
+G1 Z0.88
+G1 E1.2 F1800
+G1 X10 Y20 E0.5
+"""
 
 
-def test_extract_thumbnail_jpeg(tmp_path: Path) -> None:
-    jpeg_bytes = JPEG_HEADER + b"\x00" * 32
-    b64 = base64.b64encode(jpeg_bytes).decode("ascii")
-    lines = [
-        f"; thumbnail_JPG begin 200x200 {len(jpeg_bytes)}",
-        f"; {b64}",
-        "; thumbnail_JPG end",
-    ]
-    p = tmp_path / "jpeg.gcode"
-    p.write_text("\n".join(lines), encoding="utf-8")
-
-    result = gcode_preview.extract_thumbnail(p)
-    assert result == jpeg_bytes
-
-
-def test_extract_thumbnail_malformed_base64(tmp_path: Path) -> None:
-    lines = [
-        "; thumbnail begin 64x64 500",
-        "; !@#$%^&*()_+ NOT BASE64",
-        "; thumbnail end",
-    ]
-    p = tmp_path / "malformed.gcode"
-    p.write_text("\n".join(lines), encoding="utf-8")
-
-    assert gcode_preview.extract_thumbnail(p) is None
-
-
-def test_extract_thumbnail_non_image_payload(tmp_path: Path) -> None:
-    text_bytes = b"Hello, this is just plain text, not a PNG or JPEG!"
-    b64 = base64.b64encode(text_bytes).decode("ascii")
-    lines = [
-        "; thumbnail begin 64x64 100",
-        f"; {b64}",
-        "; thumbnail end",
-    ]
-    p = tmp_path / "text.gcode"
-    p.write_text("\n".join(lines), encoding="utf-8")
-
-    assert gcode_preview.extract_thumbnail(p) is None
+def _create_sliced_job(
+    jobs_dir: Path,
+    sliced_dir: Path,
+    jid: str = "feedface1234",
+    filename: str = "cube.stl",
+    gcode_text: str = "; gcode sample\nG1 X10 Y10 E1.0\n",
+) -> Path:
+    job = jobs_dir / jid
+    job.mkdir(parents=True, exist_ok=True)
+    stem = Path(filename).stem
+    gcode_name = f"{stem}.gcode"
+    job_sliced = sliced_dir / jid
+    job_sliced.mkdir(parents=True, exist_ok=True)
+    (job_sliced / gcode_name).write_text(gcode_text, encoding="utf-8")
+    (job / "job.json").write_text(
+        json.dumps({
+            "id": jid,
+            "status": "sliced",
+            "filename": filename,
+            "output_name": stem,
+            "gcode": gcode_name,
+            "gcode_dir": "sliced",
+            "stats": {"grams": 3.94},
+        }),
+        encoding="utf-8",
+    )
+    return job
 
 
-def test_extract_thumbnail_no_thumbnail(tmp_path: Path) -> None:
-    p = tmp_path / "plain.gcode"
-    p.write_text("G28\nG1 X10 Y10 Z0.2 E1.0\n", encoding="utf-8")
-    assert gcode_preview.extract_thumbnail(p) is None
+def test_gcode_preview_module_is_removed() -> None:
+    """Verify app.gcode_preview and gcode_preview modules cannot be imported."""
+    with pytest.raises(ImportError):
+        import gcode_preview  # noqa: F401
+    with pytest.raises(ImportError):
+        import app.gcode_preview  # noqa: F401
 
 
-def test_extract_thumbnail_missing_file(tmp_path: Path) -> None:
-    assert gcode_preview.extract_thumbnail(tmp_path / "missing.gcode") is None
+def test_gcode_endpoint_returns_raw_gcode_text_plain(client: TestClient, jobs_dir: Path, sliced_dir: Path) -> None:
+    """GET /api/jobs/{jid}/gcode returns raw G-code with media_type='text/plain'."""
+    jid = "feedface1234"
+    raw_gcode = "; total filament used [g] = 3.94\nG1 X10 Y10 E1.0\n"
+    _create_sliced_job(jobs_dir, sliced_dir, jid=jid, filename="cube.stl", gcode_text=raw_gcode)
+
+    res = client.get(f"/api/jobs/{jid}/gcode")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/plain")
+    assert res.text == raw_gcode
+    assert 'filename="cube.gcode"' in res.headers.get("content-disposition", "")
 
 
-def test_render_toolpath_preview_absolute_e(tmp_path: Path) -> None:
-    lines = [
-        "M82 ; absolute extrusion",
-        "G90 ; absolute coordinates",
-        "G28 ; home",
-        "G0 X50 Y50 Z0.2 ; travel to start",
-        "G1 X100 Y50 E2.0 F1200 ; layer 1",
-        "G1 X100 Y100 E4.0",
-        "G1 X50 Y100 E6.0",
-        "G1 X50 Y50 E8.0",
-        "G92 E0 ; reset extruder",
-        "G0 Z0.4 ; layer change",
-        "G1 X100 Y50 E2.0",
-        "G1 X100 Y100 E4.0",
-        "G1 X50 Y100 E6.0",
-        "G1 X50 Y50 E8.0",
-    ]
-    p = tmp_path / "box_abs.gcode"
-    p.write_text("\n".join(lines), encoding="utf-8")
+def test_gcode_endpoint_rebased_returns_raw_gcode_text_plain(client: TestClient, jobs_dir: Path, sliced_dir: Path) -> None:
+    """GET /api/jobs/{jid}/gcode with layer rebasing returns media_type='text/plain'."""
+    jid = "c0ffee123456"
+    _create_sliced_job(jobs_dir, sliced_dir, jid=jid, filename="box.stl", gcode_text=SAMPLE_MULTI_LAYER_GCODE)
 
-    png = gcode_preview.render_toolpath_preview(p, size=400)
-    assert png.startswith(PNG_HEADER)
-    w, h, bit_depth, color_type = _parse_png_ihdr(png)
-    assert w == 400
-    assert h == 400
-    assert bit_depth == 8
-    assert color_type == 2
+    res = client.get(f"/api/jobs/{jid}/gcode?from_layer=2")
+    assert res.status_code == 200
+    assert res.headers["content-type"].startswith("text/plain")
+    assert 'filename="box_from_layer2_on_bed.gcode"' in res.headers.get("content-disposition", "")
+    assert "; total layer number: 2" in res.text
+    assert "BEFORE_LAYER_CHANGE LAYER=0" in res.text
 
 
-def test_render_toolpath_preview_relative_e(tmp_path: Path) -> None:
-    lines = [
-        "M83 ; relative extrusion",
-        "G90",
-        "G0 X10 Y10 Z0.2",
-        "G1 X50 Y10 E1.5",
-        "G1 X50 Y50 E1.5",
-        "G1 X10 Y50 E1.5",
-        "G1 X10 Y10 E1.5",
-    ]
-    p = tmp_path / "box_rel.gcode"
-    p.write_text("\n".join(lines), encoding="utf-8")
-
-    png = gcode_preview.render_toolpath_preview(p, size=600)
-    assert png.startswith(PNG_HEADER)
-    w, h, bit_depth, color_type = _parse_png_ihdr(png)
-    assert w == 600
-    assert h == 600
-
-
-def test_render_toolpath_preview_empty_and_travel_only(tmp_path: Path) -> None:
-    empty = tmp_path / "empty.gcode"
-    empty.write_text("; only comments\n; nothing here\n", encoding="utf-8")
-    png_empty = gcode_preview.render_toolpath_preview(empty, size=200)
-    assert png_empty.startswith(PNG_HEADER)
-    assert _parse_png_ihdr(png_empty)[:2] == (200, 200)
-
-    travel = tmp_path / "travel.gcode"
-    travel.write_text("G0 X100 Y100 Z10\nG0 X200 Y200 Z20\n", encoding="utf-8")
-    png_travel = gcode_preview.render_toolpath_preview(travel, size=200)
-    assert png_travel.startswith(PNG_HEADER)
-    assert _parse_png_ihdr(png_travel)[:2] == (200, 200)
-
-
-def test_render_toolpath_preview_missing_file(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        gcode_preview.render_toolpath_preview(tmp_path / "nonexistent.gcode")
-
-
-def test_render_toolpath_preview_decimation(tmp_path: Path) -> None:
-    # Generate 70,000 small segments exceeding MAX_SEGMENTS
-    p = tmp_path / "dense.gcode"
-    with p.open("w", encoding="utf-8") as fh:
-        fh.write("M83\nG90\nG0 X0 Y0 Z0.2\n")
-        for i in range(70_000):
-            fh.write(f"G1 X{i % 200:.2f} Y{(i // 200) % 200:.2f} E0.01\n")
-
-    start = time.perf_counter()
-    png = gcode_preview.render_toolpath_preview(p, size=400)
-    duration = time.perf_counter() - start
-
-    assert png.startswith(PNG_HEADER)
-    assert duration < 2.0, f"Decimated rendering took too long: {duration:.2f}s"
-
-
-def test_get_or_render_preview_embedded_thumbnail(tmp_path: Path) -> None:
-    png_bytes = _make_dummy_png(48, 48)
-    b64 = base64.b64encode(png_bytes).decode("ascii")
-    p = tmp_path / "thumb_job.gcode"
-    p.write_text(
-        f"; thumbnail begin 48x48 {len(png_bytes)}\n; {b64}\n; thumbnail end\nG1 X10 Y10 E1\n",
+def test_gcode_endpoint_unsliced_returns_409(client: TestClient, jobs_dir: Path) -> None:
+    """GET /api/jobs/{jid}/gcode for an unsliced job returns 409."""
+    jid = "baadf00d1234"
+    job = jobs_dir / jid
+    job.mkdir(parents=True, exist_ok=True)
+    (job / "job.json").write_text(
+        json.dumps({
+            "id": jid,
+            "status": "queued",
+            "filename": "model.stl",
+        }),
         encoding="utf-8",
     )
 
-    out = gcode_preview.get_or_render_preview(p)
-    assert out == p.with_suffix(".png")
-    assert out.is_file()
-    assert out.read_bytes() == png_bytes
+    res = client.get(f"/api/jobs/{jid}/gcode")
+    assert res.status_code == 409
+    assert "not sliced" in res.json().get("detail", "")
 
 
-def test_get_or_render_preview_fallback(tmp_path: Path) -> None:
-    p = tmp_path / "no_thumb.gcode"
-    p.write_text("M82\nG90\nG0 X10 Y10 Z0.2\nG1 X20 Y10 E1.0\n", encoding="utf-8")
+def test_legacy_gcode_preview_endpoint_returns_404(client: TestClient, jobs_dir: Path, sliced_dir: Path) -> None:
+    """GET /api/jobs/{jid}/gcode-preview returns 404 for sliced and unsliced jobs."""
+    jid = "feedface1234"
+    _create_sliced_job(jobs_dir, sliced_dir, jid=jid)
 
-    out = gcode_preview.get_or_render_preview(p)
-    assert out == p.with_suffix(".png")
-    assert out.is_file()
-    data = out.read_bytes()
-    assert data.startswith(PNG_HEADER)
-    w, h, _, _ = _parse_png_ihdr(data)
-    assert w == 800 and h == 800
+    # Removed endpoint must return 404 for existing sliced job
+    res = client.get(f"/api/jobs/{jid}/gcode-preview")
+    assert res.status_code == 404
 
-
-def test_get_or_render_preview_cache_reuse_and_invalidation(tmp_path: Path) -> None:
-    p = tmp_path / "caching.gcode"
-    p.write_text("M82\nG90\nG0 X10 Y10 Z0.2\nG1 X20 Y10 E1.0\n", encoding="utf-8")
-
-    out = gcode_preview.get_or_render_preview(p)
-    assert out.is_file()
-
-    # Poison cache to verify it is reused without regenerating
-    poisoned = b"CUSTOM_CACHED_CONTENT"
-    out.write_bytes(poisoned)
-    # Ensure cache mtime >= gcode mtime
-    os.utime(out, (time.time() + 10, time.time() + 10))
-
-    hit = gcode_preview.get_or_render_preview(p)
-    assert hit == out
-    assert hit.read_bytes() == poisoned
-
-    # Touch G-code with future timestamp to invalidate cache
-    time.sleep(0.01)
-    os.utime(p, (time.time() + 20, time.time() + 20))
-
-    regen = gcode_preview.get_or_render_preview(p)
-    assert regen == out
-    # Stale poisoned content was replaced by regenerated PNG
-    assert regen.read_bytes().startswith(PNG_HEADER)
+    # Removed endpoint must return 404 for unknown job
+    unknown_res = client.get("/api/jobs/000000000000/gcode-preview")
+    assert unknown_res.status_code == 404
 
 
-def test_get_or_render_preview_custom_cache_path(tmp_path: Path) -> None:
-    p = tmp_path / "custom.gcode"
-    p.write_text("M83\nG90\nG0 X0 Y0 Z0.2\nG1 X10 Y10 E0.5\n", encoding="utf-8")
-    custom = tmp_path / "previews" / "custom_preview.png"
+def test_legacy_thumbnail_endpoint_returns_404(client: TestClient, jobs_dir: Path, sliced_dir: Path) -> None:
+    """GET /api/jobs/{jid}/thumbnail returns 404 for sliced and unsliced jobs."""
+    jid = "feedface1234"
+    _create_sliced_job(jobs_dir, sliced_dir, jid=jid)
 
-    out = gcode_preview.get_or_render_preview(p, cache_path=custom)
-    assert out == custom
-    assert custom.is_file()
-    assert custom.read_bytes().startswith(PNG_HEADER)
+    # Removed endpoint must return 404 for existing sliced job
+    res = client.get(f"/api/jobs/{jid}/thumbnail")
+    assert res.status_code == 404
 
-
-def test_get_or_render_preview_missing_gcode(tmp_path: Path) -> None:
-    with pytest.raises(FileNotFoundError):
-        gcode_preview.get_or_render_preview(tmp_path / "does_not_exist.gcode")
+    # Removed endpoint must return 404 for unknown job
+    unknown_res = client.get("/api/jobs/000000000000/thumbnail")
+    assert unknown_res.status_code == 404
