@@ -1,0 +1,52 @@
+name: SliceDeck CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+# Serialize runs on each ref to avoid concurrent publication of :latest.
+concurrency:
+  group: slicedeck-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+      - run: python -m pip install -r requirements.txt -r requirements-dev.txt
+      - run: python -m pytest -q
+
+  publish:
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/master'
+    needs: test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and publish the existing Docker Hub image
+        env:
+          DOCKERHUB_USER: ${{ secrets.DOCKERHUB_USER }}
+          DOCKERHUB_TOKEN: ${{ secrets.DOCKERHUB_TOKEN }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          test -n "$DOCKERHUB_USER" && test -n "$DOCKERHUB_TOKEN" || { echo 'Docker Hub credentials are required' >&2; exit 1; }
+          echo "$DOCKERHUB_TOKEN" | docker login -u "$DOCKERHUB_USER" --password-stdin
+          version=$(python3 -c 'import re; print(re.search(r"^VERSION = \"([^\"]+)\"", open("app/config.py").read(), re.M).group(1))')
+          image=pank85/print-portal
+          short=${SHA:0:8}
+          docker build --platform linux/amd64 -t "$image:$short" -t "$image:$version-$short" -t "$image:latest" .
+          for tag in "$short" "$version-$short" latest; do docker push "$image:$tag"; done
+          digest=$(docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' "$image:latest" | grep -F "$image@sha256:" | head -n1)
+          test -n "$digest"
+          echo "Published $digest"
