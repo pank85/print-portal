@@ -6,6 +6,22 @@ from pathlib import Path
 import gcode
 
 
+def test_orca_header_layers_with_footer_beyond_scan_limit(tmp_path: Path) -> None:
+    p = tmp_path / "large.gcode"
+    with p.open("wb") as fh:
+        fh.write(b"; total layer number: 123\n")
+        fh.write(b"G1 X0 Y0\n" * (gcode.MAX_HEAD_BYTES // 9 + 1))
+        assert fh.tell() > gcode.MAX_HEAD_BYTES
+        fh.write(b"; total layers count = 123\n")
+    assert gcode.parse_gcode_stats(p)["layers"] == 123
+
+
+def test_orca_summary_layer_count_takes_precedence(tmp_path: Path) -> None:
+    p = tmp_path / "counts.gcode"
+    p.write_text("; total layer number: 123\n; total layers count = 124\n")
+    assert gcode.parse_gcode_stats(p)["layers"] == 124
+
+
 def test_orca_header_shape(tmp_path: Path) -> None:
     p = tmp_path / "a.gcode"
     p.write_text(
