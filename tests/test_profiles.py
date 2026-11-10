@@ -133,6 +133,43 @@ def test_import_into_an_empty_datadir_writes_only_the_bundle_files(empty_datadir
     assert not (empty_datadir / prof.PORTAL_PROCESS_REL).exists()
 
 
+def test_import_bundle_prefers_bundled_custom_base_over_vendor_copy(
+        empty_datadir, bundle_bytes, tmp_path, monkeypatch):
+    """When bundled Custom base profiles coexist with third-party vendor copies in ORCA_PROFILES,
+    an imported datadir machine inheriting from fdm_klipper_common resolves through Custom/machine."""
+    resources = tmp_path / "resources"
+    for vendor, marker in (("Custom", "custom"), ("VendorA", "vendor-a")):
+        m_dir = resources / vendor / "machine"
+        m_dir.mkdir(parents=True, exist_ok=True)
+        (m_dir / "fdm_machine_common.json").write_text(json.dumps({
+            "type": "machine",
+            "name": "fdm_machine_common",
+            "from": "system",
+            "instantiation": "false",
+            "base_marker": f"{marker}-machine-common",
+        }))
+        (m_dir / "fdm_klipper_common.json").write_text(json.dumps({
+            "type": "machine",
+            "name": "fdm_klipper_common",
+            "inherits": "fdm_machine_common",
+            "from": "system",
+            "instantiation": "false",
+            "klipper_marker": f"{marker}-klipper-common",
+        }))
+    monkeypatch.setattr(prof, "ORCA_PROFILES", resources)
+
+    result = prof.import_into(empty_datadir, bundle_bytes, "portal-import.orca_printer")
+    effective = prof.effective_preset(
+        empty_datadir / IMPORTED_MACHINE_REL, "machine", empty_datadir, resources)
+
+    machine_row = next(row for row in result["imported"] if row["type"] == "machine")
+    assert "error" not in machine_row
+    assert effective["klipper_marker"] == "custom-klipper-common"
+    assert effective["base_marker"] == "custom-machine-common"
+    assert "inherits" not in effective
+
+
+
 def test_a_machine_preset_carries_from_system_verbatim(empty_datadir):
     """"user" in the bundle is overwritten, not defaulted: the CLI answers -17 for it."""
     prof.import_into(empty_datadir, machine_bundle({"from": "user"}), "portal.orca_printer")

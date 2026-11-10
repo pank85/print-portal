@@ -340,6 +340,16 @@ def _resolved_chain(path: Path, ptype: str, datadir: Path,
                 raise ProfileError(f'missing {ptype} parent {parent!r} in bundled vendor for {path.name}')
         else:
             choices = matches
+            if len(matches) > 1 and all(
+                candidate.is_relative_to(roots[1]) and not candidate.is_relative_to(roots[0])
+                for candidate in matches
+            ):
+                custom_dir = roots[1] / 'Custom' / ptype
+                custom_choices = [candidate for candidate in matches if candidate.parent == custom_dir]
+                if not custom_choices:
+                    custom_choices = [candidate for candidate in matches if candidate.is_relative_to(custom_dir)]
+                if custom_choices:
+                    choices = custom_choices
         if not choices:
             raise ProfileError(f'missing {ptype} parent {parent!r} for {path.name}')
         if len(choices) != 1:
