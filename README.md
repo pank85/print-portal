@@ -241,6 +241,9 @@ Limits worth knowing before you tick the box:
 
 ## Acknowledgements
 
+G-code toolpath preview uses [gcode-preview](https://github.com/remcoder/gcode-preview),
+licensed under the MIT License.
+
 Support fins (optional designed-in breakaway supports) are based on the **Support Fins** project by
 Matthew Trahan (gittrahan) — <https://github.com/gittrahan/support-fins> — licensed under the MIT
 License. The bundled CLI (`app/support_fins.mjs`) is unmodified upstream build output; its provenance
