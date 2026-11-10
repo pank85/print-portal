@@ -39,6 +39,8 @@ ORCA_PATTERNS: dict[str, re.Pattern[str]] = {
 }
 
 PRUSA_PATTERNS: dict[str, re.Pattern[str]] = {
+    # Orca's header count is a fallback for its traditional summary count.
+    "layers": re.compile(r"^; total layer number: (\d+)", re.M),
     "time_s": re.compile(r"^;TIME:(\d+)", re.M),
     "mm": re.compile(r"^;Filament used:([\d.]+)m", re.M),
     "height": re.compile(r"^;Layer height:([\d.]+)", re.M),
@@ -149,7 +151,7 @@ def parse_gcode_stats(gcode: Path) -> dict[str, Any]:
     mm = _as_float(orca.get("mm"))
     if mm is not None:
         stats["mm"] = mm
-    layers = _as_int(orca.get("layers"))
+    layers = _as_int(orca.get("layers", prusa.get("layers")))
     if layers is not None:
         stats["layers"] = layers
     if orca.get("time"):
