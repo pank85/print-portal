@@ -272,10 +272,9 @@ Limits worth knowing before you tick the box:
 
 The GitHub Actions workflow in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) tests pushes and
 pull requests. On `master`, it builds and publishes the existing amd64 Docker Hub image after tests pass.
-The production deploy requires explicit configuration and a trusted self-hosted runner with LAN access;
-it is disabled until `ENABLE_PRODUCTION_DEPLOY` is set to `true`. See
-[GitHub Actions setup](docs/github-actions.md) before enabling it or disabling the existing GitLab pipeline.
-The legacy GitLab pipeline remains in the repository during migration; avoid running both publishers.
+It does **not** deploy; deployment is manual. See [GitHub Actions setup](docs/github-actions.md) for
+the required secrets and cutover notes. The legacy GitLab pipeline remains in the repository during
+migration and can still deploy if active; disable it to avoid competing publishers or automatic deploys.
 
 ## Acknowledgements
 

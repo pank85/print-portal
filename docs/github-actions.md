@@ -1,52 +1,34 @@
-# GitHub Actions migration
+# GitHub Actions: tests and Docker Hub publishing
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) is a proposed replacement for the
-existing GitLab pipeline, not an already completed cutover. It tests pushes and pull requests with
-Python 3.12 and Node 22. On a push to `master` or a manual run on `master`, it builds an amd64 image
-and pushes `pank85/print-portal` to Docker Hub with the eight-character commit SHA, version-SHA,
-and `latest` tags. It obtains the version from `app/config.py`.
+[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) runs tests on pushes and pull requests
+using Python 3.12 and Node 22. On a push to `master`, or a manual workflow run on `master`, it
+builds the amd64 image and publishes `pank85/print-portal` to Docker Hub after the tests pass.
+The tags are the eight-character commit SHA, version-SHA (version from `app/config.py`), and
+`latest`. The existing image name is retained for compatibility.
 
-The current GitLab pipeline also pushes a private GitLab registry mirror. **The GitHub workflow does
-not publish that mirror**; arrange a reachable, authenticated mirror publisher if it is still needed
-before retiring GitLab. Image and container names intentionally remain unchanged for the existing
-homeserver deployment.
+**GitHub Actions does not deploy to the printer host.** Pull and deploy the desired image manually.
+A successful publish does not mean a running installation has been updated.
 
-## Prerequisites
+## Required secrets
 
-In GitHub repository Settings → Secrets and variables → Actions, add repository secrets:
+In GitHub repository Settings → Secrets and variables → Actions, add:
 
-- `DOCKERHUB_USER` and `DOCKERHUB_TOKEN`: credentials able to push `pank85/print-portal`.
-- `DEPLOY_SSH_PRIVATE_KEY_BASE64`: base64-encoded SSH private key for `pank@172.16.0.50`.
-- `DEPLOY_KNOWN_HOSTS_BASE64`: base64-encoded, independently verified known-hosts entry for that host.
+- `DOCKERHUB_USER`: Docker Hub username with push access to `pank85/print-portal`.
+- `DOCKERHUB_TOKEN`: Docker Hub access token with permission to push that repository.
 
-The deploy secrets are only needed when production deployment is enabled. Never put private keys in
-the repository. Configure a **trusted, dedicated self-hosted GitHub Actions runner** with labels
-`linux` and `slicedeck-deploy` and network access to `172.16.0.50`. The remote account must be able
-to run the existing `sudo docker` and `sudo systemctl` commands non-interactively. GitHub-hosted
-runners cannot reach the private LAN address. Restrict who can run workflows on this runner and protect
-`master`; self-hosted runners should not execute untrusted pull-request code. The test and publish
-jobs use GitHub-hosted runners, not the deployment runner.
+Never commit the token. No deployment runner or SSH secrets are needed. Once the secrets are
+configured, use **Actions → SliceDeck CI → Run workflow**, selecting `master`, or push to `master`.
+Verify the publish job and its digest in the Actions log.
 
-Create a `production` GitHub environment and set any desired deployment protection rules. After the
-runner, credentials and host key are in place, set repository variable `ENABLE_PRODUCTION_DEPLOY` to
-`true`. Until then deploy is skipped; a successful publish alone does **not** mean production was
-updated. GitHub concurrency serializes master runs, but does not coordinate with GitLab or external
-publishers of `latest`.
+## Migration from GitLab
 
-## Safe cutover
+The legacy `.gitlab-ci.yml` remains in the repository and can still publish and automatically deploy
+if its GitLab pipeline is active. Disable that pipeline in GitLab before treating GitHub as the sole
+publisher; GitHub's concurrency control cannot coordinate with GitLab. GitHub Actions does **not**
+publish the private GitLab registry mirror. Arrange a replacement if that mirror is still required.
 
-1. Commit the workflow and README changes, then run the tests on GitHub. Confirm Docker Hub
-   credentials and run the publication job without enabling production deployment.
-2. Verify the image and decide how to replace the GitLab mirror if required. Install and secure the
-   dedicated runner, add the deployment secrets and verify its network access and host key.
-3. Stop the GitLab publisher/deployer before enabling the GitHub deploy: both pipelines publish the
-   same `latest` tag and have no cross-system lock. Keep a rollback image tag available.
-4. Set `ENABLE_PRODUCTION_DEPLOY=true` and run the workflow on `master`. Confirm the production job
-   completes and independently check the printer service. If it fails, investigate and roll back;
-   a failed deployment does not automatically restore the old container.
-
-The deploy job pulls via the existing compose project and restarts its systemd unit, waits up to
-180 seconds for container health, then checks the Docker Hub manifest digest and running image ID.
-It deliberately does not run `docker compose up -d`: the systemd unit owns foreground compose.
-See [deployment.md](deployment.md) for the current host layout and rollback details; its GitLab CI
-section describes the legacy pipeline until cutover is complete.
+For the homeserver, the existing compose project is owned by systemd: use `docker compose pull`
+followed by `systemctl restart docker-compose@print-portal`, not `docker compose up -d`, which
+conflicts with the foreground compose process. Check the image and container health after a manual
+deploy. See [deployment.md](deployment.md) for the existing host layout, verification and rollback;
+its GitLab CI sections describe the legacy pipeline.
