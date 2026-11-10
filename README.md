@@ -1,15 +1,35 @@
-# print-portal
+# SliceDeck
 
-**A minimal web UI for OrcaSlicer — and for the Klipper / Kalico printer it prints on.**
+**From model to print, in your browser.**
 
-Upload a model in the browser, press **Print**. The portal slices it with the OrcaSlicer command-line
-binary and hands the finished `.gcode` to [Moonraker](https://moonraker.readthedocs.io/), which starts
-the print. One Docker container: a FastAPI app plus OrcaSlicer. No database, no accounts, no shared
-filesystem with the printer, nothing to install on the printer host.
+SliceDeck is a self-hosted 3D-printing workspace for OrcaSlicer and Klipper / Kalico printers.
+Upload a model, choose your presets and options, slice it, then explicitly start the print through
+[Moonraker](https://moonraker.readthedocs.io/). Monitor printers and manage jobs from the same UI.
+One Docker container runs FastAPI and the OrcaSlicer CLI; there is no database, built-in account
+system, shared filesystem with the printer, or software to install on the printer host.
+
+> **Security:** SliceDeck has no built-in authentication. Anyone who can reach it can operate your
+> printer. Use a trusted network, VPN or authenticated reverse proxy; see [SECURITY.md](SECURITY.md).
+>
+> **Existing installations:** SliceDeck was previously called print-portal. Existing image,
+> container and data identifiers retain that name for compatibility.
 
 ```
-browser ──upload──► portal ──OrcaSlicer CLI──► plate_1.gcode ──HTTP──► Moonraker ──► printer
+browser ──upload──► SliceDeck ──OrcaSlicer CLI──► plate_1.gcode ──HTTP──► Moonraker ──► printer
 ```
+
+## Features at a glance
+
+- **Browser-to-printer workflow:** stage STL, OBJ, 3MF or ZIP uploads, select presets and print
+  options, slice with OrcaSlicer, and explicitly send completed G-code to a ready printer.
+- **Prepare and preview:** configure supports and brim, auto-orient or shrink compatible models,
+  optionally generate support fins, and preview finned models and sliced toolpaths.
+- **Keep working on a job:** download, reprint or delete G-code; create an independent reslice draft,
+  change its settings or proportionally resize its model; or generate G-code to print from a layer.
+- **Manage printers and presets:** store multiple Moonraker connections, associate printer and process
+  presets, import OrcaSlicer bundles, edit supported presets and embed a Fluidd or Mainsail UI.
+- **Monitor locally:** view printer status, progress and temperatures alongside your jobs, without
+  needing a cloud service.
 
 ## Why this exists
 
@@ -44,6 +64,14 @@ config and web console, which the portal frames for you.
    reason and nothing starts.
 5. **Monitor** — state, current file, progress, nozzle and bed temperatures, homed axes, and the job
    list with every job's gcode, reprint and delete.
+
+## Preview, reprint and recover
+
+Completed slices offer a G-code toolpath preview and download; jobs can be reprinted or deleted.
+**Print from layer…** can generate and download or print G-code starting at a chosen layer or Z height,
+shifting the remaining layers down to the bed so the printed portions can be joined. When available,
+you can use the printer's last recorded layer. This is not an in-place resume: check the preview,
+adhesion and generated G-code before printing; not every model or G-code file is suitable.
 
 ## Reslice an existing job
 
@@ -101,8 +129,8 @@ deleted) on the **Presets** and **Filaments** pages — deleting a machine also 
 ## Quickstart
 
 ```bash
-git clone https://github.com/pank85/print-portal print-portal
-cd print-portal
+git clone https://github.com/pank85/slicedeck.git
+cd slicedeck
 cp .env.example .env        # optional: PRINTER_URL + MOONRAKER_API_KEY
 mkdir -p data
 docker compose up -d
@@ -111,13 +139,14 @@ docker compose up -d
 Open <http://localhost:8088>. Or run the published image without cloning anything:
 
 ```bash
-curl -fsSLO https://raw.githubusercontent.com/pank85/print-portal/master/docker-compose.hub.yml
-curl -fsSLo .env.example https://raw.githubusercontent.com/pank85/print-portal/master/.env.example
+curl -fsSLO https://raw.githubusercontent.com/pank85/slicedeck/master/docker-compose.hub.yml
+curl -fsSLo .env.example https://raw.githubusercontent.com/pank85/slicedeck/master/.env.example
 cp .env.example .env        # optional printer settings
 mkdir -p data sliced && sudo chown -R 1000:1000 data sliced
 docker compose -f docker-compose.hub.yml up -d
 ```
 
+The published image still uses the `pank85/print-portal` name; it has not been renamed on Docker Hub.
 Requires Docker Compose **≥ 2.24**. The image is **amd64 only** and ~1.1 GB, because it contains
 OrcaSlicer, its runtime and a node runtime for the optional fins step. Your data lives in `./data` and
 `./sliced`; deleting `./data` is a factory
@@ -238,6 +267,15 @@ Limits worth knowing before you tick the box:
 - **The preview is bounded** to 450 000 triangles and 32 MiB of input for the rotatable view. A larger finned file, up to the 150 MiB upload limit, shows still pictures (front and side) instead of refusing. Past that the dialog reports `preview unavailable: …`.
 - **A staged job is protected from age pruning** (absent from ACTIVE_STATUSES but in PRUNE_KEEP_STATUSES) and can be deleted
   individually or by **Delete finished**; it simply never enters the queue until you confirm.
+
+## CI and deployment
+
+The GitHub Actions workflow in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) tests pushes and
+pull requests. On `master`, it builds and publishes the existing amd64 Docker Hub image after tests pass.
+The production deploy requires explicit configuration and a trusted self-hosted runner with LAN access;
+it is disabled until `ENABLE_PRODUCTION_DEPLOY` is set to `true`. See
+[GitHub Actions setup](docs/github-actions.md) before enabling it or disabling the existing GitLab pipeline.
+The legacy GitLab pipeline remains in the repository during migration; avoid running both publishers.
 
 ## Acknowledgements
 

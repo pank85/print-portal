@@ -1,7 +1,7 @@
-# Run print-portal from the published image — no clone, no build.
+# Run SliceDeck from the published image — no clone, no build.
 #
-#   curl -fsSLO https://raw.githubusercontent.com/pank85/print-portal/master/docker-compose.hub.yml
-#   curl -fsSLo .env.example https://raw.githubusercontent.com/pank85/print-portal/master/.env.example
+#   curl -fsSLO https://raw.githubusercontent.com/pank85/slicedeck/master/docker-compose.hub.yml
+#   curl -fsSLo .env.example https://raw.githubusercontent.com/pank85/slicedeck/master/.env.example
 #   cp .env.example .env      # set PRINTER_URL and MOONRAKER_API_KEY
 #   mkdir -p data sliced && sudo chown -R 1000:1000 data sliced
 #   docker compose -f docker-compose.hub.yml up -d

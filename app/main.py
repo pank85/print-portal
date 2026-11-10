@@ -927,7 +927,7 @@ async def lifespan(_app: FastAPI):
     yield
 
 
-app = FastAPI(title="print-portal", lifespan=lifespan)
+app = FastAPI(title="SliceDeck", lifespan=lifespan)
 
 
 def reject_oversize(request: Request, limit: int, message: str) -> None:

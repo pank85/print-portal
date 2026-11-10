@@ -1,6 +1,6 @@
-# print-portal docs
+# SliceDeck docs
 
-Documentation for the print-portal **application**: how a request is handled, how presets are imported
+Documentation for the SliceDeck **application**: how a request is handled, how presets are imported
 and sliced, what the API and the configuration surface are.
 
 ## Read this first: two states
