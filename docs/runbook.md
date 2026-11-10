@@ -35,8 +35,8 @@ curl -fsS http://127.0.0.1:8088/api/health
 # {"status":"ok","app":"print-portal","version":"2.1.0"}
 ```
 
-`config.VERSION` is the single version source (`app/config.py:21`) and `.gitlab-ci.yml`'s `APP_VERSION`
-must equal it (`tests/test_config.py` enforces that). Two builds of the same version therefore share the
+`config.VERSION` is the single version source (`app/config.py:23`); the CI workflow reads it from that
+file instead of duplicating it (`tests/test_config.py` enforces that). Two builds of the same version therefore share the
 version string — use the timestamps and image id above to tell them apart; the version is a sanity check,
 not a build identifier.
 

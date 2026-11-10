@@ -19,7 +19,7 @@ over HTTP. One container, no database, no shared filesystem with the printer hos
 | `app/` | FastAPI app; `app/profiles.py` owns preset import/rebase/derivation |
 | `presets/datadir/` | Seed datadir copied into the image at `/opt/orca-datadir` (read-only seed) |
 | `docker/`, `Dockerfile`, `docker-compose.yml` | Image build with pinned AppImage + sha256, build-time slice smoke test |
-| `.gitlab-ci.yml` | CI/CD |
+| `.github/workflows/ci.yml` | CI: tests, then Docker Hub publish on `master`. No deploy. |
 | `.orchestration/` | Ergo run plans/context |
 
 Runtime paths inside the container (see `README.md` → Configuration): `ORCA_BIN=/opt/orca/bin/orca-slicer`,

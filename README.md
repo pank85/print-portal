@@ -268,14 +268,6 @@ Limits worth knowing before you tick the box:
 - **A staged job is protected from age pruning** (absent from ACTIVE_STATUSES but in PRUNE_KEEP_STATUSES) and can be deleted
   individually or by **Delete finished**; it simply never enters the queue until you confirm.
 
-## CI and deployment
-
-The GitHub Actions workflow in [`.github/workflows/ci.yml`](.github/workflows/ci.yml) tests pushes and
-pull requests. On `master`, it builds and publishes the existing amd64 Docker Hub image after tests pass.
-It does **not** deploy; deployment is manual. See [GitHub Actions setup](docs/github-actions.md) for
-the required secrets and cutover notes. The legacy GitLab pipeline remains in the repository during
-migration and can still deploy if active; disable it to avoid competing publishers or automatic deploys.
-
 ## Acknowledgements
 
 G-code toolpath preview uses [gcode-preview](https://github.com/remcoder/gcode-preview),

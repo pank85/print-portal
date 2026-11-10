@@ -20,12 +20,12 @@ Never commit the token. No deployment runner or SSH secrets are needed. Once the
 configured, use **Actions → SliceDeck CI → Run workflow**, selecting `master`, or push to `master`.
 Verify the publish job and its digest in the Actions log.
 
-## Migration from GitLab
+## History
 
-The legacy `.gitlab-ci.yml` remains in the repository and can still publish and automatically deploy
-if its GitLab pipeline is active. Disable that pipeline in GitLab before treating GitHub as the sole
-publisher; GitHub's concurrency control cannot coordinate with GitLab. GitHub Actions does **not**
-publish the private GitLab registry mirror. Arrange a replacement if that mirror is still required.
+CI moved here from GitLab in November 2026: the GitLab project and its container registry were
+deleted, and `.gitlab-ci.yml` was removed. GitHub is the only publisher, so a single system owns
+`latest`. The private GitLab registry mirror is gone; publish any secondary mirror needed from this
+workflow instead of restoring the old one.
 
 For the homeserver, the existing compose project is owned by systemd: use `docker compose pull`
 followed by `systemctl restart docker-compose@print-portal`, not `docker compose up -d`, which

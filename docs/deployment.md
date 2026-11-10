@@ -100,77 +100,37 @@ docker compose up -d --build
 
 ## Publishing the image from CI
 
-`.gitlab-ci.yml` runs the test suite on every branch and, on `master`, builds the
-`linux/amd64` image and pushes it to **two** registries with the same three tags:
-`$CI_COMMIT_SHORT_SHA`, `$FULL_VERSION` (`$APP_VERSION-$CI_COMMIT_SHORT_SHA`) and
-`latest`.
+`.github/workflows/ci.yml` runs the test suite on every push and pull request. On `master`
+it also builds the `linux/amd64` image and pushes it to Docker Hub as `pank85/print-portal`
+with three tags: the 8-character commit SHA, `<VERSION>-<sha>` and `latest`. `<VERSION>` is
+read from `app/config.py`, which stays the single version source.
 
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `CI_REGISTRY` | `dockerhub.pkatopodis.me` | Primary registry host. |
-| `CI_REGISTRY_IMAGE` | `dockerhub.pkatopodis.me/pank85/print-portal` | Primary repository (all three tags). |
-| `GITLAB_REGISTRY_IMAGE` | `gitlab-ce:5050/pank85/print-portal` | Mirror repository (same three tags). |
-| `PRIMARY_IMAGE` | *(empty)* | Overrides `CI_REGISTRY_IMAGE`. |
-| `MIRROR_IMAGE` | *(empty)* | Overrides `GITLAB_REGISTRY_IMAGE`; `none` disables the mirror push. |
+Two repository secrets are required (**Settings → Secrets and variables → Actions**):
+`DOCKERHUB_USER`, and `DOCKERHUB_TOKEN` — an access token allowed to push that repository.
+Without them the publish job fails closed rather than skipping, so a green run always means
+the image was published.
 
-The defaults are hardcoded in the file, so the pipeline needs no CI/CD variables
-at all on this host. The primary push logs in to `$CI_REGISTRY` with the job's
-`CI_REGISTRY_USER`/`CI_REGISTRY_PASSWORD`. With `MIRROR_IMAGE` unset the mirror
-is `GITLAB_REGISTRY_IMAGE` (also on the runner box, same account); the job logs
-in to the mirror's own registry host — the first path component of the mirror
-reference, so a custom mirror works without extra variables — **only when the
-mirror is enabled**, and `MIRROR_IMAGE=none` skips both the login and the push.
-A project or group variable of the same name (**Settings > CI/CD > Variables**)
-overrides any default, so the publishing jobs still work for a fork; the deploy job is master-only, automatic, and fails loudly without a key.
+Builds run on `ubuntu-latest`, which supplies the Docker daemon. The build pins
+`--platform linux/amd64` because the OrcaSlicer AppImage in the image is x86_64 only, and
+the resulting image is ~1.1 GB. Publishing is serialized per ref, so two pushes cannot
+race on `latest`.
 
-After the pushes the job records the digest it actually pushed for the target
-repo (selecting the `RepoDigests` entry whose repo is `$TARGET`, because the
-mirror push adds a second entry) and publishes it as a dotenv artifact
-(`release.env`, `PORTAL_IMAGE_DIGEST=...`). The deploy job consumes that
-artifact, so a deploy proves the host serves *this* build rather than whatever
-`:latest` points at later.
+The pipeline does **not** deploy. A published image changes nothing on the homeserver
+until an operator pulls it.
 
-The build pins `--platform linux/amd64` — the OrcaSlicer AppImage in the image is
-x86_64 only. The dind service uses a per-job alias (`docker-$CI_JOB_ID`) with a
-preflight that fails when the alias resolves to more than one daemon, because
-this runner shares one docker network across concurrent jobs; the daemon
-readiness probe is bounded (60 attempts, 1 s apart) and dumps `docker info`
-instead of hanging when the daemon never answers.
+## Deploying by hand
 
-Example fork override: `PRIMARY_IMAGE=registry.example.com/me/print-portal`,
-`CI_REGISTRY=registry.example.com`,
-`CI_REGISTRY_PASSWORD=<token>` (masked), `MIRROR_IMAGE=none`.
+`172.16.0.50` is the homeserver's LAN address. Its compose project lives at
+`/home/pank/homeserver/docker-compose/print-portal`, pins
+`pank85/print-portal:latest`, names the container `print-portal`, publishes port 8088, and
+is owned by the `docker-compose@print-portal` systemd unit.
 
-## Deploying from CI
-
-The `deploy:production` job pulls the image this pipeline just pushed onto the
-homeserver and restarts the systemd unit that owns the compose project. On
-`master` it runs **automatically** as soon as `test` and `docker` are green —
-there is no manual gate.
-
-Because it is automatic, a missing deploy key is a **hard failure**, not a silent
-skip: `before_script` stops with `DEPLOY FAIL: no SSH deploy key ...` when neither
-`DEPLOY_SSH_PRIVATE_KEY_BASE64` nor `SSH_PRIVATE_KEY` is set, and the job also
-refuses to run without the `PORTAL_IMAGE_DIGEST` artifact it has to assert on.
-
-| Variable | Default | Meaning |
-| --- | --- | --- |
-| `DEPLOY_HOST` | `172.16.0.50` | Host to deploy to, reachable over SSH from the runner. |
-| `DEPLOY_USER` | `pank` | SSH user. |
-| `DEPLOY_COMPOSE_PATH` | `/home/pank/homeserver/docker-compose/print-portal` | Compose project directory on that host. |
-| `DEPLOY_SSH_PRIVATE_KEY_BASE64` | *(none)* | Private key, base64-encoded (`base64 -w0 key`). |
-| `SSH_PRIVATE_KEY` | *(none)* | Raw private key; used when `DEPLOY_SSH_PRIVATE_KEY_BASE64` is unset. |
-| `DEPLOY_KNOWN_HOSTS_BASE64` | *(none)* | The host's `known_hosts` line, base64-encoded; when unset, `ssh-keyscan -H` fills it in. |
-
-Either credential style works: `DEPLOY_SSH_PRIVATE_KEY_BASE64` (preferred) or
-`SSH_PRIVATE_KEY`. `DEPLOY_KNOWN_HOSTS_BASE64` pins the host key; when it is
-unset the job falls back to `ssh-keyscan -H $DEPLOY_HOST`. Every default above
-can be overridden.
-
-### The systemd unit owns the compose project
-
-CI never mutates the compose project itself. It performs exactly what an operator
-would by hand:
+`docker-compose@.service` runs `docker compose up` in the **foreground** with
+`Restart=always`. A direct `docker compose up -d --force-recreate` therefore kills the
+foreground compose process, systemd treats the exit as a failure, runs `compose down`, and
+removes the container that was just recreated — the unit's `Restart=always` then brings a
+container back after ~10 s, so the cost is a double recreate and a short outage, not a dead
+portal. Instead:
 
 ```bash
 cd /home/pank/homeserver/docker-compose/print-portal
@@ -178,49 +138,35 @@ sudo docker compose pull
 sudo systemctl restart docker-compose@print-portal
 ```
 
-`docker-compose@.service` runs `docker compose up` in the **foreground** with
-`Restart=always`. A direct `docker compose up -d --force-recreate` therefore kills
-the foreground compose process, systemd treats the exit as a failure, runs
-`compose down`, and removes the container that was just recreated — but the unit's
-`Restart=always` + 10 s restart recreates the container, so the real cost is a
-double recreate / ~10 s outage, not a permanently dead portal. Pull plus unit
-restart is the only sequence that replaces the container while systemd keeps
-tracking it. Use `systemctl restart`, **never** `systemctl reload` (the unit's
-own ExecReload is the unsafe `pull && up -d --force-recreate` form).
+Use `systemctl restart`, **never** `systemctl reload` (the unit's own ExecReload is the
+unsafe `pull && up -d --force-recreate` form).
 
 Two assumptions about that host, both required:
 
-1. The compose project is managed by a `docker-compose@print-portal` systemd
-   unit, so the directory is stable and CI only ever pulls and restarts.
-2. Its compose file references the registry image (`image:`), never a
-   `build:` block — with both `image:` and `build:` set compose still pulls the
-   image and builds on `up`; the actionable rule is to keep only `image:` and
-   never copy the repo's `build: .` flavor to the host.
+1. The compose project is managed by a `docker-compose@print-portal` systemd unit, so the
+   directory is stable and a deploy only pulls and restarts.
+2. Its compose file references the registry image (`image:`), never a `build:` block — with
+   both set, compose still pulls on `up`, but the rule keeps a deploy reproducible from the
+   published image alone.
 
-Overriding `PRIMARY_IMAGE` therefore also means editing the host compose file's
-`image:` to the same reference. The deploy asserts on the digest of the image CI
-pushed (`PRIMARY_IMAGE`, i.e. `CI_REGISTRY_IMAGE` unless overridden), so a
-compose file that still names a different repository leaves the old image in
-place and fails the pipeline. That
-failure is the point: it fails closed, and a green deploy always means the host
-serves the exact build this pipeline pushed.
+### Verify the deploy
 
-### What the deploy asserts
+After the restart, on the host:
 
-After the restart, on the host, the job fails unless all of these hold:
+1. `docker compose pull` succeeded — a failed pull leaves the running portal serving.
+2. The `print-portal` container reports `healthy` within 180 s (90 polls × 2 s); the image
+   healthcheck has a 30 s interval and a 25 s start period, so a shorter budget can fail a
+   container that is merely warming up.
+3. The pulled `:latest` is the build you meant to deploy:
+   `sudo docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' 'pank85/print-portal:latest' | grep -F 'pank85/print-portal@' | head -n1`
+   should match the digest from the publish job log, and `.Id` identifies the same image.
+4. The running container uses that exact image:
+   `sudo docker inspect -f '{{.Config.Image}} {{.Image}} {{.State.Status}}' print-portal`
+   must show `pank85/print-portal:latest`, the expected image ID, and `running`.
 
-1. `docker compose pull` succeeded — a failed pull leaves the running portal
-   serving.
-2. The `print-portal` container reports `healthy` within 90 polls × 2 s (180 s);
-   a container that never gets healthy fails the deploy.
-3. The `:latest` the host pulled is this build:
-   `sudo docker image inspect --format '{{range .RepoDigests}}{{println .}}{{end}}' '<repo>:latest' | grep -F '<repo>@' | head -n1`
-   plus `.Id` must contain `PORTAL_IMAGE_DIGEST`.
-4. The running container is that exact image:
-   `sudo docker inspect -f '{{.Config.Image}} {{.Image}} {{.State.Status}}'
-   print-portal` must show `<repo>:latest`, the same image ID, and `running`.
+### Rollback
 
-A failed deploy leaves whatever container compose last started in place —
-recover with `sudo systemctl restart docker-compose@print-portal` in that
-directory once the cause is fixed, or roll back by pinning the previous
-`$FULL_VERSION` tag in its compose file.
+A failed pull or restart leaves whatever container compose last started in place. Recover
+with `sudo systemctl restart docker-compose@print-portal` in that directory once the cause
+is fixed. To roll back, pin the previous `<VERSION>-<sha>` tag in the compose file, pull and
+restart again.

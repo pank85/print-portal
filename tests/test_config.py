@@ -191,13 +191,13 @@ def test_python_m_config_prints_a_summary_without_the_api_key(monkeypatch):
     assert "super-secret-key" not in proc.stdout + proc.stderr
 
 
-def test_version_matches_the_ci_app_version():
-    ci = ROOT / ".gitlab-ci.yml"
-    assert ci.is_file(), ".gitlab-ci.yml is part of the shipped tree"
+def test_ci_reads_the_version_from_config():
+    ci = ROOT / ".github" / "workflows" / "ci.yml"
+    assert ci.is_file(), "the GitHub Actions workflow is part of the shipped tree"
 
-    match = re.search(r'^\s*APP_VERSION:\s*"([^"]+)"', ci.read_text(), re.MULTILINE)
-    assert match, "APP_VERSION is not declared in .gitlab-ci.yml"
-    assert match.group(1) == config.VERSION
+    text = ci.read_text()
+    assert "app/config.py" in text, "the workflow must read VERSION from app/config.py"
+    assert "APP_VERSION" not in text, "the workflow must not duplicate VERSION"
 
 
 def test_seed_is_optional_for_ui_managed_printers():
