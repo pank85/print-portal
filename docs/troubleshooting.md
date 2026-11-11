@@ -138,9 +138,9 @@ Keep these in mind before changing the slice invocation — each one has bitten 
 * **A bare `--orient` and `--orient auto` are rejected (rc 254)** — the flag needs the literal `1`.
 * **`--scale` alone produces no plate** (`-50 "One of the plate is empty"`), so a shrink also forces
   `--orient 1`.
-* **The gcode summary is not always near the top.** A profile that prints every setting can push
-  `estimated printing time` / `total filament used [g]` ~230 kB into the file; the parser reads 2 MB
-  and then falls back to the Prusa-style `;TIME:` / `;Filament used:` lines.
+* **The gcode summary is not always near the top.** Orca can place `estimated printing time` and
+  `total filament used [g]` at the end of the file. The parser scans up to 2 MB at each end, then
+  falls back to the Prusa-style `;TIME:` / `;Filament used:` lines when necessary.
 * **Preset filenames must not contain spaces** — the importer replaces them.
 
 ## Container exits at startup — `/data` not writable (both states)

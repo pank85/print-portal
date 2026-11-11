@@ -4,8 +4,11 @@ OrcaSlicer and PrusaSlicer-lineage slicers dump the numbers the user cares about
 (grams of filament, estimated time, layer count, layer height) as ``;`` comments
 near the top of the file. A profile that prints every setting puts that summary
 roughly 230 kB in, so the scan window has to be far larger than the summary
-offset — but it still must not read a 200 MB gcode into memory. Everything here
-reads at most ``MAX_HEAD_BYTES``, chunk by chunk, and tolerates junk bytes.
+offset — but it still must not read a 200 MB gcode into memory. The initial
+scan reads at most ``MAX_HEAD_BYTES``, chunk by chunk, and tolerates junk bytes.
+
+The Orca summary can also appear at the end of large files, so a bounded tail
+window is scanned when the initial window does not contain a complete summary.
 
 Two header shapes are understood:
 
@@ -126,6 +129,21 @@ def _scan_header(gcode: Path) -> tuple[dict[str, str], dict[str, str]]:
                 return orca, prusa
     if pending:
         _collect(pending, orca, prusa)
+    # Orca writes its summary after the executable G-code; on large models this
+    # can be far beyond the initial window. Skip a potentially partial first line.
+    if not _header_complete(orca):
+        with Path(gcode).open("rb") as fh:
+            fh.seek(0, 2)
+            size = fh.tell()
+            if size > MAX_HEAD_BYTES:
+                start = max(MAX_HEAD_BYTES, size - MAX_HEAD_BYTES)
+                fh.seek(start - 1)
+                previous = fh.read(1)
+                tail = fh.read(MAX_HEAD_BYTES).decode("utf-8", errors="replace")
+                tail = tail.replace("\r\n", "\n").replace("\r", "\n")
+                if previous not in (b"\n", b"\r"):
+                    tail = tail.partition("\n")[2]
+                _collect(tail, orca, prusa)
     return orca, prusa
 
 
