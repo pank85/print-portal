@@ -128,29 +128,68 @@ deleted) on the **Presets** and **Filaments** pages — deleting a machine also 
 
 ## Quickstart
 
+### Docker Compose (recommended)
+
+Run the published image without cloning the repository or building locally. This example is based
+on the Compose configuration we use on our homeserver. Create a directory and save the following as
+`docker-compose.yml`:
+
+```yaml
+services:
+  print-portal:
+    image: pank85/print-portal:latest
+    container_name: print-portal
+    restart: unless-stopped
+    env_file:
+      - path: .env
+        required: true
+    ports:
+      - "8088:8088"
+    volumes:
+      - ./data:/data
+    mem_limit: 2g
+    healthcheck:
+      test: ["CMD-SHELL", "python3 -c \"import os,urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:%s/api/health' % os.environ.get('PORT','8088'), timeout=4).status == 200 else 1)\""]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 25s
+```
+
+In the same directory, create the optional settings file and writable data directory, then start:
+
+```bash
+touch .env                  # optionally add PRINTER_URL and MOONRAKER_API_KEY
+mkdir -p data
+sudo chown 1000:1000 data  # container runs as uid 1000
+docker compose up -d
+```
+
+Open <http://localhost:8088> and follow [First run](#first-run). To update a normal Compose
+installation later, run `docker compose pull` followed by `docker compose up -d`. The `latest` tag
+moves; pin a published commit-SHA tag for a reproducible deployment. If Compose is managed by
+systemd as on our homeserver, follow the [systemd deployment instructions](docs/deployment.md#deploying-by-hand)
+instead of recreating it directly.
+
+Requires Docker Compose **≥ 2.24**. The published image retains the `pank85/print-portal` name and
+is **amd64 only** and ~1.1 GB. Jobs, presets, printer settings and sliced G-code are stored in
+`./data`; back it up before upgrades, and do not delete it unless you intend a factory reset. The
+healthcheck can report unhealthy before a printer is configured; see [First run](#first-run).
+
+### Build from source
+
 ```bash
 git clone https://github.com/pank85/slicedeck.git
 cd slicedeck
 cp .env.example .env        # optional: PRINTER_URL + MOONRAKER_API_KEY
-mkdir -p data
-docker compose up -d
+mkdir -p data sliced
+sudo chown 1000:1000 data sliced
+docker compose up -d --build
 ```
 
-Open <http://localhost:8088>. Or run the published image without cloning anything:
-
-```bash
-curl -fsSLO https://raw.githubusercontent.com/pank85/slicedeck/master/docker-compose.hub.yml
-curl -fsSLo .env.example https://raw.githubusercontent.com/pank85/slicedeck/master/.env.example
-cp .env.example .env        # optional printer settings
-mkdir -p data sliced && sudo chown -R 1000:1000 data sliced
-docker compose -f docker-compose.hub.yml up -d
-```
-
-The published image still uses the `pank85/print-portal` name; it has not been renamed on Docker Hub.
-Requires Docker Compose **≥ 2.24**. The image is **amd64 only** and ~1.1 GB, because it contains
-OrcaSlicer, its runtime and a node runtime for the optional fins step. Your data lives in `./data` and
-`./sliced`; deleting `./data` is a factory
-reset. Plain `docker run`, upgrades and rollback: [docs/deployment.md](docs/deployment.md).
+The repository also provides [`docker-compose.hub.yml`](docker-compose.hub.yml), an alternative
+published-image setup with a separate `./sliced` mount. More on upgrades, rollback and persistent
+storage: [docs/deployment.md](docs/deployment.md).
 
 ## First run
 
