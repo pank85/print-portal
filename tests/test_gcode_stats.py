@@ -67,6 +67,20 @@ def test_summary_far_into_file(tmp_path: Path) -> None:
     assert stats["layers"] == 42
 
 
+def test_orca_summary_at_end_of_large_file_overrides_time_fallback(tmp_path: Path) -> None:
+    p = tmp_path / "large.gcode"
+    with p.open("wb") as fh:
+        fh.write(b";TIME:38\n; total layer number: 550\n")
+        fh.write(b"G1 X0 Y0\n" * (gcode.MAX_HEAD_BYTES // 9 + 1))
+        fh.write(b"; total filament used [g] = 30.04\n")
+        fh.write(b"; estimated printing time (normal mode) = 1h 58m 38s\n")
+        fh.write(b"; total layers count = 550\n")
+    stats = gcode.parse_gcode_stats(p)
+    assert stats["time"] == "1h 58m 38s"
+    assert stats["grams"] == 30.04
+    assert stats["layers"] == 550
+
+
 def test_cm3_only_fallback(tmp_path: Path) -> None:
     p = tmp_path / "cm3.gcode"
     p.write_text("; filament used [cm3] = 10\n", encoding="utf-8")
