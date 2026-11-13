@@ -12,4 +12,8 @@ orca-datadir/
 *.bak
 .ergo/
 
-.ai/
+# Keep local AI artifacts private, but track the project instruction index.
+.ai/*
+!.ai/instructions/
+!.ai/instructions/**
+!.ai/file-index.md

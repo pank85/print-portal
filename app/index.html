@@ -1018,12 +1018,14 @@ input[type=checkbox]{
 }
 .dialog-actions .btn-primary{ margin-left:auto; }
 #confirmDlg{ width:min(94vw,460px); }
-#previewDlg{
+#previewDlg,
+#stlPreviewDlg{
   width:min(96vw,1160px);
   max-width:96vw;
   max-height:92vh;
 }
-#previewDlg[open]{
+#previewDlg[open],
+#stlPreviewDlg[open]{
   display:flex;
   flex-direction:column;
   gap:12px;
@@ -1057,7 +1059,9 @@ input[type=checkbox]{
     #05080E;
   overflow:hidden;
 }
-.preview-stage canvas{ display:block; width:100%; height:100%; touch-action:none; }
+.preview-stage canvas,
+#stlPreviewFrame{ display:block; width:100%; height:100%; border:0; justify-self:stretch; align-self:stretch; background:#1b1b1b; }
+.preview-stage canvas{ touch-action:none; }
 #previewCanvas{ width:100%; height:100%; touch-action:none; }
 .preview-shots{ display:flex; gap:8px; overflow-x:auto; padding:2px; }
 .preview-layer-controls{ display:flex; flex-wrap:wrap; align-items:center; gap:10px; }
@@ -1109,7 +1113,8 @@ input[type=checkbox]{
 
 /* ---------- responsive ---------- */
 @media (max-width:640px){
-  #previewDlg{
+  #previewDlg,
+  #stlPreviewDlg{
     width:100vw;
     max-width:100vw;
     height:100dvh;
@@ -1172,7 +1177,8 @@ input[type=checkbox]{
   .form-actions .btn{ flex:1 1 calc(50% - 8px); }
   .form-actions .btn-primary{ margin-left:0; flex-basis:100%; }
   .dialog{ border-radius:var(--radius-lg); }
-  #previewDlg{ width:96vw; }
+  #previewDlg,
+  #stlPreviewDlg{ width:96vw; }
   .preview-stage{ height:min(48vh,420px); min-height:200px; }
   .section-head .btn{ margin-left:0; width:100%; }
   .key-row{ flex-wrap:wrap; }
@@ -1336,10 +1342,16 @@ input[type=checkbox]{
               Print from layer…
             </button>
             <button type="button" class="btn" id="uploadLatestPreview"
-                    data-act="preview" aria-label="Preview the sliced model" hidden>
+                    data-act="preview" aria-label="Slice preview of the sliced model" hidden>
               <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                    stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
-              Preview
+              Slice preview
+            </button>
+            <button type="button" class="btn" id="uploadLatestStl"
+                    data-act="stl-preview" aria-label="STL preview of this job" hidden>
+              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5"/><path d="M12 12l8-4.5"/><path d="M12 12v9"/></svg>
+              STL preview
             </button>
             <button type="button" class="btn" id="uploadLatestReslice" data-act="reslice" hidden>Reslice…</button>
             <button type="button" class="btn btn-danger" id="uploadLatestDelete"
@@ -1600,7 +1612,7 @@ input[type=checkbox]{
 </dialog>
 
 <dialog id="previewDlg" class="dialog" aria-labelledby="previewTitle" aria-describedby="previewHint">
-  <h2 id="previewTitle">Preview</h2>
+  <h2 id="previewTitle">Slice preview</h2>
   <p id="previewHint" class="hint">G-code toolpath preview.</p>
   <div id="resliceSettings" hidden>
     <p id="resliceSource" class="hint"></p>
@@ -1636,6 +1648,19 @@ input[type=checkbox]{
   <div class="dialog-actions preview-actions">
     <button type="button" class="btn btn-danger" id="previewDiscard">Discard</button>
     <button type="button" class="btn" id="previewClose">Keep for later</button>
+  </div>
+</dialog>
+
+<dialog id="stlPreviewDlg" class="dialog" aria-labelledby="stlPreviewTitle" aria-describedby="stlPreviewHint">
+  <h2 id="stlPreviewTitle" tabindex="-1">STL preview</h2>
+  <p id="stlPreviewHint" class="hint">The job's STL, before slicing. Drag to orbit, scroll to zoom.</p>
+  <div class="preview-stage">
+    <iframe id="stlPreviewFrame" title="STL model preview" tabindex="0" hidden></iframe>
+  </div>
+  <p id="stlPreviewError" class="err" role="alert" hidden></p>
+  <p id="stlPreviewBusy" role="status" aria-live="polite" hidden></p>
+  <div class="dialog-actions preview-actions">
+    <button type="button" class="btn" id="stlPreviewClose">Close</button>
   </div>
 </dialog>
 
@@ -2295,7 +2320,8 @@ function onJobAction(ev) {
   if (btn.dataset.act === "print") printJob(btn.dataset.ref);
   else if (btn.dataset.act === "from-layer") openFromLayer(btn.dataset.ref, btn);
   else if (btn.dataset.act === "delete") del(btn.dataset.ref);
-  else if (btn.dataset.act === "preview") openPreview(btn.dataset.ref);
+  else if (btn.dataset.act === "preview") openPreview(btn.dataset.ref, btn);
+  else if (btn.dataset.act === "stl-preview") openStlPreview(btn.dataset.ref, btn);
   else if (btn.dataset.act === "reslice") createReslice(btn.dataset.ref, btn);
   else if (btn.dataset.act === "options") openJobOptions(btn.dataset.ref);
 }
@@ -2547,10 +2573,10 @@ function renderJobRow(j) {
             <svg class="icon" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true"><path d="M8 5v14l11-7z"/></svg>
             Print
           </button>
-          <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}" aria-label="Preview ${esc(j.filename || "sliced model")}">
+          <button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}" aria-label="Slice preview of ${esc(j.filename || "sliced model")}">
             <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M2 12s3.5-6 10-6 10 6 10 6-3.5 6-10 6-10-6-10-6Z"/><circle cx="12" cy="12" r="2.5"/></svg>
-            Preview
+            Slice preview
           </button>
           <button type="button" class="btn" data-act="from-layer" data-ref="${esc(j.id)}">
             Print from layer…
@@ -2560,6 +2586,13 @@ function renderJobRow(j) {
                  stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3v12"/><path d="m7 10 5 5 5-5"/><path d="M4 21h16"/></svg>
             Gcode
           </a>` : "";
+  /* available before slice; the dialog says so when this job has no STL */
+  const stlPreview = `
+          <button type="button" class="btn" data-act="stl-preview" data-ref="${esc(j.id)}" aria-label="STL preview of ${esc(j.filename || "this job")}">
+            <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+                 stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 3 4 7.5v9L12 21l8-4.5v-9L12 3Z"/><path d="M12 12 4 7.5"/><path d="M12 12l8-4.5"/><path d="M12 12v9"/></svg>
+            STL preview
+          </button>`;
   /* a staged job has nothing to print yet, but it can still be reviewed or configured from here */
   const staged = j.status === "awaiting_confirm" && !j.error ? `
           ${j.kind === "reslice" ? `<button type="button" class="btn" data-act="preview" data-ref="${esc(j.id)}">Resume reslice</button>` : ""}
@@ -2570,6 +2603,7 @@ function renderJobRow(j) {
         <div>${renderJobBody(j)}</div>
         <div class="job-actions">
           ${staged}
+          ${stlPreview}
           ${j.reslice?.eligible ? `<button type="button" class="btn" data-act="reslice" data-ref="${esc(j.id)}">Reslice…</button>` : ""}
           ${actions}
           <button type="button" class="btn btn-danger" data-act="delete" data-ref="${esc(j.id)}">
@@ -2589,6 +2623,7 @@ function setUploadLatest(job) {
         print = $("#uploadLatestPrint"), gcode = $("#uploadLatestGcode"),
         fromLayer = $("#uploadLatestFromLayer"),
         preview = $("#uploadLatestPreview"),
+        stl = $("#uploadLatestStl"),
         remove = $("#uploadLatestDelete");
   if (!job) { box.hidden = true; return; }
   box.hidden = false;
@@ -2619,12 +2654,15 @@ function setUploadLatest(job) {
   } else if (printable) {
     preview.hidden = false;
     preview.dataset.ref = job.id;
-    preview.textContent = "Preview";
-    preview.setAttribute("aria-label", `Preview ${name}`);
+    preview.textContent = "Slice preview";
+    preview.setAttribute("aria-label", `Slice preview of ${name}`);
   } else {
     preview.hidden = true;
     preview.dataset.ref = "";
   }
+  stl.hidden = false;
+  stl.dataset.ref = job.id;
+  stl.setAttribute("aria-label", `STL preview of ${name}`);
   const reslice = $("#uploadLatestReslice");
   reslice.hidden = !job.reslice?.eligible;
   reslice.dataset.ref = job.id;
@@ -3093,7 +3131,7 @@ async function openPreview(id, returnFocus = document.activeElement) {
   previewReturnFocus = returnFocus;
   previewJob = { id };
   $("#resliceSettings").hidden = true;
-  $("#previewTitle").textContent = "Preview";
+  $("#previewTitle").textContent = "Slice preview";
   previewScene = null;
   previewDrag = null;
   previewHidden = new Set();
@@ -3123,7 +3161,7 @@ async function openPreview(id, returnFocus = document.activeElement) {
     if (!jr.ok) throw new Error(job.detail || jr.statusText);
     previewJob = job;
     if (job.status === "sliced") {
-      $("#previewTitle").textContent = "G-code preview: " + (job.filename || id);
+      $("#previewTitle").textContent = "Slice preview: " + (job.filename || id);
       const s = job.stats || {};
       $("#previewHint").textContent = `${s.layers || "?"} layers · ${s.time || "?"} · ${s.grams ? s.grams.toFixed(1) + " g" : "?"}`;
       stats.textContent = `Time: ${s.time || "?"} · Filament: ${s.grams ? s.grams.toFixed(1) + " g" : "?"} · Layers: ${s.layers || "?"} · Height: ${s.layer_height || "?"} mm`;
@@ -3563,6 +3601,104 @@ async function slicePrintOptions() {
   }
 }
 
+let stlPreviewToken = 0;
+let stlPreviewReturnFocus = null;
+let stlPreviewBusy = false;
+
+function waitForStlMessage(frame, token, type, timeoutMs) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => {
+      window.removeEventListener("message", onMsg);
+      reject(new Error("STL preview could not start."));
+    }, timeoutMs);
+    function onMsg(ev) {
+      if (token !== stlPreviewToken) {
+        cleanup();
+        reject(new Error("closed"));
+        return;
+      }
+      if (ev.origin !== location.origin || ev.source !== frame.contentWindow) return;
+      const kind = ev.data && ev.data.type;
+      const matched = kind === type || (type === "stl_preview_result" && (kind === "stl_preview_loaded" || kind === "stl_preview_error"));
+      if (!matched) return;
+      cleanup();
+      resolve(ev.data);
+    }
+    function cleanup() {
+      clearTimeout(timer);
+      window.removeEventListener("message", onMsg);
+    }
+    window.addEventListener("message", onMsg);
+  });
+}
+
+function cleanupStlPreview() {
+  stlPreviewToken++;
+  stlPreviewBusy = false;
+  const frame = $("#stlPreviewFrame");
+  frame.hidden = true;
+  frame.removeAttribute("src");
+  $("#stlPreviewBusy").hidden = true;
+  const back = stlPreviewReturnFocus;
+  stlPreviewReturnFocus = null;
+  if (back && document.contains(back)) back.focus();
+}
+
+async function openStlPreview(id, returnFocus = document.activeElement) {
+  if (!id || stlPreviewBusy) return;
+  stlPreviewBusy = true;
+  const token = ++stlPreviewToken;
+  stlPreviewReturnFocus = returnFocus && returnFocus.focus ? returnFocus : null;
+  const dlg = $("#stlPreviewDlg"), frame = $("#stlPreviewFrame"), err = $("#stlPreviewError");
+  err.hidden = true;
+  err.textContent = "";
+  $("#stlPreviewTitle").textContent = "STL preview";
+  $("#stlPreviewBusy").hidden = false;
+  $("#stlPreviewBusy").textContent = "Loading STL…";
+  frame.hidden = false;
+  if (typeof dlg.showModal === "function") { if (!dlg.open) dlg.showModal(); }
+  else dlg.setAttribute("open", "");
+  $("#stlPreviewTitle").focus();
+  try {
+    const ready = waitForStlMessage(frame, token, "viewer_ready", 15000);
+    frame.src = `/vendor/model-viewer/index.html?load=${token}`;
+    await ready;
+    if (token !== stlPreviewToken) return;
+    const r = await fetch(`/api/jobs/${encodeURIComponent(id)}/stl`);
+    if (token !== stlPreviewToken) return;
+    if (!r.ok) {
+      const j = await r.json().catch(() => ({}));
+      throw new Error(j.detail || "this job has no STL");
+    }
+    const buf = await r.arrayBuffer();
+    if (token !== stlPreviewToken) return;
+    const header = r.headers.get("content-disposition") || "";
+    const named = header.match(/filename="?([^"';]+)"?/);
+    if (named) $("#stlPreviewTitle").textContent = "STL preview: " + named[1];
+    frame.contentWindow.postMessage({type:"load_model", buffer: buf, ext:"stl"}, location.origin, [buf]);
+    const done = await waitForStlMessage(frame, token, "stl_preview_result", 15000);
+    if (token !== stlPreviewToken) return;
+    if (done.type === "stl_preview_error") throw new Error(done.message || "STL preview failed.");
+  } catch (e) {
+    if (token !== stlPreviewToken) return;
+    frame.hidden = true;
+    err.textContent = e.message || "STL preview failed.";
+    err.hidden = false;
+    $("#stlPreviewClose").focus();
+  } finally {
+    if (token === stlPreviewToken) {
+      $("#stlPreviewBusy").hidden = true;
+      stlPreviewBusy = false;
+    }
+  }
+}
+
+function initStlPreview() {
+  const dlg = $("#stlPreviewDlg");
+  $("#stlPreviewClose").addEventListener("click", () => { if (dlg.open) dlg.close(); });
+  dlg.addEventListener("close", cleanupStlPreview);
+}
+
 function initPreview() {
   const canvas = $("#previewCanvas"), dlg = $("#previewDlg");
   $("#resliceSave").addEventListener("click", ev => withPreviewBusy("Saving settings…", async () => { const button = $("#resliceSave"); button.disabled = true; try { await saveResliceSettings(); toast("Draft settings saved"); } catch (e) { previewActionError("Settings not saved: " + e.message); } finally { button.disabled = false; } }));
@@ -3992,6 +4128,7 @@ function boot() {
   $("#printOptionsSlice").addEventListener("click", slicePrintOptions);
   $("#supportFins").addEventListener("change", applyPrintOptionsConstraints);
   initPreview();
+initStlPreview();
   initSupportFins();
   initFromLayer();
 

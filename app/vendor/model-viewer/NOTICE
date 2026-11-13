@@ -1,0 +1,12 @@
+model-viewer
+Copyright Mechaxil
+https://github.com/Mechaxil/model-viewer
+Licensed under the Apache License, Version 2.0. See LICENSE.
+
+This copy is modified for print-portal:
+- Three.js 0.160.0 is vendored in ./three/ (MIT, see three/LICENSE). No CDN or other network fetch.
+- STEP / occt-import-js support was removed. STL only.
+- Upload, edit, confirm, and remote file= URL loading were removed.
+- The parent page supplies the job STL with postMessage {type:"load_model", buffer, ext:"stl"}.
+- The viewer posts viewer_ready, stl_preview_loaded, and stl_preview_error to its parent.
+- prefers-reduced-motion disables the continuous animation loop.

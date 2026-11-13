@@ -18,6 +18,7 @@ Endpoints
     GET    /api/jobs             job list
     GET    /api/jobs/{id}        job status + stats
     GET    /api/jobs/{id}/gcode  download the sliced gcode
+    GET    /api/jobs/{id}/stl    the job's own STL, for preview before slice
     POST   /api/jobs/{id}/print  upload the gcode to Moonraker and start it
     DELETE /api/jobs/{id}        remove job directory and its sliced output
     DELETE /api/jobs             remove every finished job (skips active ones)
@@ -52,6 +53,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse
+from fastapi.staticfiles import StaticFiles
 
 import archives
 import config
@@ -701,6 +703,67 @@ def gcode_path(jid: str, job: dict) -> Path | None:
     return None
 
 
+def job_stl_path(jid: str, job: dict) -> Path:
+    """The job's own STL inside its upload directory.
+
+    A missing, unreadable, or non-STL file is "this job has no STL". Sliced gcode is
+    never returned, including a gcode file renamed to end in ``.stl``.
+    """
+    upload = job_dir(jid) / "upload"
+    if upload.is_symlink() or not upload.is_dir():
+        raise HTTPException(409, "this job has no STL")
+    try:
+        upload_root = upload.resolve()
+    except OSError as exc:
+        raise HTTPException(409, "this job has no STL") from exc
+    gcode = gcode_path(jid, job)
+    blocked = None
+    if gcode is not None:
+        try:
+            blocked = gcode.resolve()
+        except OSError:
+            blocked = None
+
+    def usable(path: Path) -> Path | None:
+        try:
+            if path.is_symlink() or not path.is_file() or path.suffix.lower() != ".stl":
+                return None
+            resolved = path.resolve()
+            if resolved.parent != upload_root or resolved == blocked:
+                return None
+        except OSError:
+            return None
+        try:
+            preview.read_scene(resolved)
+        except (preview.PreviewError, OSError):
+            return None
+        return resolved
+
+    names: list[str] = []
+    for raw in (job.get("filename"), job.get("original")):
+        name = Path(str(raw or "")).name
+        if name and name not in names:
+            names.append(name)
+    for name in names:
+        found = usable(upload / name)
+        if found is not None:
+            return found
+    if any(name.lower().endswith(".stl") for name in names):
+        raise HTTPException(409, "this job has no STL")
+    matches: list[Path] = []
+    try:
+        children = list(upload.iterdir())
+    except OSError as exc:
+        raise HTTPException(409, "this job has no STL") from exc
+    for child in children:
+        found = usable(child)
+        if found is not None and found not in matches:
+            matches.append(found)
+    if len(matches) == 1:
+        return matches[0]
+    raise HTTPException(409, "this job has no STL")
+
+
 def slice_profile(job: dict) -> tuple[dict[str, Path], dict[str, bool]]:
     """The presets and options to slice with: the job's snapshot, else the live profile.
 
@@ -928,6 +991,7 @@ async def lifespan(_app: FastAPI):
 
 
 app = FastAPI(title="SliceDeck", lifespan=lifespan)
+app.mount("/vendor", StaticFiles(directory=APP_DIR / "vendor"), name="vendor")
 
 
 def reject_oversize(request: Request, limit: int, message: str) -> None:
@@ -2283,6 +2347,14 @@ def api_gcode(jid: str, from_layer: int | None = None, from_z: float | None = No
         media_type="text/plain",
         filename=job_output_name(job) + ".gcode",
     )
+
+
+@app.get("/api/jobs/{jid}/stl")
+def api_job_stl(jid: str):
+    """The job's STL bytes for the pre-slice viewer. Never the sliced gcode."""
+    job = read_job(jid)
+    path = job_stl_path(jid, job)
+    return FileResponse(path, media_type="model/stl", filename=path.name)
 
 
 @app.post("/api/jobs/{jid}/print")
