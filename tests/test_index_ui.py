@@ -1350,7 +1350,7 @@ def test_the_preview_dialog_is_a_labelled_modal_with_a_fallback(page):
     assert 'class="dialog"' in dlg
     assert 'aria-labelledby="previewTitle"' in dlg
     assert 'aria-describedby="previewHint"' in dlg
-    assert '<h2 id="previewTitle">Preview</h2>' in dlg
+    assert '<h2 id="previewTitle">Slice preview</h2>' in dlg
     assert 'id="previewHint"' in dlg and 'class="hint"' in dlg
     assert 'id="previewCanvas"' in dlg
     assert 'id="previewLayerControls"' in dlg
@@ -1382,7 +1382,7 @@ def test_the_dialog_actions_put_the_decision_last(page):
 
 def test_the_dialog_fits_a_phone_and_keeps_the_decision_visible(page):
     """A 3-D canvas needs the screen; the three actions must not scroll away from it."""
-    css = slice_between(page, "#previewDlg{", ".preview-key{")
+    css = slice_between(page, "#previewDlg,", ".preview-key{")
     assert "max-width:96vw" in css
     assert "max-height:92vh" in css
     assert "height:min(60vh,520px)" in css
@@ -1490,8 +1490,10 @@ def test_the_last_job_block_offers_preview_and_slice_for_a_staged_job(page):
     tag = tag[:tag.index(">")]
     assert 'data-act="preview"' in tag
     assert "hidden" in tag                              # only shown dynamically
-    assert 'aria-label="Preview the sliced model"' in tag
-    assert "Preview" in card[card.index('id="uploadLatestPreview"'):]
+    assert 'aria-label="Slice preview of the sliced model"' in tag
+    assert "Slice preview" in card[card.index('id="uploadLatestPreview"'):]
+    assert 'id="uploadLatestStl"' in card
+    assert 'data-act="stl-preview"' in card
     assert "Preview fins" not in card[card.index('id="uploadLatestPreview"'):]
     assert 'id="uploadLatestSlice"' not in card
 
@@ -1500,11 +1502,12 @@ def test_the_last_job_block_offers_preview_and_slice_for_a_staged_job(page):
     assert 'job.kind === "reslice"' in latest
     assert 'preview.textContent = "Resume reslice";' in latest
     assert 'preview.hidden = true;' in latest
-    assert 'preview.textContent = "Preview";' in latest
+    assert 'preview.textContent = "Slice preview";' in latest
+    assert 'stl.hidden = false;' in latest
 
     handler = function_body(page, "onJobAction")
     assert 'btn.dataset.act === "preview"' in handler
-    assert "openPreview(btn.dataset.ref)" in handler
+    assert "openPreview(btn.dataset.ref, btn)" in handler
     assert 'btn.dataset.act === "options"' in handler
     assert "openJobOptions(btn.dataset.ref)" in handler
     assert 'btn.dataset.act === "slice"' not in handler
@@ -1517,7 +1520,7 @@ def test_the_last_job_block_offers_preview_and_slice_for_a_staged_job(page):
 const assert = require('assert');
 const elements = {};
 for (const id of ['uploadLatest', 'uploadLatestBody', 'uploadLatestPrint', 'uploadLatestGcode',
-                  'uploadLatestFromLayer', 'uploadLatestPreview', 'uploadLatestDelete', 'uploadLatestReslice']) {
+                  'uploadLatestFromLayer', 'uploadLatestPreview', 'uploadLatestStl', 'uploadLatestDelete', 'uploadLatestReslice']) {
   elements[id] = {hidden:false, textContent:'', dataset:{}, setAttribute(k,v){this[k]=v;}};
 }
 const $ = s => elements[s.slice(1)];
@@ -1529,6 +1532,8 @@ const reslicePending = new Set();
 const stagedNonReslice = {id:'j1', status:'awaiting_confirm', filename:'part.stl'};
 setUploadLatest(stagedNonReslice);
 assert.equal(elements.uploadLatestPreview.hidden, true);
+assert.equal(elements.uploadLatestStl.hidden, false);
+assert.equal(elements.uploadLatestStl.dataset.ref, 'j1');
 
 // 2. Reslice staged upload -> preview visible as "Resume reslice"
 const stagedReslice = {id:'j2', kind:'reslice', status:'awaiting_confirm', filename:'part.stl'};
@@ -1537,12 +1542,14 @@ assert.equal(elements.uploadLatestPreview.hidden, false);
 assert.equal(elements.uploadLatestPreview.textContent, 'Resume reslice');
 assert.equal(elements.uploadLatestPreview.dataset.ref, 'j2');
 
-// 3. Sliced job -> preview visible as "Preview"
+// 3. Sliced job -> preview visible as "Slice preview"
 const sliced = {id:'j3', status:'sliced', filename:'part.gcode'};
 setUploadLatest(sliced);
 assert.equal(elements.uploadLatestPreview.hidden, false);
-assert.equal(elements.uploadLatestPreview.textContent, 'Preview');
+assert.equal(elements.uploadLatestPreview.textContent, 'Slice preview');
 assert.equal(elements.uploadLatestPreview.dataset.ref, 'j3');
+assert.equal(elements.uploadLatestStl.hidden, false);
+assert.equal(elements.uploadLatestStl.dataset.ref, 'j3');
 '''
         subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
 
@@ -1564,11 +1571,12 @@ def test_a_staged_row_offers_both_preview_and_slice_it(page):
     assert "Resume reslice" in staged
     assert 'j.status === "awaiting_confirm" && !j.error' in row
 
-    # sliced rows render the "Preview" button adjacent to Print
+    # sliced rows render the Slice preview button adjacent to Print
     assert 'data-act="preview"' in actions
-    assert "Preview" in actions
+    assert "Slice preview" in actions
     assert 'data-act="print"' in actions
-    assert 'aria-label="Preview' in actions
+    assert 'aria-label="Slice preview' in actions
+    assert 'data-act="stl-preview"' in row
     assert '<svg class="icon"' in actions
     assert actions.index('data-act="print"') < actions.index('data-act="preview"')
 
@@ -1595,7 +1603,7 @@ assert.ok(row2.includes('data-act="preview"'));
 // 3. Sliced job has Print and Preview
 const row3 = renderJobRow({id:'j3', status:'sliced'});
 assert.ok(row3.includes('Print'));
-assert.ok(row3.includes('Preview'));
+assert.ok(row3.includes('Slice preview'));
 assert.ok(row3.includes('data-act="preview"'));
 '''
         subprocess.run([node, "-e", js], check=True, capture_output=True, text=True)
@@ -1615,7 +1623,7 @@ def test_sliced_job_preview_wires_gcode_image_and_stats(page):
 
     open_ = function_body(page, "openPreview")
     assert 'job.status === "sliced"' in open_
-    assert 'G-code preview: ' in open_
+    assert 'Slice preview: ' in open_
     assert '/gcode' in open_
     assert 'canvas.hidden = false;' in open_
     assert 'layerControls.hidden = false;' in open_
@@ -1696,7 +1704,7 @@ global.fetch = async (url) => {
 (async () => {
   await openPreview('job-123');
   assert.equal(elements.previewDlg.open, true);
-  assert.equal(elements.previewTitle.textContent, 'G-code preview: benchy.stl');
+  assert.equal(elements.previewTitle.textContent, 'Slice preview: benchy.stl');
   assert.equal(elements.previewCanvas.hidden, false);
   assert.equal(elements.previewLayerControls.hidden, false);
   assert.equal(elements.previewLayerSlider.min, '1');

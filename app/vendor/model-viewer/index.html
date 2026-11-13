@@ -1,0 +1,227 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>STL preview</title>
+<!--
+model-viewer
+Copyright Mechaxil
+Licensed under the Apache License, Version 2.0. See LICENSE in this directory.
+Modified for print-portal: Three.js 0.160.0 is pinned in ./three/ (MIT, see three/LICENSE).
+See NOTICE for the removed product paths. STL arrives only by same-origin postMessage load_model.
+-->
+<style>
+body{
+margin:0;
+background:#1b1b1b;
+color:#fff;
+font-family:Arial,sans-serif;
+overflow:hidden;
+}
+#toolbar{
+position:absolute;
+top:10px;
+left:10px;
+background:#2a2a2a;
+padding:10px;
+border-radius:6px;
+}
+#stats{
+font-size:16px;
+line-height:1.35;
+}
+@media (prefers-reduced-motion: reduce){
+body{scroll-behavior:auto;}
+}
+</style>
+<script type="importmap">
+{
+  "imports": {
+    "three": "./three/three.module.js"
+  }
+}
+</script>
+</head>
+<body>
+<div id="toolbar"></div>
+<script type="module">
+import * as THREE from "three";
+import { OrbitControls } from "./three/OrbitControls.js";
+import { STLLoader } from "./three/STLLoader.js";
+
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x1b1b1b);
+
+const camera = new THREE.PerspectiveCamera(
+  60,
+  window.innerWidth/window.innerHeight,
+  0.1,
+  10000
+);
+camera.position.set(200,200,200);
+
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(window.innerWidth,window.innerHeight);
+document.body.appendChild(renderer.domElement);
+
+const controls = new OrbitControls(camera,renderer.domElement);
+const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+controls.enableDamping = !reduceMotion;
+
+scene.add(new THREE.AmbientLight(0xffffff,0.6));
+
+const light = new THREE.DirectionalLight(0xffffff,0.8);
+light.position.set(1,1,1);
+scene.add(light);
+
+const grid = new THREE.GridHelper(300,30);
+scene.add(grid);
+
+const axes = new THREE.AxesHelper(50);
+axes.position.y = 0.1;
+scene.add(axes);
+
+const BUILD_VOLUME = {x:220,y:220,z:250};
+
+const buildBox = new THREE.LineSegments(
+  new THREE.EdgesGeometry(new THREE.BoxGeometry(BUILD_VOLUME.x,BUILD_VOLUME.z,BUILD_VOLUME.y)),
+  new THREE.LineBasicMaterial({color:0x00ff88})
+);
+buildBox.position.y = BUILD_VOLUME.z/2;
+scene.add(buildBox);
+
+const toolbar = document.getElementById("toolbar");
+const stats = document.createElement("div");
+stats.id = "stats";
+toolbar.appendChild(stats);
+
+const stlLoader = new STLLoader();
+let mesh = null;
+let running = !reduceMotion;
+
+function report(type, message){
+  const payload = {type};
+  if (message) payload.message = message;
+  window.parent.postMessage(payload, location.origin);
+}
+
+function loadBuffer(buffer, format){
+  if (format !== "stl") throw new Error("STL preview could not read this file.");
+  loadGeometry(stlLoader.parse(buffer));
+}
+
+function computeVolume(g){
+  const pos = g.attributes.position.array;
+  let v = 0;
+  for(let i=0;i<pos.length;i+=9){
+    const v0 = new THREE.Vector3(pos[i],  pos[i+1],pos[i+2]);
+    const v1 = new THREE.Vector3(pos[i+3],pos[i+4],pos[i+5]);
+    const v2 = new THREE.Vector3(pos[i+6],pos[i+7],pos[i+8]);
+    v += v0.dot(v1.clone().cross(v2));
+  }
+  return Math.abs(v/6);
+}
+
+function snapToBed(){
+  const box = new THREE.Box3().setFromObject(mesh);
+  mesh.position.y -= box.min.y;
+}
+
+function fitCamera(obj){
+  const box = new THREE.Box3().setFromObject(obj);
+  const size = box.getSize(new THREE.Vector3());
+  const dist = Math.max(size.x,size.y,size.z)*2;
+  camera.position.set(dist,dist,dist);
+  controls.target.set(0,0,0);
+  controls.update();
+}
+
+function updateStats(){
+  if(!mesh) return;
+  const box = new THREE.Box3().setFromObject(mesh);
+  const size = box.getSize(new THREE.Vector3());
+  const tris = mesh.geometry.attributes.position.count/3;
+  const volume = computeVolume(mesh.geometry)/1000;
+  stats.textContent = "";
+  const lines = [
+    `X ${size.x.toFixed(2)} mm`,
+    `Y ${size.y.toFixed(2)} mm`,
+    `Z ${size.z.toFixed(2)} mm`,
+    `Triangles ${Math.round(tris)}`,
+    `Volume ${volume.toFixed(2)} cm³`
+  ];
+  lines.forEach((line, index) => {
+    if (index) stats.appendChild(document.createElement("br"));
+    stats.appendChild(document.createTextNode(line));
+  });
+}
+
+function loadGeometry(g){
+  g.computeVertexNormals();
+  g.center();
+  if(mesh) scene.remove(mesh);
+  mesh = new THREE.Mesh(g, new THREE.MeshStandardMaterial({
+    color:0x00aaff,
+    metalness:0.1,
+    roughness:0.8
+  }));
+  scene.add(mesh);
+  snapToBed();
+  fitCamera(mesh);
+  updateStats();
+  renderer.render(scene,camera);
+}
+
+window.addEventListener("message", e => {
+  if (e.origin !== location.origin) return;
+  if (e.data?.type !== "load_model") return;
+  const ext = String(e.data.ext || "").toLowerCase();
+  if (ext !== "stl" || !(e.data.buffer instanceof ArrayBuffer)) {
+    report("stl_preview_error", "STL preview could not read this file.");
+    return;
+  }
+  try {
+    loadBuffer(e.data.buffer, "stl");
+    report("stl_preview_loaded");
+  } catch (err) {
+    report("stl_preview_error", (err && err.message) || "STL preview failed.");
+  }
+});
+
+controls.addEventListener("change", () => {
+  if (reduceMotion) renderer.render(scene,camera);
+});
+
+function animate(){
+  if (!running) return;
+  requestAnimationFrame(animate);
+  controls.update();
+  renderer.render(scene,camera);
+}
+
+const motion = window.matchMedia("(prefers-reduced-motion: reduce)");
+function applyMotion(){
+  const reduce = motion.matches;
+  controls.enableDamping = !reduce;
+  if (reduce) {
+    running = false;
+    renderer.render(scene,camera);
+  } else if (!running) {
+    running = true;
+    animate();
+  }
+}
+if (typeof motion.addEventListener === "function") motion.addEventListener("change", applyMotion);
+animate();
+
+window.addEventListener("resize", () => {
+  camera.aspect = window.innerWidth/window.innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(window.innerWidth,window.innerHeight);
+  renderer.render(scene,camera);
+});
+
+report("viewer_ready");
+</script>
+</body>
+</html>
