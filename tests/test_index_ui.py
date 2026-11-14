@@ -66,14 +66,30 @@ def test_profile_edit_controls_live_in_the_printer_card(page):
         'id="selMachine"',
         'id="selProcess"',
         'id="selFilament"',
-        'for="profFile"',
-        'id="profFile"',
-        'id="profNotes"',
     ]
     marks = [page.index(needle) for needle in order]
     assert printer < min(marks), "the edit controls belong to the Printer card"
     assert marks == sorted(marks), f"wrong control order inside the Printer card: {order}"
     assert max(marks) < upload, "the Printer card precedes the upload card"
+
+    printer_region = page[printer:upload]
+    for node in ('for="profFile"', 'id="profFile"', 'id="profNotes"'):
+        assert node not in printer_region
+    machine = slice_between(page, 'id="machineCardTitle"', 'id="processCardTitle"')
+    machine_order = ['for="profFile"', 'id="profFile"', 'id="profNotes"', 'id="machineSelect"']
+    machine_marks = [machine.index(node) for node in machine_order]
+    assert machine_marks == sorted(machine_marks)
+    assert 'Upload .orca_printer' in machine
+    assert '<input id="profFile" type="file" accept=".orca_printer,.json,.zip" hidden>' in machine
+    assert 'No machine presets imported yet. Upload an .orca_printer bundle above.' in machine
+    assert 'Import a bundle on the dashboard first.' not in machine
+
+    handler = slice_between(page, '$("#profFile").addEventListener("change"',
+                            '/* selecting a preset')
+    assert 'fetch("/api/profile/upload", {method:"POST", body:fd})' in handler
+    assert 'await loadProfile();' in handler
+    assert 'await loadPresets();' in handler
+    assert 'ev.target.value = "";' in handler
 
     # print options are inside #printOptions in the upload card
     print_options = slice_between(page, 'id="printOptions"', 'id="profCardTitle"')

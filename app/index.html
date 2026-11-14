@@ -1287,15 +1287,6 @@ input[type=checkbox]{
               <select id="selFilament"></select>
             </div>
           </div>
-          <div class="acts">
-            <label class="btn" for="profFile">
-              <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
-                   stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
-              Upload .orca_printer
-            </label>
-            <input id="profFile" type="file" accept=".orca_printer,.json,.zip" hidden>
-          </div>
-          <div class="notes" id="profNotes"></div>
         </div>
       </section>
 
@@ -1496,12 +1487,21 @@ input[type=checkbox]{
     <p class="meta">Edit the basic settings of a machine and its process presets. Supports and brim are set on the dashboard profile card, not here.</p>
     <section class="card" aria-labelledby="machineCardTitle">
       <h2 id="machineCardTitle">Machine</h2>
+      <div class="acts">
+        <label class="btn" for="profFile">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"
+               stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 16V4"/><path d="m7 9 5-5 5 5"/><path d="M4 20h16"/></svg>
+          Upload .orca_printer
+        </label>
+        <input id="profFile" type="file" accept=".orca_printer,.json,.zip" hidden>
+      </div>
+      <div class="notes" id="profNotes"></div>
       <div class="field"><label for="machineSelect">Machine</label>
         <select id="machineSelect"></select></div>
       <div id="machineForm"></div>
       <div class="actions"><button id="saveMachineBtn" type="button">Save machine</button>
         <button id="deleteMachineBtn" type="button" class="danger">Delete machine</button></div>
-      <p class="hint" id="machineEmpty" hidden>No machine presets imported yet. Import a bundle on the dashboard first.</p>
+      <p class="hint" id="machineEmpty" hidden>No machine presets imported yet. Upload an .orca_printer bundle above.</p>
     </section>
     <section class="card" aria-labelledby="processCardTitle">
       <h2 id="processCardTitle">Process</h2>
@@ -4142,7 +4142,8 @@ initStlPreview();
       if (!r.ok || !j.ok) throw new Error(j.detail || "no presets found");
       $("#profNotes").textContent = (j.notes || []).join("\n");
       toast(`Imported ${j.imported.length} presets — select one to activate`, 6000);
-      loadProfile();
+      await loadProfile();
+      await loadPresets();
     } catch (e) { toast("Failure: " + e.message, 6000); }
     ev.target.value = "";
   });
